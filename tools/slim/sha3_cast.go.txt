@@ -1,0 +1,5 @@
+// sixup slim build: replaces crypto/internal/fips140/sha3/cast.go.
+// The original registers a FIPS self-test at package init whose closure references
+// cSHAKE, pulling the whole sha3 package into the binary. sixup does not use SHA-3,
+// so without the self-test the linker drops the package entirely.
+package sha3

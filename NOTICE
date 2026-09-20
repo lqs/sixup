@@ -1,0 +1,35 @@
+sixup includes work derived from other projects. Their licences are reproduced below and
+apply to the parts named; the rest of sixup is under the MIT licence in LICENSE.
+
+================================================================================
+luci-app-fleth — https://github.com/makeding/luci-app-fleth
+
+The MAP-E rule tables in mape_rules.go are generated from
+root/usr/sbin/fleth-map-e.lua, and the calculation in mape.go is a port of the same
+file. That file is authored by huggy <fleth@huggy.moe> and rewritten there from
+https://ipv4.web.fc2.com/map-e.html; the tables themselves are measurements
+contributed by the Japanese IPoE community and collated by that project.
+
+The GPL-2.0 exception luci-app-fleth states for root/lib/netifd/proto/ipip6h.sh and
+htdocs/luci-static/resources/protocol/ipip6h.js does not apply here: sixup uses neither
+file. What it uses is covered by the MIT licence below.
+
+Copyright (c) 2024 huggy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE
+OR OTHER DEALINGS IN THE SOFTWARE.

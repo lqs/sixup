@@ -1,0 +1,41 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; echo "run gofmt -w ."; exit 1; }
+      - run: go vet ./...
+      - name: Build for every supported GOOS
+        run: |
+          for os in linux darwin freebsd; do GOOS=$os go build ./...; done
+      - run: go test ./...
+      - name: Cross-compile and check size
+        run: |
+          ./build.sh ci
+          test "$(stat -c %s dist/sixup-ci-linux-amd64)" -le 5242880
+
+  nftables:
+    # The unit tests cover what the rules should be; this covers the kernel accepting them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: sudo -E env "PATH=$PATH" go test -tags integration -run TestNAT ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      # Built from source with the repo's Go toolchain: the prebuilt binaries lag
+      # behind the Go version in go.mod and refuse to load the config.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2
+      - run: golangci-lint run

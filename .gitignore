@@ -1,0 +1,4 @@
+/sixup
+/sixup-*
+/testdata/fuzz/
+/dist/

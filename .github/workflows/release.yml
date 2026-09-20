@@ -1,0 +1,33 @@
+name: release
+# On a v* tag, cross-compile every platform and upload to a GitHub Release; a manual run only produces artifacts.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: go vet ./... && go test ./...
+      - name: Cross-compile
+        run: ./build.sh "${GITHUB_REF_NAME}"
+      - name: Size limit 5 MiB (amd64)
+        run: test "$(stat -c %s dist/sixup-${GITHUB_REF_NAME}-linux-amd64)" -le 5242880
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sixup-${{ github.ref_name }}
+          path: dist/
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

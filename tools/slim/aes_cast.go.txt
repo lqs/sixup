@@ -1,0 +1,2 @@
+// sixup slim build: replaces crypto/internal/fips140/aes/cast.go to drop the FIPS self-test's init references.
+package aes

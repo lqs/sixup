@@ -1,0 +1,25 @@
+// sixup slim build: replaces crypto/internal/fips140/drbg/ctrdrbg.go.
+// crypto/rand only uses CTR_DRBG under GODEBUG=fips140=on; otherwise it reads getrandom
+// directly. Types and method signatures are kept but panic, which cuts the AES reference.
+package drbg
+
+const (
+	keySize        = 256 / 8
+	SeedSize       = keySize + 16
+	reseedInterval = 1 << 48
+	maxRequestSize = (1 << 19) / 8
+)
+
+type Counter struct{}
+
+func NewCounter(entropy *[SeedSize]byte) *Counter {
+	panic("sixup slim build: CTR_DRBG removed, FIPS 140 mode is not supported")
+}
+
+func (c *Counter) Reseed(entropy, additionalInput *[SeedSize]byte) {
+	panic("sixup slim build: CTR_DRBG removed, FIPS 140 mode is not supported")
+}
+
+func (c *Counter) Generate(out []byte, additionalInput *[SeedSize]byte) (reseedRequired bool) {
+	panic("sixup slim build: CTR_DRBG removed, FIPS 140 mode is not supported")
+}

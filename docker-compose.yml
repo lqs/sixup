@@ -1,0 +1,37 @@
+# A router needs the host network stack directly, hence host networking plus NET_ADMIN / NET_RAW.
+# /proc/sys is read-only inside a container, so pick one of:
+#   1. privileged: true, letting sixup set forwarding and the other sysctls itself (the default below)
+#   2. drop privileged, use cap_add, set the sysctls on the host and pass -no-sysctl
+services:
+  sixup:
+    build: .
+    image: sixup:latest
+    container_name: sixup
+    network_mode: host
+    privileged: true
+    # cap_add:
+    #   - NET_ADMIN
+    #   - NET_RAW
+    #   - NET_BIND_SERVICE
+    restart: unless-stopped
+    volumes:
+      - sixup-state:/var/lib/sixup
+    command:
+      - -wan
+      - eth0
+      - -lan
+      - eth1
+      - -dhcp6s-mode
+      - stateless
+      - -lan-ula
+      - auto
+      - -state-dir
+      - /var/lib/sixup
+      # - -no-sysctl
+    deploy:
+      resources:
+        limits:
+          memory: 32M
+
+volumes:
+  sixup-state:

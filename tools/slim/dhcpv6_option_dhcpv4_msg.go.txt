@@ -1,0 +1,26 @@
+// sixup slim build: replaces github.com/insomniacslk/dhcp/dhcpv6/option_dhcpv4_msg.go.
+// The original pulls in the whole dhcpv4 package for the RFC 7341 DHCPv4-over-DHCPv6
+// option, which sixup never uses, so only the raw bytes are kept, unparsed.
+package dhcpv6
+
+import "fmt"
+
+// OptDHCPv4Msg is the RFC 7341 encapsulated DHCPv4 message option; the slim build keeps only the raw bytes.
+type OptDHCPv4Msg struct {
+	Raw []byte
+}
+
+func (op *OptDHCPv4Msg) Code() OptionCode { return OptionDHCPv4Msg }
+
+func (op *OptDHCPv4Msg) ToBytes() []byte { return op.Raw }
+
+func (op *OptDHCPv4Msg) String() string {
+	return fmt.Sprintf("%s: %d bytes (not parsed in slim build)", op.Code(), len(op.Raw))
+}
+
+func (op *OptDHCPv4Msg) LongString(int) string { return op.String() }
+
+func (op *OptDHCPv4Msg) FromBytes(data []byte) error {
+	op.Raw = append([]byte(nil), data...)
+	return nil
+}

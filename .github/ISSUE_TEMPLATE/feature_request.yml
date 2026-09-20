@@ -1,0 +1,20 @@
+name: Feature request
+description: Something sixup should do and does not
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to get working, and what stops you today?
+    validations: { required: true }
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What sixup should do
+      description: "If it maps onto an RFC or onto what odhcp6c, odhcpd, radvd or ndppd already do, say which."
+    validations: { required: true }
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you do instead right now

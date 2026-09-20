@@ -1,0 +1,39 @@
+name: Bug report
+description: Something misbehaves on a line that sixup already understands
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Almost every question about "my line does not work" is answered by the `-dry-run` output,
+        so please paste it. It performs the full exchange with the ISP and changes nothing.
+  - type: textarea
+    id: dryrun
+    attributes:
+      label: Output of -dry-run
+      description: "`sudo sixup -wan YOUR_WAN_IF -dry-run`, run for a few seconds, then Ctrl-C. Include the JSON report, the packet counters and the hints. Mask what you consider sensitive, but keep the prefix lengths and the structure of the addresses."
+      render: text
+    validations: { required: true }
+  - type: input
+    id: cmdline
+    attributes:
+      label: Command line or config
+      description: The flags, UCI section or unit file you run sixup with.
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected, and what happened instead
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes:
+      label: Version and platform
+      description: "`sixup -version`, plus kernel and distribution (or OpenWrt release)."
+    validations: { required: true }
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs from the real run
+      description: "Run with `-v 1` and paste the relevant part."
+      render: text

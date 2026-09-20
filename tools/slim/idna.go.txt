@@ -1,0 +1,21 @@
+// sixup slim build: replaces the whole golang.org/x/net/idna package.
+// Only mdlayher/ndp calls ToASCII / ToUnicode, when coding the DNSSL option of an RA, and
+// the search domains carriers hand out are all ASCII, so this passes ASCII through and
+// errors otherwise. The real package plus the Unicode tables it drags in (x/text/unicode/bidi
+// and friends) costs about 90 KB.
+package idna
+
+import "errors"
+
+var errNonASCII = errors.New("idna: non-ASCII domain names are not supported in the sixup slim build")
+
+func ToASCII(s string) (string, error) {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return "", errNonASCII
+		}
+	}
+	return s, nil
+}
+
+func ToUnicode(s string) (string, error) { return ToASCII(s) }

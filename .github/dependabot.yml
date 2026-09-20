@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # The protocol libraries (insomniacslk/dhcp, mdlayher/ndp, mdlayher/netlink) parse packets from
+  # the ISP, so their fixes matter here; grouped into one PR to keep the noise down.
+  - package-ecosystem: gomod
+    directory: /
+    schedule: { interval: weekly }
+    groups:
+      go-dependencies:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: monthly }

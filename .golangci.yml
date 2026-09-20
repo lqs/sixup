@@ -1,0 +1,17 @@
+# Linters that catch real mistakes without demanding ceremony. errcheck is off on purpose: most
+# ignored errors here are best-effort netlink and sysctl calls that already log their own failures.
+version: "2"
+linters:
+  default: none
+  enable:
+    - govet
+    - ineffassign
+    - misspell
+    - staticcheck
+    - unused
+  settings:
+    staticcheck:
+      checks: ["all", "-ST1000", "-ST1003", "-ST1020", "-ST1021", "-ST1022"]
+formatters:
+  enable:
+    - gofmt

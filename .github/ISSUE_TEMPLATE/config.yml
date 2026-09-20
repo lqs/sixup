@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions about your line
+    url: https://github.com/lqs/sixup/discussions
+    about: Not sure whether it is a bug? Ask here with the -dry-run output.
