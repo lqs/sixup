@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"math/big"
 	"net"
 	"net/netip"
@@ -205,7 +204,7 @@ func (m *addrManager) checkDAD() {
 			switch {
 			case ia.Flags&ifaFDadFailed != 0:
 				if st != "conflict" {
-					log.Printf("[address %s] tunnel local endpoint %s failed DAD: another device on the link is using it (HGW or another tunnel endpoint still online?), not enabling", m.ifname, ia.Addr)
+					warnf("[address %s] tunnel local endpoint %s failed DAD: another device on the link is using it (HGW or another tunnel endpoint still online?), not enabling", m.ifname, ia.Addr)
 					m.endpoints[ia.Addr] = "conflict"
 					addrDel(m.ifi.Index, ia.Addr, 128)
 					if m.store != nil {
@@ -216,7 +215,7 @@ func (m *addrManager) checkDAD() {
 				pending = true
 			default:
 				if st != "ok" {
-					log.Printf("[address %s] tunnel local endpoint %s passed DAD, now active", m.ifname, ia.Addr)
+					infof("[address %s] tunnel local endpoint %s passed DAD, now active", m.ifname, ia.Addr)
 					m.endpoints[ia.Addr] = "ok"
 				}
 			}
@@ -233,7 +232,7 @@ func (m *addrManager) checkDAD() {
 		}
 		if p, ok := m.applied[ia.Addr]; ok {
 			m.dadCnt[p.Prefix]++
-			log.Printf("[address %s] %s failed DAD, switching to address with DAD_Counter=%d", m.ifname, ia.Addr, m.dadCnt[p.Prefix])
+			warnf("[address %s] %s failed DAD, switching to address with DAD_Counter=%d", m.ifname, ia.Addr, m.dadCnt[p.Prefix])
 			addrDel(m.ifi.Index, ia.Addr, ia.PrefixLen)
 			delete(m.applied, ia.Addr)
 			m.applyPrefixAddrs()
@@ -241,7 +240,7 @@ func (m *addrManager) checkDAD() {
 			continue
 		}
 		if t := m.tempOf(ia.Addr); t != nil {
-			log.Printf("[address %s] temporary address %s failed DAD, regenerating", m.ifname, ia.Addr)
+			warnf("[address %s] temporary address %s failed DAD, regenerating", m.ifname, ia.Addr)
 			m.remove(t)
 			if t.state == "preferred" {
 				var pfx []Prefix
@@ -304,19 +303,19 @@ func (m *addrManager) applyPrefixAddrs() {
 		pref, valid := p.preferredLeft(now), p.validLeft(now)
 		plen := m.plen(p.Prefix)
 		if err := addrSet(m.ifi.Index, a, plen, pref, valid, false, 0); err != nil {
-			log.Printf("[address %s] failed to configure %s: %v", m.ifname, a, err)
+			errorf("[address %s] failed to configure %s: %v", m.ifname, a, err)
 			continue
 		}
 		if _, ok := m.applied[a]; !ok {
-			log.Printf("[address %s] added %s/%d preferred=%s valid=%s", m.ifname, a, plen, pref.Round(time.Second), valid.Round(time.Second))
+			infof("[address %s] added %s/%d preferred=%s valid=%s", m.ifname, a, plen, pref.Round(time.Second), valid.Round(time.Second))
 			m.dadDue = true
 		}
 	}
 	for a, p := range m.applied {
 		if _, ok := want[a]; !ok {
-			log.Printf("[address %s] removing %s", m.ifname, a)
+			infof("[address %s] removing %s", m.ifname, a)
 			if err := addrDel(m.ifi.Index, a, m.plen(p.Prefix)); err != nil {
-				log.Printf("[address %s] failed to delete %s: %v", m.ifname, a, err)
+				warnf("[address %s] failed to delete %s: %v", m.ifname, a, err)
 			}
 		}
 	}
@@ -345,10 +344,10 @@ func (m *addrManager) adoptStrays(want map[netip.Addr]Prefix) {
 			}
 		}
 		if err := addrSet(m.ifi.Index, ia.Addr, ia.PrefixLen, 0, 0, true, ifaFNodad); err != nil {
-			log.Printf("[address %s] failed to deprecate stray address %s: %v", m.ifname, ia.Addr, err)
+			warnf("[address %s] failed to deprecate stray address %s: %v", m.ifname, ia.Addr, err)
 			continue
 		}
-		log.Printf("[address %s] adopted stray address %s/%d, will reclaim once no longer in use", m.ifname, ia.Addr, ia.PrefixLen)
+		infof("[address %s] adopted stray address %s/%d, will reclaim once no longer in use", m.ifname, ia.Addr, ia.PrefixLen)
 		m.temps = append(m.temps, &tempAddr{addr: ia.Addr, prefix: prefix, plen: ia.PrefixLen, created: time.Now(), state: "deprecated"})
 	}
 }
@@ -438,12 +437,12 @@ func (m *addrManager) rotateFor(targets, active []Prefix) bool {
 		}
 		// valid lifetime is enforced by this process, so the kernel gets infinite
 		if err := addrSet(m.ifi.Index, na.addr, na.plen, pref, 0, true, flags); err != nil {
-			log.Printf("[address %s] failed to create temporary address %s: %v", m.ifname, na.addr, err)
+			warnf("[address %s] failed to create temporary address %s: %v", m.ifname, na.addr, err)
 			continue
 		}
 		made = true
 		m.dadDue = true
-		log2("[address %s] new temporary address %s", m.ifname, na.addr)
+		debugf("[address %s] new temporary address %s", m.ifname, na.addr)
 		for _, old := range m.temps {
 			if old.prefix == p.Prefix && old.state == "preferred" {
 				m.deprecate(old)
@@ -467,7 +466,7 @@ func (m *addrManager) rotateFor(targets, active []Prefix) bool {
 
 func (m *addrManager) deprecate(t *tempAddr) {
 	if err := addrSet(m.ifi.Index, t.addr, t.plen, 0, 0, true, ifaFTemporary|ifaFNodad); err != nil {
-		log.Printf("[address %s] failed to deprecate %s: %v", m.ifname, t.addr, err)
+		warnf("[address %s] failed to deprecate %s: %v", m.ifname, t.addr, err)
 		return
 	}
 	t.state = "deprecated"
@@ -482,14 +481,14 @@ func (m *addrManager) enforceMax() {
 	slices.SortFunc(m.temps, func(a, b *tempAddr) int { return a.created.Compare(b.created) })
 	for len(m.temps) > m.cfg.maxConcurrent {
 		t := m.temps[0]
-		log.Printf("[address %s] max_concurrent reached, forcibly reclaiming %s (may break connections)", m.ifname, t.addr)
+		warnf("[address %s] max_concurrent reached, forcibly reclaiming %s (may break connections)", m.ifname, t.addr)
 		m.remove(t)
 	}
 }
 
 func (m *addrManager) remove(t *tempAddr) {
 	if err := addrDel(m.ifi.Index, t.addr, t.plen); err != nil {
-		log.Printf("[address %s] failed to delete %s: %v", m.ifname, t.addr, err)
+		warnf("[address %s] failed to delete %s: %v", m.ifname, t.addr, err)
 	}
 	for i, x := range m.temps {
 		if x == t {
@@ -509,12 +508,12 @@ func (m *addrManager) drain() {
 		n := m.inUse(t.addr)
 		if n > 0 {
 			t.emptyCnt = 0
-			log2("[address %s] %s still in use by %d", m.ifname, t.addr, n)
+			debugf("[address %s] %s still in use by %d", m.ifname, t.addr, n)
 			continue
 		}
 		t.emptyCnt++
 		if t.emptyCnt >= 2 {
-			log.Printf("[address %s] %s unused for two consecutive checks, reclaiming", m.ifname, t.addr)
+			infof("[address %s] %s unused for two consecutive checks, reclaiming", m.ifname, t.addr)
 			m.remove(t)
 		}
 	}
@@ -524,13 +523,13 @@ func (m *addrManager) drain() {
 func (m *addrManager) inUse(a netip.Addr) int {
 	n, err := sockDiagInUse(a)
 	if err != nil {
-		log2("[address %s] sock_diag query failed: %v", m.ifname, err)
+		debugf("[address %s] sock_diag query failed: %v", m.ifname, err)
 	}
 	if m.ctAvail {
 		c, err := conntrackInUse(a)
 		if err != nil {
 			if !m.ctWarn {
-				log.Printf("[address %s] conntrack unavailable, retirement relies on sock_diag only: %v", m.ifname, err)
+				warnf("[address %s] conntrack unavailable, retirement relies on sock_diag only: %v", m.ifname, err)
 				m.ctWarn = true
 			}
 			m.ctAvail = false
@@ -608,10 +607,10 @@ func (m *addrManager) applyEndpoints() {
 		}
 		// preferred=0: tunnel endpoint only, never chosen as source for ordinary outbound traffic
 		if err := addrSet(m.ifi.Index, a, 128, 0, 0, true, 0); err != nil {
-			log.Printf("[address %s] failed to configure tunnel local endpoint %s: %v", m.ifname, a, err)
+			errorf("[address %s] failed to configure tunnel local endpoint %s: %v", m.ifname, a, err)
 			continue
 		}
-		log.Printf("[address %s] tunnel local endpoint %s added, awaiting DAD", m.ifname, a)
+		infof("[address %s] tunnel local endpoint %s added, awaiting DAD", m.ifname, a)
 		m.endpoints[a] = "tentative"
 		m.dadDue = true
 	}
@@ -626,6 +625,6 @@ func (m *addrManager) applyEndpoints() {
 			m.store.SetEndpointConflict(a, false)
 		}
 		delete(m.endpoints, a)
-		log.Printf("[address %s] tunnel local endpoint %s no longer needed, removed", m.ifname, a)
+		infof("[address %s] tunnel local endpoint %s no longer needed, removed", m.ifname, a)
 	}
 }

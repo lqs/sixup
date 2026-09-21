@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net"
 	"sync"
 	"time"
@@ -15,15 +14,15 @@ func waitIface(ctx context.Context, name string) *net.Interface {
 		ifi, err := ifaceByName(name)
 		if err == nil && ifi.Flags&net.FlagUp != 0 {
 			if warned {
-				log.Printf("[link-watch] interface %s ready (index %d)", name, ifi.Index)
+				infof("[link-watch] interface %s ready (index %d)", name, ifi.Index)
 			}
 			return ifi
 		}
 		if !warned {
 			if err != nil {
-				log.Printf("[link-watch] interface %s missing, retrying every 2s", name)
+				warnf("[link-watch] interface %s missing, retrying every 2s", name)
 			} else {
-				log.Printf("[link-watch] interface %s not UP, retrying every 2s", name)
+				warnf("[link-watch] interface %s not UP, retrying every 2s", name)
 			}
 			warned = true
 		}
@@ -46,7 +45,7 @@ func newLinkHub(ctx context.Context) *linkHub {
 	h := &linkHub{subs: map[string][]chan linkEvent{}}
 	ch := make(chan linkEvent, 32)
 	if err := linkWatch(ch); err != nil {
-		log2("[link-watch] cannot subscribe to link events: %v", err)
+		debugf("[link-watch] cannot subscribe to link events: %v", err)
 		return h
 	}
 	go func() {
@@ -94,7 +93,7 @@ func (h *linkHub) supervise(ctx context.Context, name string, body func(ctx cont
 					return
 				case ev := <-events:
 					if !ev.Up || ev.Gone {
-						log.Printf("[link-watch] interface %s %s, closing its sockets until it returns", name, linkState(ev))
+						warnf("[link-watch] interface %s %s, closing its sockets until it returns", name, linkState(ev))
 						cancel()
 						return
 					}

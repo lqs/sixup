@@ -8,7 +8,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"log"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -130,7 +129,7 @@ func (c *dhcpClient) loadDUID() error {
 				return nil
 			}
 		}
-		log.Printf("[dhcpv6-client] state file %s corrupt, regenerating DUID", p)
+		warnf("[dhcpv6-client] state file %s corrupt, regenerating DUID", p)
 	}
 	// ppp interfaces (PPPoE) have no MAC; use 6 random bytes, persisted with the DUID in normal mode
 	hw := c.ifi.HardwareAddr
@@ -138,13 +137,13 @@ func (c *dhcpClient) loadDUID() error {
 		hw = make(net.HardwareAddr, 6)
 		crand.Read(hw)
 		hw[0] = hw[0]&0xfe | 0x02
-		log.Printf("[dhcpv6-client] interface %s has no MAC (PPPoE?), DUID uses a random link-layer address", c.ifname)
+		warnf("[dhcpv6-client] interface %s has no MAC (PPPoE?), DUID uses a random link-layer address", c.ifname)
 	}
 	if dryRun {
 		// Stable without persisting: DUID-LL from MAC only, so repeated dry-runs look like one client
 		// to the server; otherwise each run burns a /64 until the pool answers NoPrefixAvail
 		c.duid = &dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: hw}
-		log.Printf("[dhcpv6-client] dry-run, using MAC-derived stable DUID %s, not persisted", c.duid)
+		infof("[dhcpv6-client] dry-run, using MAC-derived stable DUID %s, not persisted", c.duid)
 		return nil
 	}
 	c.duid = &dhcpv6.DUIDLLT{
@@ -156,7 +155,7 @@ func (c *dhcpClient) loadDUID() error {
 	if err := os.WriteFile(p, []byte(hex.EncodeToString(c.duid.ToBytes())+"\n"), 0o600); err != nil {
 		return err
 	}
-	log.Printf("[dhcpv6-client] generated new DUID %s", c.duid)
+	infof("[dhcpv6-client] generated new DUID %s", c.duid)
 	return nil
 }
 
@@ -222,15 +221,15 @@ func (c *dhcpClient) reader(conn *net.UDPConn) {
 		}
 		msg, err := dhcpv6.MessageFromBytes(buf[:n])
 		if err != nil {
-			log2("[dhcpv6-client] packet parse failed: %v", err)
+			debugf("[dhcpv6-client] packet parse failed: %v", err)
 			continue
 		}
 		statInc(strings.ToLower(msg.MessageType.String()) + "_recv")
-		log2("[dhcpv6-client] received %s", msg.MessageType)
-		if verbose > 0 {
+		debugf("[dhcpv6-client] received %s", msg.MessageType)
+		if debugEnabled() {
 			// Dump all options: IA_PD/IA_NA addresses and lifetimes, DNS, tunnel options, status codes
 			for _, line := range strings.Split(strings.TrimRight(msg.LongString(2), "\n"), "\n") {
-				log.Printf("[dhcpv6-client]   %s", line)
+				debugf("[dhcpv6-client]   %s", line)
 			}
 			// The library prints tunnel options as raw bytes; add a parsed line
 			if t := parseTunnel(msg); t != nil {
@@ -238,7 +237,7 @@ func (c *dhcpClient) reader(conn *net.UDPConn) {
 				if t.MAPE != nil {
 					extra = " MAPE=" + s46Env(t.MAPE)
 				}
-				log.Printf("[dhcpv6-client]   tunnel options: AFTR=%q%s parse errors=%v", t.AFTRName, extra, t.Errors)
+				debugf("[dhcpv6-client]   tunnel options: AFTR=%q%s parse errors=%v", t.AFTRName, extra, t.Errors)
 			}
 		}
 		select {
@@ -270,7 +269,7 @@ func (c *dhcpClient) run(ctx context.Context, wait bool) {
 	}
 	c.iaid = iaidFor(c.ifi)
 	for c.loadDUID() != nil {
-		log.Printf("[dhcpv6-client] writing DUID failed, retrying in 5s")
+		warnf("[dhcpv6-client] writing DUID failed, retrying in 5s")
 		select {
 		case <-ctx.Done():
 			return
@@ -278,23 +277,23 @@ func (c *dhcpClient) run(ctx context.Context, wait bool) {
 		}
 	}
 	if wait {
-		log.Printf("[dhcpv6-client] waiting for upstream RA M/O flags before starting")
+		infof("[dhcpv6-client] waiting for upstream RA M/O flags before starting")
 		select {
 		case <-ctx.Done():
 			return
 		case f := <-c.start:
 			switch {
 			case f.managed:
-				log.Printf("[dhcpv6-client] upstream RA has M bit, starting in stateful mode")
+				infof("[dhcpv6-client] upstream RA has M bit, starting in stateful mode")
 			case f.other:
 				// O bit only calls for Information-Request, but Japanese IPoE often serves PD on O-only lines
 				c.raOther = true
-				log.Printf("[dhcpv6-client] upstream RA has only O bit, still requesting IA_PD (falling back to Information-Request if none)")
+				infof("[dhcpv6-client] upstream RA has only O bit, still requesting IA_PD (falling back to Information-Request if none)")
 			default:
-				log.Printf("[dhcpv6-client] upstream RA has no M/O bits, RFC says no DHCPv6 needed; still probing PD with SOLICIT, retrying silently with backoff if unanswered")
+				infof("[dhcpv6-client] upstream RA has no M/O bits, RFC says no DHCPv6 needed; still probing PD with SOLICIT, retrying silently with backoff if unanswered")
 			}
 		case <-time.After(8 * time.Second):
-			log.Printf("[dhcpv6-client] no upstream RA within 8s, starting in stateful mode")
+			warnf("[dhcpv6-client] no upstream RA within 8s, starting in stateful mode")
 		}
 	}
 	for ctx.Err() == nil {
@@ -342,7 +341,7 @@ func (c *dhcpClient) waitLinkUp(ctx context.Context) {
 			return
 		} else {
 			// link-local may still be in DAD; retry shortly
-			log2("[dhcpv6-client] opening socket failed: %v", err)
+			debugf("[dhcpv6-client] opening socket failed: %v", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -397,7 +396,7 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 			return
 		}
 		c.fallbackInfo()
-		log.Printf("[dhcpv6-client] server gave no binding, retrying in 10s")
+		warnf("[dhcpv6-client] server gave no binding, retrying in 10s")
 		select {
 		case <-ctx.Done():
 		case <-time.After(10 * time.Second):
@@ -412,7 +411,7 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 			if c.releaseOn || dryRun {
 				c.release(lease)
 			} else {
-				log.Printf("[dhcpv6-client] exiting, keeping DHCPv6 binding (-dhcp6c-release to release instead)")
+				infof("[dhcpv6-client] exiting, keeping DHCPv6 binding (-dhcp6c-release to release instead)")
 			}
 			return
 		case "down":
@@ -456,7 +455,7 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 				continue
 			}
 		}
-		log.Printf("[dhcpv6-client] REBIND failed: %v, back to SOLICIT", err)
+		warnf("[dhcpv6-client] REBIND failed: %v, back to SOLICIT", err)
 		c.clearLease()
 		return
 	}
@@ -467,10 +466,10 @@ func (c *dhcpClient) onExchangeErr(err error) {
 		return
 	}
 	if errors.Is(err, errLinkDown) {
-		log.Printf("[dhcpv6-client] link down, pausing")
+		infof("[dhcpv6-client] link down, pausing")
 		return
 	}
-	log2("[dhcpv6-client] %v", err)
+	debugf("[dhcpv6-client] %v", err)
 }
 
 // waitBound waits in BOUND and returns "t1" / "reconf" / "down" / "ctx".
@@ -484,10 +483,10 @@ func (c *dhcpClient) waitBound(ctx context.Context, t1 time.Time) string {
 		case <-t.C:
 			return "t1"
 		case why := <-c.reconfirm:
-			log.Printf("[dhcpv6-client] %s, REBIND to reconfirm PD", why)
+			infof("[dhcpv6-client] %s, REBIND to reconfirm PD", why)
 			return "reconfirm"
 		case mt := <-c.reconfig:
-			log.Printf("[dhcpv6-client] received Reconfigure(%s)", mt)
+			infof("[dhcpv6-client] received Reconfigure(%s)", mt)
 			return "reconf"
 		case ev := <-c.link:
 			c.linkUp = ev.Up
@@ -506,7 +505,7 @@ func (c *dhcpClient) handleUnsolicited(msg *dhcpv6.Message) {
 		return
 	}
 	if !c.verifyReconfigure(msg) {
-		log.Printf("[dhcpv6-client] Reconfigure verification failed, dropped")
+		warnf("[dhcpv6-client] Reconfigure verification failed, dropped")
 		return
 	}
 	mt := dhcpv6.MessageTypeRenew
@@ -711,7 +710,7 @@ func (c *dhcpClient) refusedWait(ctx context.Context, why string) {
 	}
 	// Tell the prefix state machine PD is settled (none) so it can use RA prefixes
 	c.store.Set("pd", SourceUpdate{})
-	log.Printf("[dhcpv6-client] %s, retrying in %s (unaffected while upstream RA prefixes exist)", why, c.refuseBackoff)
+	warnf("[dhcpv6-client] %s, retrying in %s (unaffected while upstream RA prefixes exist)", why, c.refuseBackoff)
 	select {
 	case <-ctx.Done():
 	case <-time.After(c.refuseBackoff):
@@ -765,7 +764,7 @@ func (c *dhcpClient) renewOrRebind(ctx context.Context, mt dhcpv6.MessageType, p
 			return false, false
 		}
 		if st := m.Options.Status(); st != nil && st.StatusCode != iana.StatusSuccess {
-			log.Printf("[dhcpv6-client] %s rejected: %s", mt, st.StatusMessage)
+			warnf("[dhcpv6-client] %s rejected: %s", mt, st.StatusMessage)
 			return false, false
 		}
 		reply = m
@@ -842,10 +841,10 @@ func (c *dhcpClient) exchange(ctx context.Context, mt dhcpv6.MessageType, p retr
 		}
 		msg := build(elapsed, tid)
 		if err := c.send(msg); err != nil {
-			log2("[dhcpv6-client] sending %s failed: %v", mt, err)
+			debugf("[dhcpv6-client] sending %s failed: %v", mt, err)
 			statInc("send_error")
 		} else {
-			log2("[dhcpv6-client] sent %s (attempt %d, RT=%s)", mt, count+1, rt.Round(time.Millisecond))
+			debugf("[dhcpv6-client] sent %s (attempt %d, RT=%s)", mt, count+1, rt.Round(time.Millisecond))
 			statInc(strings.ToLower(mt.String()) + "_sent")
 		}
 		wait := rt
@@ -976,13 +975,13 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 	}
 	for _, ia := range reply.Options.IAPD() {
 		if st := ia.Options.Status(); st != nil && st.StatusCode != iana.StatusSuccess {
-			log.Printf("[dhcpv6-client] IA_PD status %s: %s", st.StatusCode, st.StatusMessage)
+			warnf("[dhcpv6-client] IA_PD status %s: %s", st.StatusCode, st.StatusMessage)
 			continue
 		}
 		t1, t2 = pickT(t1, ia.T1), pickT(t2, ia.T2)
 		for _, p := range ia.Options.Prefixes() {
 			if p.ValidLifetime == 0 || p.Prefix == nil {
-				log.Printf("[dhcpv6-client] prefix %v lifetime=0, withdrawn", p.Prefix)
+				infof("[dhcpv6-client] prefix %v lifetime=0, withdrawn", p.Prefix)
 				continue
 			}
 			addr, ok := netip.AddrFromSlice(p.Prefix.IP)
@@ -1000,7 +999,7 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 	}
 	for _, ia := range reply.Options.IANA() {
 		if st := ia.Options.Status(); st != nil && st.StatusCode != iana.StatusSuccess {
-			log.Printf("[dhcpv6-client] IA_NA status %s: %s", st.StatusCode, st.StatusMessage)
+			warnf("[dhcpv6-client] IA_NA status %s: %s", st.StatusCode, st.StatusMessage)
 			continue
 		}
 		t1, t2 = pickT(t1, ia.T1), pickT(t2, ia.T2)
@@ -1016,7 +1015,7 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 				maxValid = a.ValidLifetime
 			}
 			if err := addrSet(c.ifi.Index, addr, 128, a.PreferredLifetime, a.ValidLifetime, false, 0); err != nil {
-				log.Printf("[dhcpv6-client] configuring WAN address %s failed: %v", addr, err)
+				errorf("[dhcpv6-client] configuring WAN address %s failed: %v", addr, err)
 			}
 		}
 	}
@@ -1049,7 +1048,7 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 		t2 = t1
 	}
 	l.t1, l.t2, l.valid = now.Add(t1), now.Add(t2), now.Add(maxValid)
-	log.Printf("[dhcpv6-client] bound %d prefixes %d addresses, T1=%s T2=%s", len(l.prefixes), len(l.addrs), t1, t2)
+	infof("[dhcpv6-client] bound %d prefixes %d addresses, T1=%s T2=%s", len(l.prefixes), len(l.addrs), t1, t2)
 	return l
 }
 
@@ -1071,7 +1070,7 @@ type raFlags struct {
 func (c *dhcpClient) fallbackInfo() bool {
 	if c.raOther && !c.infoOnly {
 		c.infoOnly = true
-		log.Printf("[dhcpv6-client] PD probing got nothing and upstream RA has only O bit, switching to Information-Request for DNS etc.")
+		infof("[dhcpv6-client] PD probing got nothing and upstream RA has only O bit, switching to Information-Request for DNS etc.")
 		return true
 	}
 	return false
@@ -1085,7 +1084,7 @@ func (c *dhcpClient) release(l *lease) {
 	}
 	rctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	log.Printf("[dhcpv6-client] exiting, sending RELEASE for %d prefixes %d addresses", len(l.prefixes), len(l.addrs))
+	infof("[dhcpv6-client] exiting, sending RELEASE for %d prefixes %d addresses", len(l.prefixes), len(l.addrs))
 	err := c.exchange(rctx, dhcpv6.MessageTypeRelease, relParams, func(el time.Duration, tid dhcpv6.TransactionID) *dhcpv6.Message {
 		mods := append(c.baseOptions(el), dhcpv6.WithServerID(c.serverID))
 		mods = append(mods, c.iaOptions(l)...)
@@ -1097,10 +1096,10 @@ func (c *dhcpClient) release(l *lease) {
 		return m.MessageType == dhcpv6.MessageTypeReply, true
 	})
 	if err != nil {
-		log2("[dhcpv6-client] RELEASE not acknowledged: %v", err)
+		debugf("[dhcpv6-client] RELEASE not acknowledged: %v", err)
 		return
 	}
-	log.Printf("[dhcpv6-client] RELEASE acknowledged")
+	infof("[dhcpv6-client] RELEASE acknowledged")
 	c.clearLease()
 }
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net"
 	"net/netip"
 	"strconv"
@@ -71,7 +70,7 @@ func (c *raClient) serve(ctx context.Context, ifi *net.Interface) {
 		// supervise retries every second; report each distinct error once
 		if msg := err.Error(); msg != c.lastOpenErr {
 			c.lastOpenErr = msg
-			log.Printf("[ra-client] failed to open %s: %v (further identical errors suppressed)", c.ifname, err)
+			errorf("[ra-client] failed to open %s: %v (further identical errors suppressed)", c.ifname, err)
 		}
 		return
 	}
@@ -117,10 +116,10 @@ func (c *raClient) serve(ctx context.Context, ifi *net.Interface) {
 				rsLeft--
 				rs := &ndp.RouterSolicitation{Options: []ndp.Option{&ndp.LinkLayerAddress{Direction: ndp.Source, Addr: c.ifi.HardwareAddr}}}
 				if err := conn.WriteTo(rs, ifCM(c.ifi), allRouters2.WithZone(c.ifi.Name)); err != nil {
-					log2("[ra-client] failed to send RS: %v", err)
+					debugf("[ra-client] failed to send RS: %v", err)
 					statInc("send_error")
 				} else {
-					log2("[ra-client] sent RS (%d of 3)", 3-rsLeft)
+					debugf("[ra-client] sent RS (%d of 3)", 3-rsLeft)
 					statInc("rs_sent")
 				}
 				rsTimer.Reset(4 * time.Second)
@@ -143,10 +142,10 @@ func pppDefaultRoute(ifi *net.Interface) {
 		return
 	}
 	if err := routeSet(ifi.Index, netip.MustParsePrefix("::/0"), netip.Addr{}, 4096, 0); err != nil {
-		log.Printf("[ra-client] failed to set device default route on %s: %v", ifi.Name, err)
+		warnf("[ra-client] failed to set device default route on %s: %v", ifi.Name, err)
 		return
 	}
-	log.Printf("[ra-client] %s is point-to-point with no RA; default route points at the device (metric 4096, an RA takes over when it arrives)", ifi.Name)
+	infof("[ra-client] %s is point-to-point with no RA; default route points at the device (metric 4096, an RA takes over when it arrives)", ifi.Name)
 	statInc("ppp_default_route")
 }
 
@@ -255,23 +254,23 @@ func parseRA(ra *ndp.RouterAdvertisement, now time.Time, ifMTU int, slaac, wanOn
 func (c *raClient) handle(ra *ndp.RouterAdvertisement, from netip.Addr) {
 	now := time.Now()
 	statInc("ra_recv")
-	log2("[ra-client] RA from %s, M=%v O=%v lifetime=%s, %d options", from, ra.ManagedConfiguration, ra.OtherConfiguration, ra.RouterLifetime, len(ra.Options))
+	debugf("[ra-client] RA from %s, M=%v O=%v lifetime=%s, %d options", from, ra.ManagedConfiguration, ra.OtherConfiguration, ra.RouterLifetime, len(ra.Options))
 	r := c.routers[from]
 	if r == nil {
 		r = &routerInfo{routes: map[netip.Prefix]time.Time{}}
 		c.routers[from] = r
-		log.Printf("[ra-client] discovered router %s", from)
+		infof("[ra-client] discovered router %s", from)
 	}
 	r.seen = now
 	r.pref = ra.RouterSelectionPreference
 	if ra.RouterLifetime > 0 {
 		r.lifetime = now.Add(ra.RouterLifetime)
 		if err := routeSet(c.ifi.Index, netip.MustParsePrefix("::/0"), from, routerMetric(r.pref), ra.RouterLifetime); err != nil {
-			log.Printf("[ra-client] failed to set default route: %v", err)
+			errorf("[ra-client] failed to set default route: %v", err)
 		}
 	} else {
 		if !r.lifetime.IsZero() {
-			log.Printf("[ra-client] router %s lifetime went to zero, withdrawing default route and prefixes", from)
+			warnf("[ra-client] router %s lifetime went to zero, withdrawing default route and prefixes", from)
 		}
 		r.lifetime = time.Time{}
 		routeDel(c.ifi.Index, netip.MustParsePrefix("::/0"), from, routerMetric(r.pref))
@@ -287,7 +286,7 @@ func (c *raClient) handle(ra *ndp.RouterAdvertisement, from netip.Addr) {
 	}
 	info := parseRA(ra, now, c.ifi.MTU, c.slaac, c.layout.wanOnLink())
 	for _, pf := range info.revoked {
-		log.Printf("[ra-client] prefix %s revoked", pf)
+		infof("[ra-client] prefix %s revoked", pf)
 	}
 	for range info.prefixes {
 		statInc("ra_prefix")
@@ -306,14 +305,14 @@ func (c *raClient) handle(ra *ndp.RouterAdvertisement, from netip.Addr) {
 	}
 	r.dns, r.dnssl, r.pref64 = info.dns, info.dnssl, info.pref64
 	if info.badMTU != 0 {
-		log2("[ra-client] ignoring unreasonable upstream MTU %d", info.badMTU)
+		debugf("[ra-client] ignoring unreasonable upstream MTU %d", info.badMTU)
 	}
 	if info.mtu != 0 {
 		r.mtu = info.mtu
 		if info.mtu < c.ifi.MTU {
 			// RFC 4861 §6.3.4: the RA MTU sets the link's IPv6 MTU only, not the interface MTU.
 			if cur, _ := sysctlGet(c.ifname, "mtu"); cur != strconv.Itoa(info.mtu) {
-				log.Printf("[ra-client] upstream RA requests MTU %d (interface %d), setting WAN IPv6 MTU", info.mtu, c.ifi.MTU)
+				infof("[ra-client] upstream RA requests MTU %d (interface %d), setting WAN IPv6 MTU", info.mtu, c.ifi.MTU)
 				sysctlSet(c.ifname, "mtu", strconv.Itoa(info.mtu))
 			}
 		}
@@ -334,7 +333,7 @@ func (c *raClient) publish() {
 	seen := map[netip.Prefix]bool{}
 	for addr, r := range c.routers {
 		if !r.lifetime.IsZero() && now.After(r.lifetime) {
-			log.Printf("[ra-client] router %s timed out", addr)
+			warnf("[ra-client] router %s timed out", addr)
 			routeDel(c.ifi.Index, netip.MustParsePrefix("::/0"), addr, routerMetric(r.pref))
 			delete(c.routers, addr)
 			continue

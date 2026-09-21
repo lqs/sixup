@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -88,7 +87,7 @@ func (r *raServer) run(ctx context.Context, hub *linkHub, store *Store, ch <-cha
 func (r *raServer) serve(ctx context.Context, store *Store, ch <-chan Snapshot) {
 	if err := r.open(); err != nil {
 		// the link-local address may still be in DAD; supervise retries later
-		log.Printf("[ra-server %s] failed to open interface: %v", r.ifname, err)
+		errorf("[ra-server %s] failed to open interface: %v", r.ifname, err)
 		return
 	}
 	defer r.conn.Close()
@@ -246,11 +245,11 @@ func (r *raServer) build() *ndp.RouterAdvertisement {
 func (r *raServer) send() {
 	ra := r.build()
 	if err := r.conn.WriteTo(ra, ifCM(r.ifi), allNodes.WithZone(r.ifi.Name)); err != nil {
-		log.Printf("[ra-server %s] send failed: %v", r.ifname, err)
+		warnf("[ra-server %s] send failed: %v", r.ifname, err)
 		return
 	}
 	r.lastSent = time.Now()
-	log2("[ra-server %s] sent RA, %d options, lifetime=%s", r.ifname, len(ra.Options), ra.RouterLifetime)
+	debugf("[ra-server %s] sent RA, %d options, lifetime=%s", r.ifname, len(ra.Options), ra.RouterLifetime)
 }
 
 // ifCM pins the outgoing interface. Without it macOS reports no route to host for link-local

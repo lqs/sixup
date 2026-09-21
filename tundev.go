@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"net"
 	"net/netip"
 )
@@ -67,7 +66,7 @@ func (m *tunnelManager) run(ctx context.Context, ch <-chan Snapshot) {
 			}
 			// The local endpoint must be on the WAN interface and past DAD, or the kernel cannot send
 			if conflicted(s, spec.Local) {
-				log.Printf("[tunnel-dev %s] local endpoint %s has a DAD conflict, deferring tunnel setup", m.dev, spec.Local)
+				warnf("[tunnel-dev %s] local endpoint %s has a DAD conflict, deferring tunnel setup", m.dev, spec.Local)
 				continue
 			}
 			m.apply(spec)
@@ -161,7 +160,7 @@ func planTunnel(s Snapshot, dev, wan string, mtuOverride, wanIfMTU int, metric4 
 func (m *tunnelManager) apply(spec tunnelSpec) {
 	wan, err := ifaceByName(m.wan)
 	if err != nil {
-		log.Printf("[tunnel-dev %s] WAN interface %s: %v", m.dev, m.wan, err)
+		warnf("[tunnel-dev %s] WAN interface %s: %v", m.dev, m.wan, err)
 		return
 	}
 	mtu := tunnelMTU(m.mtu, wan.MTU, m.wanMTU)
@@ -170,19 +169,19 @@ func (m *tunnelManager) apply(spec tunnelSpec) {
 		verb = "modified"
 	}
 	if err := tunnelSet(m.dev, wan.Index, spec.Local, spec.Remote, mtu); err != nil {
-		log.Printf("[tunnel-dev %s] tunnel %s failed: %v", m.dev, verb, err)
+		errorf("[tunnel-dev %s] tunnel %s failed: %v", m.dev, verb, err)
 		return
 	}
-	log.Printf("[tunnel-dev %s] %s ip6tnl: %s → %s, link %s, mtu %d (%s)", m.dev, verb, spec.Local, spec.Remote, m.wan, mtu, spec.Kind)
+	infof("[tunnel-dev %s] %s ip6tnl: %s → %s, link %s, mtu %d (%s)", m.dev, verb, spec.Local, spec.Remote, m.wan, mtu, spec.Kind)
 	if spec.IPv4.IsValid() {
 		if other := addr4Holder(m.dev, spec.IPv4); other != "" {
-			log.Printf("[tunnel-dev %s] IPv4 %s is already configured on %s, leaving the tunnel without an address and without a route: remove it there, or point -tunnel-dev at that device", m.dev, spec.IPv4, other)
+			warnf("[tunnel-dev %s] IPv4 %s is already configured on %s, leaving the tunnel without an address and without a route: remove it there, or point -tunnel-dev at that device", m.dev, spec.IPv4, other)
 			return
 		}
 		if err := addr4Set(m.dev, spec.IPv4); err != nil {
-			log.Printf("[tunnel-dev %s] failed to configure IPv4 %s: %v", m.dev, spec.IPv4, err)
+			errorf("[tunnel-dev %s] failed to configure IPv4 %s: %v", m.dev, spec.IPv4, err)
 		} else {
-			log.Printf("[tunnel-dev %s] IPv4 %s/32 configured; NAT is left to external policy", m.dev, spec.IPv4)
+			infof("[tunnel-dev %s] IPv4 %s/32 configured; NAT is left to external policy", m.dev, spec.IPv4)
 			m.route4()
 		}
 	}
@@ -197,14 +196,14 @@ func (m *tunnelManager) route4() {
 	}
 	dev, err := net.InterfaceByName(m.dev)
 	if err != nil {
-		log.Printf("[tunnel-dev %s] IPv4 default route skipped: %v", m.dev, err)
+		warnf("[tunnel-dev %s] IPv4 default route skipped: %v", m.dev, err)
 		return
 	}
 	if err := routeSet(dev.Index, netip.MustParsePrefix("0.0.0.0/0"), netip.Addr{}, m.metric4, 0); err != nil {
-		log.Printf("[tunnel-dev %s] IPv4 default route failed: %v", m.dev, err)
+		warnf("[tunnel-dev %s] IPv4 default route failed: %v", m.dev, err)
 		return
 	}
-	log.Printf("[tunnel-dev %s] IPv4 default route points at the device with metric %d", m.dev, m.metric4)
+	infof("[tunnel-dev %s] IPv4 default route points at the device with metric %d", m.dev, m.metric4)
 }
 
 // addr4Holder names the other interface that already carries this IPv4 address, empty when none
@@ -216,7 +215,7 @@ func (m *tunnelManager) route4() {
 func addr4Holder(dev string, a netip.Addr) string {
 	ifis, err := net.Interfaces()
 	if err != nil {
-		log.Printf("[tunnel-dev %s] cannot list interfaces to check for a duplicate IPv4: %v", dev, err)
+		warnf("[tunnel-dev %s] cannot list interfaces to check for a duplicate IPv4: %v", dev, err)
 		return ""
 	}
 	for _, ifi := range ifis {

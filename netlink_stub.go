@@ -35,7 +35,7 @@ var errConntrackUnavailable = errors.New("conntrack unavailable")
 
 func skipOrUnsupported(what string) error {
 	if dryRun {
-		log2("[dry-run] skipping %s", what)
+		debugf("[dry-run] skipping %s", what)
 		return nil
 	}
 	return errUnsupported

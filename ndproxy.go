@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net"
 	"net/netip"
 	"sync"
@@ -75,9 +74,9 @@ func (n *ndProxy) setPrefixes(s Snapshot) {
 		}
 		if on != n.autoOn {
 			if on {
-				log.Printf("[ndp-proxy] LAN shares the on-link /64 with the upstream, enabling NDP proxy (forward mode)")
+				infof("[ndp-proxy] LAN shares the on-link /64 with the upstream, enabling NDP proxy (forward mode)")
 			} else {
-				log.Printf("[ndp-proxy] LAN prefix is routed via PD, disabling NDP proxy")
+				infof("[ndp-proxy] LAN prefix is routed via PD, disabling NDP proxy")
 			}
 			n.autoOn = on
 		}
@@ -165,7 +164,7 @@ func (n *ndProxy) serve(ctx context.Context, ch <-chan Snapshot) {
 	var err error
 	n.wanConn, err = openNDConn(n.wanIfi, ipv6.ICMPTypeNeighborSolicitation, ipv6.ICMPTypeNeighborAdvertisement)
 	if err != nil {
-		log.Printf("[ndp-proxy] failed to open %s: %v", n.wanIf, err)
+		errorf("[ndp-proxy] failed to open %s: %v", n.wanIf, err)
 		return
 	}
 	defer n.wanConn.Close()
@@ -175,7 +174,7 @@ func (n *ndProxy) serve(ctx context.Context, ch <-chan Snapshot) {
 	if n.effectiveMode() == proxyForward {
 		n.lanConn, err = openNDConn(n.lanIfi, ipv6.ICMPTypeNeighborSolicitation, ipv6.ICMPTypeNeighborAdvertisement)
 		if err != nil {
-			log.Printf("[ndp-proxy] failed to open %s: %v", n.lanIf, err)
+			errorf("[ndp-proxy] failed to open %s: %v", n.lanIf, err)
 			return
 		}
 		defer n.lanConn.Close()
@@ -218,11 +217,11 @@ func (n *ndProxy) applyStatic() {
 	sysctlSet(n.wanIf, "proxy_ndp", "1")
 	for _, p := range n.static {
 		if p.Bits() != 128 {
-			log.Printf("[ndp-proxy] static mode only accepts single addresses, skipping %s", p)
+			warnf("[ndp-proxy] static mode only accepts single addresses, skipping %s", p)
 			continue
 		}
 		if err := neighProxySet(n.wanIfi.Index, p.Addr(), false); err != nil {
-			log.Printf("[ndp-proxy] failed to add proxy %s: %v", p.Addr(), err)
+			warnf("[ndp-proxy] failed to add proxy %s: %v", p.Addr(), err)
 		}
 	}
 }
@@ -440,7 +439,7 @@ func (n *ndProxy) probe(side side, target netip.Addr) {
 		Options:       []ndp.Option{&ndp.LinkLayerAddress{Direction: ndp.Source, Addr: ifi.HardwareAddr}},
 	}
 	if err := c.WriteTo(ns, ifCM(ifi), snm.WithZone(ifi.Name)); err != nil {
-		log2("[ndp-proxy] probe on the %s side for %s failed: %v", side, target, err)
+		debugf("[ndp-proxy] probe on the %s side for %s failed: %v", side, target, err)
 	}
 }
 
@@ -462,8 +461,8 @@ func (n *ndProxy) reply(side side, target, to netip.Addr) {
 		dst = allNodes
 	}
 	if err := c.WriteTo(na, ifCM(ifi), dst.WithZone(ifi.Name)); err != nil {
-		log2("[ndp-proxy] reply on the %s side for %s failed: %v", side, target, err)
+		debugf("[ndp-proxy] reply on the %s side for %s failed: %v", side, target, err)
 		return
 	}
-	log2("[ndp-proxy] proxy reply on the %s side for %s -> %s", side, target, dst)
+	debugf("[ndp-proxy] proxy reply on the %s side for %s -> %s", side, target, dst)
 }

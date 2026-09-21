@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"log"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -460,7 +459,7 @@ func (s *Store) recompute(now time.Time) {
 				hold = op.Valid
 			}
 			s.revoked[op.Prefix] = revokedLAN{iface, Prefix{Prefix: op.Prefix, Preferred: now, Valid: hold, Source: op.Source, Deprecated: true}}
-			log.Printf("[prefix-store] %s on %s revoked, advertising preferred=0 until %s", iface, op.Prefix, hold.Format(time.TimeOnly))
+			infof("[prefix-store] %s on %s revoked, advertising preferred=0 until %s", iface, op.Prefix, hold.Format(time.TimeOnly))
 		}
 	}
 	for _, op := range s.cur.WAN {
@@ -537,7 +536,7 @@ func (s *Store) recompute(now time.Time) {
 	if change == changeNone {
 		return // nothing material changed; do not open a settle window for it
 	}
-	log.Printf("[prefix-store] change %s, source %s, %s", change, src, next.describe(now))
+	infof("[prefix-store] change %s, source %s, %s", change, src, next.describe(now))
 	if changeRank(change) > changeRank(s.pending) {
 		s.pending = change
 	}
@@ -602,7 +601,7 @@ func (s *Store) warnShort(short []shortPrefix) {
 		byPrefix[sp.prefix] = append(byPrefix[sp.prefix], fmt.Sprintf("%s(subnet %d)", sp.lan.iface, sp.lan.index))
 	}
 	for _, pf := range order {
-		log.Printf("[prefix-store] %s is too short to cover %s: that segment gets no address from it. "+
+		warnf("[prefix-store] %s is too short to cover %s: that segment gets no address from it. "+
 			"A /64 holds one segment only; ask the ISP for a shorter delegation, or run -lan-ula for internal addresses",
 			pf, strings.Join(byPrefix[pf], " "))
 	}
@@ -713,7 +712,7 @@ func loadULA(stateDir, spec string) ([]netip.Prefix, error) {
 				return nil, err
 			}
 		}
-		log.Printf("[prefix-store] generated ULA %s", pf)
+		infof("[prefix-store] generated ULA %s", pf)
 		return []netip.Prefix{pf}, nil
 	}
 	var out []netip.Prefix

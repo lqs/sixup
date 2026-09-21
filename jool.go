@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"log"
 	"net/netip"
 	"os"
 	"strconv"
@@ -132,7 +131,7 @@ func (m *joolManager) report(err error) {
 	}
 	if msg := err.Error(); msg != m.lastErr {
 		m.lastErr = msg
-		log.Printf("[jool] %s", msg)
+		warnf("[jool] %s", msg)
 	}
 }
 
@@ -153,7 +152,7 @@ func (m *joolManager) configure(pool pool4Entry) error {
 
 	switch err := m.request(c, fam.ID, ver, opInstanceAdd, m.instanceAttrs()); {
 	case err == nil:
-		log.Printf("[jool] instance %q created, translating %s", m.iname, joolNAT64)
+		infof("[jool] instance %q created, translating %s", m.iname, joolNAT64)
 	case errors.Is(err, unix.EEXIST):
 		// Left over from a previous run or created by hand; its pool4 is rewritten below either way
 	default:
@@ -173,10 +172,10 @@ func (m *joolManager) configure(pool pool4Entry) error {
 		}
 	}
 	if len(pool.ports) > 0 {
-		log.Printf("[jool] translating to %s, %d ports in %d ranges: %s",
+		infof("[jool] translating to %s, %d ports in %d ranges: %s",
 			pool.addr, portCount(pool.ports), len(pool.ports), spansString(pool.ports))
 	} else {
-		log.Printf("[jool] translating to %s, every port", pool.addr)
+		infof("[jool] translating to %s, every port", pool.addr)
 	}
 	return nil
 }
@@ -196,10 +195,10 @@ func (m *joolManager) remove() {
 		return
 	}
 	if err := m.request(c, fam.ID, ver, opInstanceRm, nil); err != nil {
-		log.Printf("[jool] cannot remove instance %q: %v", m.iname, err)
+		warnf("[jool] cannot remove instance %q: %v", m.iname, err)
 		return
 	}
-	log.Printf("[jool] instance %q removed", m.iname)
+	infof("[jool] instance %q removed", m.iname)
 }
 
 func (m *joolManager) request(c *genetlink.Conn, family uint16, ver uint32, op uint8, attrs []byte) error {

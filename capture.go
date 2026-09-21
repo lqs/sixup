@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"log"
 	"net/netip"
 	"time"
 )
@@ -69,7 +68,7 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 			sub.Close()
 			sub = nil
 			frames = nil
-			log.Printf("[tunnel-capture] tunnel inference finished")
+			infof("[tunnel-capture] tunnel inference finished")
 		}
 	}
 	defer end()
@@ -90,7 +89,7 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 				lastKey = key
 				// Discard the old decision only once the captured local endpoint falls outside every WAN prefix; gaining a first prefix is not a change
 				if s.Tunnel != nil && s.Tunnel.Captured != nil && len(s.WAN) > 0 && !localStillValid(s, s.Tunnel.Captured.Local) {
-					log.Printf("[tunnel-capture] local endpoint %s is no longer inside a WAN prefix, discarding the old decision and inferring again", s.Tunnel.Captured.Local)
+					infof("[tunnel-capture] local endpoint %s is no longer inside a WAN prefix, discarding the old decision and inferring again", s.Tunnel.Captured.Local)
 					w.store.SetCaptured(nil)
 					end()
 				}
@@ -102,7 +101,7 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 				frames = sub.C
 				started = time.Now()
 				cc = &tunnelSniffer{tunnels: map[[2]netip.Addr]*tunnelObs{}}
-				log.Printf("[tunnel-capture] DHCPv6 delivered no tunnel options, inferring from tunnel traffic (up to %s)", w.maxRun)
+				infof("[tunnel-capture] DHCPv6 delivered no tunnel options, inferring from tunnel traffic (up to %s)", w.maxRun)
 			}
 			if !need && sub != nil {
 				end()
@@ -129,7 +128,7 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 				continue
 			}
 			if time.Since(started) > w.maxRun {
-				log.Printf("[tunnel-capture] no tunnel packets within %s, stopping capture", w.maxRun)
+				warnf("[tunnel-capture] no tunnel packets within %s, stopping capture", w.maxRun)
 				end()
 			}
 		}
@@ -195,7 +194,7 @@ func (c *tunnelSniffer) handleTunnel(src, dst netip.Addr, in []byte) {
 	if o == nil {
 		o = &tunnelObs{Remote: src, Local: dst, Inner4s: map[netip.Addr]int{}, Ports: map[uint16]int{}, First: now}
 		c.tunnels[key] = o
-		log.Printf("[tunnel-capture] found tunnel %s -> %s, inner IPv4 destination %s", src, dst, inner4)
+		infof("[tunnel-capture] found tunnel %s -> %s, inner IPv4 destination %s", src, dst, inner4)
 	}
 	o.Packets++
 	o.Last = now
@@ -253,9 +252,9 @@ func (o *tunnelObs) guess() tunnelGuess {
 // logInferred reports the decision; the note carries the confidence reasoning, which is the
 // only hint the operator gets on lines whose tunnel parameters never appear in DHCPv6.
 func logInferred(g tunnelGuess) {
-	log.Printf("[tunnel-capture] inferred %s, remote %s, local %s, IPv4 %s", g.Type, g.Remote, g.Local, g.IPv4)
+	infof("[tunnel-capture] inferred %s, remote %s, local %s, IPv4 %s", g.Type, g.Remote, g.Local, g.IPv4)
 	if g.Note != "" {
-		log.Printf("[tunnel-capture] %s confidence: %s", g.Confidence, g.Note)
+		infof("[tunnel-capture] %s confidence: %s", g.Confidence, g.Note)
 	}
 }
 

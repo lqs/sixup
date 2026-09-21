@@ -126,7 +126,7 @@ func parseTunnel(msg *dhcpv6.Message) *TunnelParams {
 			t.Errors = map[string]string{}
 		}
 		t.Errors[fmt.Sprint(int(code))] = err.Error()
-		log2("[tunnel-options] failed to parse option %d: %v", code, err)
+		debugf("[tunnel-options] failed to parse option %d: %v", code, err)
 	}
 	if o := msg.Options.GetOne(dhcpv6.OptionAFTRName); o != nil {
 		name, err := parseFQDN(o.ToBytes())
@@ -344,7 +344,7 @@ func resolveAFTR(ctx context.Context, name string) []netip.Addr {
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip6", name)
 	if err != nil {
-		log2("[tunnel-options] failed to resolve AFTR %s: %v", name, err)
+		debugf("[tunnel-options] failed to resolve AFTR %s: %v", name, err)
 		return nil
 	}
 	var out []netip.Addr

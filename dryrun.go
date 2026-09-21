@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"maps"
 	"net"
 	"os"
@@ -25,13 +24,10 @@ type dryOpts struct {
 }
 
 func runDry(ctx context.Context, store *Store, hub *linkHub, pkts *packetHub, o dryOpts) {
-	if verbose == 0 {
-		verbose = 1
-	}
 	if o.timeout > 0 {
-		log.Printf("[dry-run] only requesting parameters, changing no configuration, running for %s and printing on every change", o.timeout)
+		infof("[dry-run] only requesting parameters, changing no configuration, running for %s and printing on every change", o.timeout)
 	} else {
-		log.Printf("[dry-run] only requesting parameters, changing no configuration, running until interrupted and printing on every change (renewals, prefix changes and tunnel inference all included)")
+		infof("[dry-run] only requesting parameters, changing no configuration, running until interrupted and printing on every change (renewals, prefix changes and tunnel inference all included)")
 	}
 	ch := store.Subscribe()
 	var dhcp *dhcpClient
@@ -60,7 +56,7 @@ func runDry(ctx context.Context, store *Store, hub *linkHub, pkts *packetHub, o 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("[dry-run] interrupted, printing the final parameters")
+			infof("[dry-run] interrupted, printing the final parameters")
 			enc.Encode(dryReport(last, o))
 			dryDiagnose(last)
 			if dhcp != nil {
@@ -68,7 +64,7 @@ func runDry(ctx context.Context, store *Store, hub *linkHub, pkts *packetHub, o 
 			}
 			return
 		case <-deadline:
-			log.Printf("[dry-run] deadline reached, printing the final parameters")
+			infof("[dry-run] deadline reached, printing the final parameters")
 			enc.Encode(dryReport(last, o))
 			dryDiagnose(last)
 			return
@@ -92,7 +88,7 @@ func runDry(ctx context.Context, store *Store, hub *linkHub, pkts *packetHub, o 
 				label = "update"
 			}
 			first = false
-			log.Printf("[dry-run] parameters changed (%s), current report:", label)
+			infof("[dry-run] parameters changed (%s), current report:", label)
 			enc.Encode(dryReport(s, o))
 		}
 	}

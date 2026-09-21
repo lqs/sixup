@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/binary"
-	"log"
 	"sync"
 	"time"
 )
@@ -66,7 +65,7 @@ func (h *packetHub) reconcile() {
 		if h.stop != nil {
 			h.stop()
 			h.stop = nil
-			log.Printf("[tunnel-capture %s] no listeners, stopping capture", h.ifname)
+			infof("[tunnel-capture %s] no listeners, stopping capture", h.ifname)
 		}
 		return
 	}
@@ -92,14 +91,14 @@ func (h *packetHub) open(gen int) {
 			h.stop = stop
 			h.lastErr = ""
 			go h.dispatch(gen, frames)
-			log.Printf("[tunnel-capture %s] capture started (kinds %d)", h.ifname, h.kinds)
+			infof("[tunnel-capture %s] capture started (kinds %d)", h.ifname, h.kinds)
 			return
 		}
 		err = err2
 	}
 	if msg := err.Error(); msg != h.lastErr {
 		h.lastErr = msg
-		log.Printf("[tunnel-capture %s] capture open failed: %v, retrying every 2s (same error not repeated)", h.ifname, err)
+		warnf("[tunnel-capture %s] capture open failed: %v, retrying every 2s (same error not repeated)", h.ifname, err)
 	}
 	time.AfterFunc(2*time.Second, func() {
 		h.mu.Lock()
@@ -121,7 +120,7 @@ func (h *packetHub) onReaderExit(gen int) {
 	if len(h.subs) == 0 || h.ctx.Err() != nil {
 		return
 	}
-	log.Printf("[tunnel-capture %s] socket lost, reopening once the interface returns", h.ifname)
+	warnf("[tunnel-capture %s] socket lost, reopening once the interface returns", h.ifname)
 	h.gen++
 	g := h.gen
 	time.AfterFunc(2*time.Second, func() {

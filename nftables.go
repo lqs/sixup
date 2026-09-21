@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"log"
 	"net"
 	"strings"
 
@@ -72,7 +71,7 @@ func (m *natManager) apply(snap Snapshot) {
 	}
 	c, err := m.conn()
 	if err != nil {
-		log.Printf("[nat] cannot talk to nftables: %v", err)
+		errorf("[nat] cannot talk to nftables: %v", err)
 		return
 	}
 	m.warnConflicts(c)
@@ -103,15 +102,15 @@ func (m *natManager) apply(snap Snapshot) {
 		c.AddRule(m.mssRule(tbl, fwd, plan.mtu))
 	}
 	if err := c.Flush(); err != nil {
-		log.Printf("[nat] failed to install the ruleset: %v", err)
+		errorf("[nat] failed to install the ruleset: %v", err)
 		m.applied = ""
 		return
 	}
-	log.Printf("[nat] table inet %s installed for %s: %s%s", natTable, m.dev, plan.describe(), mssNote(plan.mtu))
+	infof("[nat] table inet %s installed for %s: %s%s", natTable, m.dev, plan.describe(), mssNote(plan.mtu))
 	if len(plan.ports) > 0 {
 		// The ranges themselves, because this is the number to quote when an ISP is asked why a
 		// connection was refused, and the only way to tell a wrong PSID from a wrong rule table.
-		log.Printf("[nat] port ranges: %s", spansString(plan.ports))
+		infof("[nat] port ranges: %s", spansString(plan.ports))
 	}
 }
 
@@ -201,7 +200,7 @@ func (m *natManager) warnConflicts(c *nftables.Conn) {
 	}
 	m.warned = true
 	if len(other) > 0 {
-		log.Printf("[nat] other source NAT chains are loaded (%s). A masquerade rule covering %s would "+
+		warnf("[nat] other source NAT chains are loaded (%s). A masquerade rule covering %s would "+
 			"translate to a port outside the range this line owns, and only some connections would work. "+
 			"Restrict those rules to the interfaces they are meant for, or run with -tunnel-nat off",
 			strings.Join(other, " "), m.dev)
@@ -219,10 +218,10 @@ func (m *natManager) remove() {
 	}
 	c.DelTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: natTable})
 	if err := c.Flush(); err != nil {
-		log.Printf("[nat] failed to remove table inet %s: %v", natTable, err)
+		warnf("[nat] failed to remove table inet %s: %v", natTable, err)
 		return
 	}
-	log.Printf("[nat] table inet %s removed", natTable)
+	infof("[nat] table inet %s removed", natTable)
 }
 
 // tunnelMTU reads the MTU the tunnel device ended up with, which the tunnel manager derives from the

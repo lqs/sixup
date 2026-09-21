@@ -3,7 +3,6 @@ package main
 import (
 	"flag"
 	"fmt"
-	"log"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -65,6 +64,8 @@ var (
 	joolRanges = flag.Int("jool-port-ranges", 3, "how many of the port ranges a MAP-E line owns are given to the translator; netfilter keeps the rest, and neither hands out a port the other might. Ignored where the line owns every port of its address")
 	tunNAT     = flag.String("tunnel-nat", "auto", "maintain the nftables table sixup for traffic leaving the tunnel device: auto configures the port-restricted source NAT a MAP-E customer edge is required to have (RFC 7597), an ordinary source NAT on a line with its own public IPv4, none on DS-Lite where the AFTR translates, and in every case an MSS clamp to the tunnel MTU; off writes no rules. Nothing outside that table is read or changed, and it is removed on exit")
 
+	logLevelName = flag.String("log-level", "info", "minimum level printed: debug / info / warn / error")
+
 	showVersion *bool
 	showLicense *bool
 )
@@ -77,7 +78,7 @@ func init() {
 	flag.Var(&routes, "ra-route", "Route Information carried in the RA, repeatable")
 	flag.Var(&ndStatic, "ndproxy-static", "static address or prefix for the NDP proxy, repeatable")
 	flag.Var(&ndExclude, "ndproxy-exclude", "prefix excluded from the NDP proxy, repeatable")
-	flag.IntVar(&verbose, "v", 0, "log level, 1 prints debug information")
+	flag.IntVar(&verbose, "v", 0, "shorthand for -log-level debug")
 	showVersion = flag.Bool("version", false, "print the version and exit")
 	showLicense = flag.Bool("license", false, "print the licence of sixup and of the work it derives from, and exit")
 }
@@ -96,7 +97,7 @@ func parseLans(list []string) []lanDef {
 			name = s[:k]
 			v, err := strconv.Atoi(s[k+1:])
 			if err != nil {
-				log.Fatalf("-lan %q has an invalid subnet id", s)
+				fatalf("-lan %q has an invalid subnet id", s)
 			}
 			idx = v
 		}
@@ -119,13 +120,13 @@ func parseStatics(list []string) []staticBind {
 			case "addr":
 				a, err := netip.ParseAddr(strings.TrimSpace(v))
 				if err != nil {
-					log.Fatalf("-dhcp6s-static %q has an invalid address: %v", s, err)
+					fatalf("-dhcp6s-static %q has an invalid address: %v", s, err)
 				}
 				b.addr = a
 			}
 		}
 		if !b.addr.IsValid() || (b.mac == "" && b.duid == "") {
-			log.Fatalf("-dhcp6s-static %q needs mac or duid, plus addr", s)
+			fatalf("-dhcp6s-static %q needs mac or duid, plus addr", s)
 		}
 		out = append(out, b)
 	}
@@ -135,12 +136,12 @@ func parseStatics(list []string) []staticBind {
 func parsePool(s string) (uint64, uint64) {
 	a, b, ok := strings.Cut(s, "-")
 	if !ok {
-		log.Fatalf("-dhcp6s-pool %q must have the form start-end", s)
+		fatalf("-dhcp6s-pool %q must have the form start-end", s)
 	}
 	start, err1 := strconv.ParseUint(a, 16, 64)
 	end, err2 := strconv.ParseUint(b, 16, 64)
 	if err1 != nil || err2 != nil || start > end {
-		log.Fatalf("-dhcp6s-pool %q is invalid", s)
+		fatalf("-dhcp6s-pool %q is invalid", s)
 	}
 	return start, end
 }
@@ -151,7 +152,7 @@ func parsePrefixOrAddr(s string) netip.Prefix {
 	}
 	a, err := netip.ParseAddr(s)
 	if err != nil {
-		log.Fatalf("%q is not a valid address or prefix", s)
+		fatalf("%q is not a valid address or prefix", s)
 	}
 	return netip.PrefixFrom(a, 128)
 }
@@ -208,4 +209,15 @@ func printUsage() {
 		}
 		printFlag(f)
 	})
+}
+
+// flagGiven reports whether the option was actually passed on the command line.
+func flagGiven(name string) bool {
+	given := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			given = true
+		}
+	})
+	return given
 }

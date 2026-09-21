@@ -10,7 +10,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -90,14 +89,14 @@ func (s *dhcpServer) serve(ctx context.Context, ch <-chan Snapshot) {
 	lc := net.ListenConfig{Control: reusePort}
 	pconn, err := lc.ListenPacket(ctx, "udp6", "[::]:547")
 	if err != nil {
-		log.Printf("[dhcpv6-server %s] listen on 547 failed: %v", s.ifname, err)
+		errorf("[dhcpv6-server %s] listen on 547 failed: %v", s.ifname, err)
 		return
 	}
 	conn := pconn.(*net.UDPConn)
 	defer conn.Close()
 	pc := ipv6.NewPacketConn(conn)
 	if err := pc.JoinGroup(s.ifi, &net.UDPAddr{IP: allRouters.AsSlice()}); err != nil {
-		log.Printf("[dhcpv6-server %s] join ff02::1:2 failed: %v", s.ifname, err)
+		errorf("[dhcpv6-server %s] join ff02::1:2 failed: %v", s.ifname, err)
 		return
 	}
 	pc.SetControlMessage(ipv6.FlagInterface, true)
@@ -140,7 +139,7 @@ func (s *dhcpServer) reader(pc *ipv6.PacketConn) {
 		}
 		msg, err := dhcpv6.MessageFromBytes(buf[:n])
 		if err != nil {
-			log2("[dhcpv6-server %s] parse failed: %v", s.ifname, err)
+			debugf("[dhcpv6-server %s] parse failed: %v", s.ifname, err)
 			continue
 		}
 		udp, ok := src.(*net.UDPAddr)
@@ -150,7 +149,7 @@ func (s *dhcpServer) reader(pc *ipv6.PacketConn) {
 		peer, _ := netip.AddrFromSlice(udp.IP)
 		if resp := s.handle(msg, peer.Unmap()); resp != nil {
 			if _, err := pc.WriteTo(resp.ToBytes(), &ipv6.ControlMessage{IfIndex: s.ifi.Index}, udp); err != nil {
-				log2("[dhcpv6-server %s] send failed: %v", s.ifname, err)
+				debugf("[dhcpv6-server %s] send failed: %v", s.ifname, err)
 			}
 		}
 	}
@@ -458,10 +457,10 @@ func (s *dhcpServer) sendReconfigure(l *Lease) {
 	}
 	dst := &net.UDPAddr{IP: l.Peer.AsSlice(), Port: 546, Zone: s.ifname}
 	if _, err := s.pc.WriteTo(raw, &ipv6.ControlMessage{IfIndex: s.ifi.Index}, dst); err != nil {
-		log2("[dhcpv6-server %s] send Reconfigure to %s failed: %v", s.ifname, l.Peer, err)
+		debugf("[dhcpv6-server %s] send Reconfigure to %s failed: %v", s.ifname, l.Peer, err)
 		return
 	}
-	log.Printf("[dhcpv6-server %s] sent Reconfigure to %s", s.ifname, l.Peer)
+	infof("[dhcpv6-server %s] sent Reconfigure to %s", s.ifname, l.Peer)
 }
 
 // buildReconfigure signs a Reconfigure(Renew) with the lease's RKAP key (RFC 8415 §20.4).
@@ -524,13 +523,13 @@ func (s *dhcpServer) loadLeases() {
 	}
 	var list []*Lease
 	if err := json.Unmarshal(b, &list); err != nil {
-		log.Printf("[dhcpv6-server] lease file corrupt, ignoring: %v", err)
+		warnf("[dhcpv6-server] lease file corrupt, ignoring: %v", err)
 		return
 	}
 	for _, l := range list {
 		s.leases[leaseKey(l.DUID, l.IAID)] = l
 	}
-	log.Printf("[dhcpv6-server %s] loaded %d leases", s.ifname, len(list))
+	infof("[dhcpv6-server %s] loaded %d leases", s.ifname, len(list))
 }
 
 // saveLeases requires the caller to hold the lock.
@@ -542,7 +541,7 @@ func (s *dhcpServer) saveLeases() {
 	b, _ := json.MarshalIndent(list, "", "  ")
 	tmp := s.leaseFile + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		log2("[dhcpv6-server] write leases failed: %v", err)
+		debugf("[dhcpv6-server] write leases failed: %v", err)
 		return
 	}
 	os.Rename(tmp, s.leaseFile)
@@ -577,7 +576,7 @@ func serverDUID(ctx context.Context, c *dhcpClient, stateDir, wan string) dhcpv6
 		return nil
 	}
 	if err := tmp.loadDUID(); err != nil {
-		log.Printf("[dhcpv6-server] DUID: %v", err)
+		errorf("[dhcpv6-server] DUID: %v", err)
 		return nil
 	}
 	return tmp.duid

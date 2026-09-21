@@ -5,7 +5,6 @@ import (
 	_ "embed"
 	"flag"
 	"fmt"
-	"log"
 	"net"
 	"net/netip"
 	"os/signal"
@@ -35,13 +34,6 @@ var noticeText string
 // would tie the translator to a prefix that changes, and every client would have to be told again.
 var joolNAT64 = netip.MustParsePrefix("64:ff9b::/96")
 
-// log2 only prints with -v.
-func log2(format string, args ...any) {
-	if verbose > 0 {
-		log.Printf(format, args...)
-	}
-}
-
 func main() {
 	flag.Usage = printUsage
 	flag.Parse()
@@ -54,15 +46,19 @@ func main() {
 		return
 	}
 
-	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	setupLogging(*logLevelName)
+	// -v and dry-run both mean "show everything", but an explicit -log-level still wins.
+	if verbose > 0 || (dryRun && !flagGiven("log-level")) {
+		setDebug()
+	}
 	if *wan == "" {
-		log.Fatal("-wan is required")
+		fatalf("-wan is required")
 	}
 	if runtime.GOOS != "linux" && !dryRun {
-		log.Fatalf("only -dry-run is supported on %s: configuring addresses, routes, sysctls and tunnel devices needs Linux netlink, so run for real on Linux", runtime.GOOS)
+		fatalf("only -dry-run is supported on %s: configuring addresses, routes, sysctls and tunnel devices needs Linux netlink, so run for real on Linux", runtime.GOOS)
 	}
 	if len(lans) == 0 && !dryRun {
-		log.Fatal("at least one -lan is required")
+		fatalf("at least one -lan is required")
 	}
 	if len(lans) == 0 {
 		lans = multiFlag{"lan"}
@@ -72,17 +68,17 @@ func main() {
 	mode := clientMode(*dhcpMode)
 	pdEnabled := mode != clientOff && *pdLen > 0
 	if len(lanDefs) > 1 && (!pdEnabled || *prefer == "ra") {
-		log.Fatal("multiple LAN interfaces need a PD prefix; a /64 from RA cannot be split, so enable PD and set -wan-prefer pd")
+		fatalf("multiple LAN interfaces need a PD prefix; a /64 from RA cannot be split, so enable PD and set -wan-prefer pd")
 	}
 	srv := serverMode(*srvMode)
 	if srv != serverOff && srv != serverStateless && srv != serverStateful {
-		log.Fatal("-dhcp6s-mode must be off / stateless / stateful")
+		fatalf("-dhcp6s-mode must be off / stateless / stateful")
 	}
 	if *tMode != "off" && *tMode != "stable" && *tMode != "temporary" && *tMode != "both" {
-		log.Fatal("-tempaddr-mode must be off / stable / temporary / both")
+		fatalf("-tempaddr-mode must be off / stable / temporary / both")
 	}
 	if *tunNAT != "auto" && *tunNAT != "off" {
-		log.Fatal("-tunnel-nat must be auto / off")
+		fatalf("-tunnel-nat must be auto / off")
 	}
 	// The two translators divide one port set, so the ruleset has to know what was lent out.
 	joolShare := 0
@@ -90,35 +86,35 @@ func main() {
 		joolShare = *joolRanges
 	}
 	if *nat64 != "jool" && *nat64 != "off" {
-		log.Fatal("-nat64 must be jool / off")
+		fatalf("-nat64 must be jool / off")
 	}
 	layout := shared64Layout(*shared64)
 	switch layout {
 	case "wan", "lan", "split":
 	default:
-		log.Fatal("-wan-shared64 must be wan / lan / split")
+		fatalf("-wan-shared64 must be wan / lan / split")
 	}
 	switch *ndMode {
 	case "auto", "off", "static", "prefix", "forward":
 	default:
-		log.Fatal("-ndproxy-mode must be auto / off / static / prefix / forward")
+		fatalf("-ndproxy-mode must be auto / off / static / prefix / forward")
 	}
 	if *raMin > *raMax || *raMin < 3*time.Second {
-		log.Fatal("-ra-min must be at least 3 seconds and no larger than -ra-max")
+		fatalf("-ra-min must be at least 3 seconds and no larger than -ra-max")
 	}
 	if mode == clientOff && !*upRA {
-		log.Fatal("at least one of the DHCPv6 client and the upstream RA must be enabled")
+		fatalf("at least one of the DHCPv6 client and the upstream RA must be enabled")
 	}
 	iid, err := parseIIDPolicy(*wanIID)
 	if err != nil {
-		log.Fatalf("-wan-iid: %v", err)
+		fatalf("-wan-iid: %v", err)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	ula, err := loadULA(*stateDir, *ulaSpec)
 	if err != nil {
-		log.Fatalf("-lan-ula: %v", err)
+		fatalf("-lan-ula: %v", err)
 	}
 	grace := *pdGrace
 	if mode == clientOff || *pdLen == 0 {
@@ -162,7 +158,7 @@ func main() {
 		// router; the IPv6 switches alone leave the tunnel built and the LAN unable to use it.
 		if !*noSysctl && !dryRun {
 			if err := sysctlWrite("/proc/sys/net/ipv4/ip_forward", "1"); err != nil {
-				log.Printf("[sysctl] ipv4/ip_forward=1 failed: %v", err)
+				warnf("[sysctl] ipv4/ip_forward=1 failed: %v", err)
 			}
 		}
 		if *tunNAT == "auto" {
@@ -191,12 +187,12 @@ func main() {
 	if *raPref64 != "" {
 		p, err := netip.ParsePrefix(*raPref64)
 		if err != nil {
-			log.Fatalf("-ra-pref64: %v", err)
+			fatalf("-ra-pref64: %v", err)
 		}
 		switch p.Bits() {
 		case 32, 40, 48, 56, 64, 96:
 		default:
-			log.Fatal("-ra-pref64 length must be 32/40/48/56/64/96")
+			fatalf("-ra-pref64 length must be 32/40/48/56/64/96")
 		}
 		pref64 = p.Masked()
 	}
@@ -253,10 +249,10 @@ func main() {
 		go proxy.run(ctx, hub, store, store.Subscribe())
 	}
 
-	log.Printf("[sixup] version %s", version)
-	log.Printf("[sixup] starting: wan=%s lan=%v dhcpv6-client=%s dhcpv6-server=%s ndp-proxy=%s tempaddr=%s", *wan, lans, *dhcpMode, *srvMode, *ndMode, *tMode)
+	infof("[sixup] version %s", version)
+	infof("[sixup] starting: wan=%s lan=%v dhcpv6-client=%s dhcpv6-server=%s ndp-proxy=%s tempaddr=%s", *wan, lans, *dhcpMode, *srvMode, *ndMode, *tMode)
 	<-ctx.Done()
-	log.Printf("[sixup] got a termination signal, advertising RA with lifetime=0 and releasing the DHCPv6 bindings before exit")
+	infof("[sixup] got a termination signal, advertising RA with lifetime=0 and releasing the DHCPv6 bindings before exit")
 	if dhcp != nil {
 		dhcp.WaitDone()
 	}

@@ -49,7 +49,7 @@ func rtDial() (*netlink.Conn, error) {
 // reclaiming it.
 func addrSet(ifi int, addr netip.Addr, plen int, preferred, valid time.Duration, infiniteValid bool, flags uint32) error {
 	if dryRun {
-		log2("[dry-run] skip configuring address %s/%d", addr, plen)
+		debugf("[dry-run] skip configuring address %s/%d", addr, plen)
 		return nil
 	}
 	c, err := rtDial()
@@ -84,7 +84,7 @@ func addrSet(ifi int, addr netip.Addr, plen int, preferred, valid time.Duration,
 
 func addrDel(ifi int, addr netip.Addr, plen int) error {
 	if dryRun {
-		log2("[dry-run] skip deleting address %s/%d", addr, plen)
+		debugf("[dry-run] skip deleting address %s/%d", addr, plen)
 		return nil
 	}
 	c, err := rtDial()
@@ -185,7 +185,7 @@ func routeDel(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32) error {
 
 func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires time.Duration) error {
 	if dryRun {
-		log2("[dry-run] skip route %s -> %s dev %d", dst, gw, ifi)
+		debugf("[dry-run] skip route %s -> %s dev %d", dst, gw, ifi)
 		return nil
 	}
 	c, err := rtDial()
@@ -241,7 +241,7 @@ func addrBytes(a netip.Addr) []byte {
 // neighProxySet is equivalent to ip -6 neigh add proxy ADDR dev IF.
 func neighProxySet(ifi int, addr netip.Addr, del bool) error {
 	if dryRun {
-		log2("[dry-run] skip proxy neighbor %s", addr)
+		debugf("[dry-run] skip proxy neighbor %s", addr)
 		return nil
 	}
 	c, err := rtDial()
@@ -280,7 +280,7 @@ func linkWatch(ch chan<- linkEvent) error {
 		for {
 			msgs, err := c.Receive()
 			if err != nil {
-				log2("[netlink] link watch ended: %v", err)
+				debugf("[netlink] link watch ended: %v", err)
 				return
 			}
 			for _, m := range msgs {
@@ -326,7 +326,7 @@ func sysctlSet(iface, key, val string) error {
 // sysctlWrite writes one /proc/sys entry by path, for the switches that are not per-interface IPv6.
 func sysctlWrite(path, val string) error {
 	if dryRun {
-		log2("[dry-run] skip sysctl %s=%s", path, val)
+		debugf("[dry-run] skip sysctl %s=%s", path, val)
 		return nil
 	}
 	return os.WriteFile(path, []byte(val), 0)
@@ -464,7 +464,7 @@ func ifaceByName(name string) (*net.Interface, error) {
 // setAllMulti enables IFF_ALLMULTI so the NDP proxy receives NS sent to any solicited-node group.
 func setAllMulti(name string) error {
 	if dryRun {
-		log2("[dry-run] skip allmulti %s", name)
+		debugf("[dry-run] skip allmulti %s", name)
 		return nil
 	}
 	ifi, err := net.InterfaceByName(name)
@@ -516,7 +516,7 @@ func packetCapture(ifindex int, frames chan<- []byte, kinds frameKind, onExit fu
 		return nil, err
 	}
 	if err := attachCaptureFilter(fd, kinds); err != nil {
-		log2("[tunnel-capture] attaching BPF filter failed: %v, falling back to userspace filtering", err)
+		debugf("[tunnel-capture] attaching BPF filter failed: %v, falling back to userspace filtering", err)
 	}
 	done := make(chan struct{})
 	go func() {
@@ -530,7 +530,7 @@ func packetCapture(ifindex int, frames chan<- []byte, kinds frameKind, onExit fu
 				case <-done:
 				default:
 					if !errors.Is(err, unix.EINTR) {
-						log2("[tunnel-capture] read failed: %v", err)
+						debugf("[tunnel-capture] read failed: %v", err)
 					}
 				}
 				if !errors.Is(err, unix.EINTR) {
@@ -568,7 +568,7 @@ func attachCaptureFilter(fd int, kinds frameKind) error {
 // NLM_F_CREATE|NLM_F_EXCL (ip tunnel add).
 func tunnelSet(name string, link int, local, remote netip.Addr, mtu int) error {
 	if dryRun {
-		log2("[dry-run] skip tunnel device %s: %s -> %s mtu %d", name, local, remote, mtu)
+		debugf("[dry-run] skip tunnel device %s: %s -> %s mtu %d", name, local, remote, mtu)
 		return nil
 	}
 	c, err := rtDial()
@@ -621,7 +621,7 @@ func tunnelSet(name string, link int, local, remote netip.Addr, mtu int) error {
 // addr4Set assigns a /32 IPv4 address to the tunnel device, replacing any existing one.
 func addr4Set(dev string, a netip.Addr) error {
 	if dryRun {
-		log2("[dry-run] skip configuring IPv4 %s/32 on %s", a, dev)
+		debugf("[dry-run] skip configuring IPv4 %s/32 on %s", a, dev)
 		return nil
 	}
 	ifi, err := net.InterfaceByName(dev)
