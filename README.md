@@ -17,12 +17,12 @@ the tunnel endpoints all follow from that one event. No manual step, no restart.
 
 ## Features
 
-- Takes the prefix from DHCPv6-PD or from an RA
-- Splits it across the LAN segments, handing out addresses and DNS, ULA optional
-- Shares a single /64 with the LAN the way RFC 7278 prescribes, Neighbor Discovery proxy included
-- Builds a Japanese NGN line's IPv4 tunnel, whether DS-Lite, MAP-E or the IPIP6 of SoftBank Hikari read off the traffic
-- Carries the upstream MTU and the reachable DNS servers through to LAN clients
-- Ships as one static binary under 5 MiB that drives netlink and /proc itself, dependent on no external command and no system service
+- Handles the whole job of an IPv6 router, with no other daemon to configure
+- Detects how the prefix arrives, DHCPv6-PD or an RA, and hands clients their addresses and configuration through its own RA and DHCPv6 services
+- When the ISP hands out a new prefix, addresses, RAs, leases, proxy entries and tunnel endpoints follow
+- Shares a single upstream /64 with the LAN as RFC 7278 prescribes, Neighbor Discovery proxy included, splits a shorter prefix across the segments
+- Builds a DS-Lite, MAP-E or IPIP6 tunnel as needed, and keeps MAP-E source ports inside the assigned port set
+- One static binary under 5 MiB, dependent on no external command and no system service
 
 ## Quick start
 
