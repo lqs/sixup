@@ -2,8 +2,8 @@
 # Cross-compile static binaries for the common platforms into dist/, with checksums.
 # Usage: ./build.sh [version]           version defaults to git describe
 #        TARGETS="linux/amd64 linux/arm64" ./build.sh   build only these platforms
-#        SLIM=1 ./build.sh              use the tools/slim stubs to drop unused stdlib and
-#                                       dependency code, saving about 5%
+#        SLIM=0 ./build.sh              keep the stdlib and dependency code the tools/slim
+#                                       stubs drop by default; see tools/slim/overlay.sh
 # Artifacts: dist/sixup-<version>-<os>-<arch>[-<variant>], plus dist/SHA256SUMS.
 set -eu
 
@@ -35,7 +35,7 @@ mkdir -p "$OUT"
 rm -f "$OUT"/SHA256SUMS
 
 SLIM_FLAGS=""
-if [ "${SLIM:-0}" = "1" ]; then
+if [ "${SLIM:-1}" = "1" ]; then
 	SLIM_DIR=$(tools/slim/overlay.sh)
 	trap 'rm -rf "$SLIM_DIR"' EXIT
 	SLIM_FLAGS="-modfile $SLIM_DIR/go.mod -overlay $SLIM_DIR/overlay.json"
