@@ -4,8 +4,9 @@
 #   2. drop privileged, use cap_add, set the sysctls on the host and pass -no-sysctl
 services:
   sixup:
-    build: .
-    image: sixup:latest
+    # Published for amd64, arm64 and armv7; uncomment build to compile from this checkout instead.
+    image: ghcr.io/lqs/sixup:latest
+    # build: .
     container_name: sixup
     network_mode: host
     privileged: true
