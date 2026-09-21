@@ -1,4 +1,4 @@
-# sixup
+# sixup: IPv6 routing, fully automatic
 
 <strong>English</strong> | <a href="README.zh.md" lang="zh-Hans">简体中文</a> | <a href="README.ja.md" lang="ja">日本語</a>
 

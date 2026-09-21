@@ -1,6 +1,6 @@
 <div lang="ja">
 
-# sixup
+# sixup: IPv6 ルーティングを全自動で設定
 
 <a href="README.md" lang="en">English</a> | <a href="README.zh.md" lang="zh-Hans">简体中文</a> | <strong>日本語</strong>
 

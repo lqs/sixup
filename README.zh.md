@@ -1,6 +1,6 @@
 <div lang="zh-Hans">
 
-# sixup
+# sixup：全自动配置 IPv6 路由
 
 <a href="README.md" lang="en">English</a> | <strong>简体中文</strong> | <a href="README.ja.md" lang="ja">日本語</a>
 
