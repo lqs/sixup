@@ -26,25 +26,36 @@ const (
 	proxyForward proxyMode = "forward"
 )
 
+// maxProxySessions caps the session table. A real LAN holds far fewer neighbours than this; the
+// limit exists so that a host walking the /64 cannot grow the table, and the /128 routes derived
+// from it, without bound. Hitting it costs the newest targets their proxy entry, never the process.
+const maxProxySessions = 4096
+
+// maxAskers caps how many hosts are remembered as waiting for one probe. They all receive the same
+// answer, so a longer list buys nothing and is one more thing an attacker could grow.
+const maxAskers = 8
+
 type ndProxy struct {
-	mode      proxyMode
-	autoOn    bool // whether auto mode is currently enabled
-	wanIf     string
-	lanIf     string
-	static    []netip.Prefix
-	exclude   []netip.Prefix
-	ttl       time.Duration
-	layout    shared64Layout
-	wanIfi    *net.Interface
-	lanIfi    *net.Interface
-	wanConn   *ndp.Conn
-	lanConn   *ndp.Conn
-	mu        sync.Mutex
-	prefixes  []netip.Prefix // proxy scope driven by the snapshot
-	sessions  map[netip.Addr]*proxySession
-	pending   map[netip.Addr][]solicitor // forward-mode probes awaiting an NA: target -> askers
-	kernelSet map[netip.Addr]int         // targets with a /128 route -> outgoing interface index
-	selfAddrs map[netip.Addr]bool        // our own addresses on both sides, to ignore packets we sent
+	mode       proxyMode
+	autoOn     bool // whether auto mode is currently enabled
+	wanIf      string
+	lanIf      string
+	static     []netip.Prefix
+	exclude    []netip.Prefix
+	ttl        time.Duration
+	layout     shared64Layout
+	wanIfi     *net.Interface
+	lanIfi     *net.Interface
+	wanConn    *ndp.Conn
+	lanConn    *ndp.Conn
+	mu         sync.Mutex
+	prefixes   []netip.Prefix // proxy scope driven by the snapshot
+	sessions   map[netip.Addr]*proxySession
+	pending    map[netip.Addr][]solicitor // forward-mode probes awaiting an NA: target -> askers
+	kernelSet  map[netip.Addr]int         // targets with a /128 route -> outgoing interface index
+	selfAddrs  map[netip.Addr]bool        // our own addresses on both sides, to ignore packets we sent
+	fullSince  time.Time                  // when the table was last found full, to stop sweeping it per packet
+	warnedFull bool                       // the table being full is reported once per episode
 }
 
 type proxySession struct {
@@ -198,14 +209,7 @@ func (n *ndProxy) serve(ctx context.Context, ch <-chan Snapshot) {
 			n.mu.Unlock()
 		case <-gc.C:
 			n.mu.Lock()
-			now := time.Now()
-			for a, s := range n.sessions {
-				if now.After(s.Expires) {
-					delete(n.sessions, a)
-					delete(n.pending, a)
-					n.dropRoute(a)
-				}
-			}
+			n.sweep(time.Now())
 			n.mu.Unlock()
 		}
 	}
@@ -224,6 +228,55 @@ func (n *ndProxy) applyStatic() {
 			warnf("[ndp-proxy] failed to add proxy %s: %v", p.Addr(), err)
 		}
 	}
+}
+
+// sweep drops the sessions whose time is up; the caller holds the lock.
+func (n *ndProxy) sweep(now time.Time) {
+	for a, s := range n.sessions {
+		if now.After(s.Expires) {
+			n.forget(a)
+		}
+	}
+}
+
+// forget removes a session and everything derived from it; the caller holds the lock.
+func (n *ndProxy) forget(a netip.Addr) {
+	delete(n.sessions, a)
+	delete(n.pending, a)
+	n.dropRoute(a)
+}
+
+// admit makes room for one new session and reports whether it fits. Entries whose time is up go
+// first, then the probes still waiting for an answer: those are unconfirmed, and a host walking the
+// prefix produces almost nothing else. Neighbours an NA has confirmed are kept and the newcomer is
+// turned away instead, so a flood degrades the proxy for new targets rather than for the hosts
+// already using it. The caller holds the lock.
+func (n *ndProxy) admit(now time.Time) bool {
+	if len(n.sessions) < maxProxySessions {
+		return true
+	}
+	// Walking the table costs O(n); without this an attacker would pay one packet for one walk.
+	if now.Sub(n.fullSince) < time.Second {
+		return false
+	}
+	n.sweep(now)
+	if len(n.sessions) >= maxProxySessions {
+		for a, s := range n.sessions {
+			if s.State == "probing" {
+				n.forget(a)
+			}
+		}
+	}
+	if len(n.sessions) < maxProxySessions {
+		n.warnedFull = false
+		return true
+	}
+	n.fullSince = now
+	if !n.warnedFull {
+		n.warnedFull = true
+		warnf("[ndp-proxy] session table full at %d entries, refusing new targets; a host may be scanning the prefix", maxProxySessions)
+	}
+	return false
 }
 
 // covered reports whether a target falls in the proxy scope; the caller holds the lock.
@@ -320,7 +373,9 @@ func (n *ndProxy) onSolicit(side side, target, from netip.Addr) {
 			n.mu.Unlock()
 			return
 		}
-		n.sessions[target] = &proxySession{State: "valid", Side: sideLAN, Expires: now.Add(n.ttl)}
+		if n.admit(now) {
+			n.sessions[target] = &proxySession{State: "valid", Side: sideLAN, Expires: now.Add(n.ttl)}
+		}
 		n.mu.Unlock()
 		n.reply(sideWAN, target, from)
 		return
@@ -348,6 +403,10 @@ func (n *ndProxy) onSolicit(side side, target, from netip.Addr) {
 		return
 	}
 	if s == nil {
+		if !n.admit(now) {
+			n.mu.Unlock()
+			return
+		}
 		s = &proxySession{State: "probing"}
 		n.sessions[target] = s
 	}
@@ -387,6 +446,9 @@ func (n *ndProxy) onAdvert(side side, target netip.Addr) {
 func (n *ndProxy) learn(side side, target netip.Addr, now time.Time) {
 	s := n.sessions[target]
 	if s == nil {
+		if !n.admit(now) {
+			return
+		}
 		s = &proxySession{}
 		n.sessions[target] = s
 	}
@@ -420,6 +482,9 @@ func appendAsker(list []solicitor, a solicitor) []solicitor {
 		if x == a {
 			return list
 		}
+	}
+	if len(list) >= maxAskers {
+		return list
 	}
 	return append(list, a)
 }

@@ -132,13 +132,7 @@ func TestProxyRouteCleanup(t *testing.T) {
 	n.mu.Lock()
 	n.kernelSet[host] = 3
 	n.sessions[host] = &proxySession{State: "valid", Side: "lan", Expires: time.Now().Add(-time.Second)}
-	now := time.Now()
-	for a, s := range n.sessions {
-		if now.After(s.Expires) {
-			delete(n.sessions, a)
-			n.dropRoute(a)
-		}
-	}
+	n.sweep(time.Now())
 	n.mu.Unlock()
 	if _, ok := n.kernelSet[host]; ok {
 		t.Fatal("route record should be removed after expiry")
@@ -193,5 +187,74 @@ func TestProxyLANLayoutRouteViaWAN(t *testing.T) {
 		if idx != tc.wantIdx {
 			t.Fatalf("%s: /128 route interface should be %d, got %d", tc.layout, tc.wantIdx, idx)
 		}
+	}
+}
+
+// A host walking the prefix must not grow the session table past its cap, and the neighbours already
+// confirmed must survive the flood.
+func TestProxySessionTableCapped(t *testing.T) {
+	n := newTestProxy("wan")
+	known := netip.MustParseAddr("2001:db8::abcd")
+	now := time.Now()
+	n.mu.Lock()
+	n.sessions[known] = &proxySession{State: "valid", Side: sideLAN, Expires: now.Add(n.ttl)}
+	n.mu.Unlock()
+
+	// Every scanned target arrives as a fresh NS from the WAN side, which is what a scan looks like.
+	base := netip.MustParseAddr("2001:db8::").As16()
+	for i := range maxProxySessions * 2 {
+		b := base
+		b[13], b[14], b[15] = byte(i>>16), byte(i>>8), byte(i)
+		n.mu.Lock()
+		n.onSolicit(sideWAN, netip.AddrFrom16(b), netip.MustParseAddr("fe80::2"))
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.sessions) > maxProxySessions {
+		t.Fatalf("session table grew past the cap: %d", len(n.sessions))
+	}
+	if s := n.sessions[known]; s == nil || s.State != "valid" {
+		t.Fatalf("a confirmed neighbour was evicted by the scan: %+v", s)
+	}
+}
+
+// One target asked for by many hosts must not grow the asker list without bound.
+func TestProxyAskerListCapped(t *testing.T) {
+	var list []solicitor
+	base := netip.MustParseAddr("fe80::").As16()
+	for i := range maxAskers * 4 {
+		b := base
+		b[14], b[15] = byte(i>>8), byte(i)
+		list = appendAsker(list, solicitor{netip.AddrFrom16(b), sideWAN})
+	}
+	if len(list) != maxAskers {
+		t.Fatalf("asker list should stop at %d, got %d", maxAskers, len(list))
+	}
+}
+
+// Sessions an NA confirmed are not swept, so the table can fill with them; admit must then turn
+// newcomers away rather than keep growing, and no /128 route may be added for them.
+func TestProxyAdmitRefusesWhenFullOfValid(t *testing.T) {
+	n := newTestProxy("wan")
+	now := time.Now()
+	base := netip.MustParseAddr("2001:db8::").As16()
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for i := range maxProxySessions {
+		b := base
+		b[13], b[14], b[15] = byte(i>>16), byte(i>>8), byte(i)
+		n.sessions[netip.AddrFrom16(b)] = &proxySession{State: "valid", Side: sideLAN, Expires: now.Add(n.ttl)}
+	}
+	if n.admit(now) {
+		t.Fatal("a table full of confirmed neighbours should refuse a newcomer")
+	}
+	newcomer := netip.MustParseAddr("2001:db8::ffff:ffff")
+	n.learn(sideLAN, newcomer, now)
+	if _, ok := n.sessions[newcomer]; ok {
+		t.Fatal("learn should not have recorded a session past the cap")
+	}
+	if _, ok := n.kernelSet[newcomer]; ok {
+		t.Fatal("learn should not have installed a /128 route past the cap")
 	}
 }
