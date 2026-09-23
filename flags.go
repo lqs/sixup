@@ -21,7 +21,7 @@ var (
 	dhcpMode   = flag.String("dhcp6c-mode", "auto", "DHCPv6 client: auto(follow the M/O bits of the upstream RA) / on / off")
 	upRA       = flag.Bool("wan-ra", true, "listen to RA on the WAN side as a second prefix source and maintain the default route")
 	wanSLAAC   = flag.Bool("wan-slaac", true, "run SLAAC on the WAN interface for upstream RA prefixes with the A bit set")
-	wanIID     = flag.String("wan-iid", "", "suffix of the static SLAAC address on the WAN interface: empty for an RFC 7217 stable address, eui64 to derive it from the MAC, or a fixed suffix such as ::1 or ::1111:2222:3333:4444")
+	wanIID     = flag.String("wan-iid", "", "comma-separated suffixes of the static SLAAC addresses on the WAN interface, one address each: empty or stable for an RFC 7217 stable address, eui64 to derive it from the MAC, or a fixed suffix such as ::1 or ::1111:2222:3333:4444; the first one is reported as the WAN address")
 	wanTemp    = flag.Bool("wan-tempaddr", false, "besides the static SLAAC address, also rotate temporary addresses on the WAN interface according to -tempaddr-regen and friends")
 	prefer     = flag.String("wan-prefer", "pd", "which prefix source wins when both are available: pd / ra")
 	shared64   = flag.String("wan-shared64", "lan", "layout when upstream hands out only one /64: lan(RFC 7278 /64 sharing: /64 on the LAN, /128 routes for same-subnet hosts on the WAN side, default) / wan(/64 on the WAN, one /128 route per LAN host) / split(/128 on both sides, the router itself cannot reach hosts it has not learned); all /128 routes are added automatically once the NDP proxy probes them")

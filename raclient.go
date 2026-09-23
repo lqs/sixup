@@ -20,7 +20,7 @@ type raClient struct {
 	store  *Store
 	dhcp   *dhcpClient // started according to the M/O bits
 	slaac  bool        // do SLAAC on the WAN
-	iid    iidPolicy   // IID source for SLAAC addresses
+	iid    iidPolicy   // IID source of the SLAAC address reported as the WAN address (the first -wan-iid entry)
 	layout shared64Layout
 	secret []byte // RFC 7217 secret
 

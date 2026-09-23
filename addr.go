@@ -112,12 +112,12 @@ type addrManager struct {
 	ifi    *net.Interface
 	secret []byte
 	cfg    tempConfig
-	iid    iidPolicy               // IID source for static addresses
+	iids   []iidPolicy             // IID sources for static addresses, one address per policy and prefix
 	pick   func(Snapshot) []Prefix // prefixes to address on this interface (LAN: split result; WAN: upstream A-bit prefixes)
 	side   side                    // which interface role this manager runs on
 	layout shared64Layout
-	dadCnt map[netip.Prefix]uint8 // DAD_Counter per prefix
-	dadDue bool                   // new addresses awaiting a DAD verdict
+	dadCnt map[iidSlot]uint8 // DAD_Counter per prefix and policy
+	dadDue bool              // new addresses awaiting a DAD verdict
 	// Tunnel endpoints: /128, preferred=0 (never a source for ordinary traffic), kernel DAD for conflict detection; on failure report instead of re-addressing
 	extra     func(Snapshot) []netip.Addr
 	endpoints map[netip.Addr]string // configured endpoints and their state: tentative / ok / conflict
@@ -136,7 +136,7 @@ func (m *addrManager) run(ctx context.Context, hub *linkHub, store *Store, ch <-
 		// A recreated interface loses all addresses; start from scratch
 		m.applied = map[netip.Addr]Prefix{}
 		m.temps = nil
-		m.dadCnt = map[netip.Prefix]uint8{}
+		m.dadCnt = map[iidSlot]uint8{}
 		m.endpoints = map[netip.Addr]string{}
 		m.store = store
 		m.snap = store.Current()
@@ -231,8 +231,9 @@ func (m *addrManager) checkDAD() {
 			continue
 		}
 		if p, ok := m.applied[ia.Addr]; ok {
-			m.dadCnt[p.Prefix]++
-			warnf("[address %s] %s failed DAD, switching to address with DAD_Counter=%d", m.ifname, ia.Addr, m.dadCnt[p.Prefix])
+			slot := m.slotOf(ia.Addr, p.Prefix)
+			m.dadCnt[slot]++
+			warnf("[address %s] %s failed DAD, switching to address with DAD_Counter=%d", m.ifname, ia.Addr, m.dadCnt[slot])
 			addrDel(m.ifi.Index, ia.Addr, ia.PrefixLen)
 			delete(m.applied, ia.Addr)
 			m.applyPrefixAddrs()
@@ -297,7 +298,9 @@ func (m *addrManager) applyPrefixAddrs() {
 		if p.validLeft(now) == 0 {
 			continue
 		}
-		want[m.iid.addr(m.secret, p.Prefix, m.ifi, m.dadCnt[p.Prefix])] = p
+		for i, iid := range m.iids {
+			want[iid.addr(m.secret, p.Prefix, m.ifi, m.dadCnt[iidSlot{p.Prefix, i}])] = p
+		}
 	}
 	for a, p := range want {
 		pref, valid := p.preferredLeft(now), p.validLeft(now)
@@ -321,6 +324,23 @@ func (m *addrManager) applyPrefixAddrs() {
 	}
 	m.applied = want
 	m.adoptStrays(want)
+}
+
+// iidSlot names one static address: the prefix and the index of the policy in iids.
+type iidSlot struct {
+	prefix netip.Prefix
+	policy int
+}
+
+// slotOf finds which policy produced a static address inside prefix.
+func (m *addrManager) slotOf(a netip.Addr, prefix netip.Prefix) iidSlot {
+	for i, iid := range m.iids {
+		s := iidSlot{prefix, i}
+		if iid.addr(m.secret, prefix, m.ifi, m.dadCnt[s]) == a {
+			return s
+		}
+	}
+	return iidSlot{prefix, 0}
 }
 
 // adoptStrays takes over addresses inside a managed prefix that we did not compute this round:
@@ -570,6 +590,28 @@ func parseIIDPolicy(s string) (iidPolicy, error) {
 	p := iidPolicy{mode: iidFixed}
 	copy(p.fixed[:], b[8:])
 	return p, nil
+}
+
+// parseIIDPolicies parses a comma-separated list of policies; an empty string is the single stable policy.
+func parseIIDPolicies(s string) ([]iidPolicy, error) {
+	if strings.TrimSpace(s) == "" {
+		return []iidPolicy{{mode: iidStable}}, nil
+	}
+	var ps []iidPolicy
+	for f := range strings.SplitSeq(s, ",") {
+		if strings.TrimSpace(f) == "" {
+			return nil, fmt.Errorf("empty entry in %q", s)
+		}
+		p, err := parseIIDPolicy(f)
+		if err != nil {
+			return nil, err
+		}
+		if slices.Contains(ps, p) {
+			return nil, fmt.Errorf("%q is given more than once", strings.TrimSpace(f))
+		}
+		ps = append(ps, p)
+	}
+	return ps, nil
 }
 
 // addr builds the address. dad is the RFC 7217 DAD_Counter, incremented on each DAD failure.

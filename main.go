@@ -105,7 +105,7 @@ func main() {
 	if mode == clientOff && !*upRA {
 		fatalf("at least one of the DHCPv6 client and the upstream RA must be enabled")
 	}
-	iid, err := parseIIDPolicy(*wanIID)
+	iids, err := parseIIDPolicies(*wanIID)
 	if err != nil {
 		fatalf("-wan-iid: %v", err)
 	}
@@ -128,7 +128,7 @@ func main() {
 	pkts := newPacketHub(ctx, *wan)
 
 	if dryRun {
-		runDry(ctx, store, hub, pkts, dryOpts{wan: *wan, dhcpMode: mode, stateDir: *stateDir, tunDev: *tunDev, upRA: *upRA, wantNA: *wantNA, pdLen: *pdLen, tunMTU: *tunMTU, metric4: uint32(*tunMetric4), iid: iid, timeout: *dryTO})
+		runDry(ctx, store, hub, pkts, dryOpts{wan: *wan, dhcpMode: mode, stateDir: *stateDir, tunDev: *tunDev, upRA: *upRA, wantNA: *wantNA, pdLen: *pdLen, tunMTU: *tunMTU, metric4: uint32(*tunMetric4), iid: iids[0], timeout: *dryTO})
 		return
 	}
 
@@ -144,7 +144,7 @@ func main() {
 		go dhcp.run(ctx, mode == clientAuto && *upRA)
 	}
 	if *upRA {
-		go (&raClient{ifname: *wan, store: store, dhcp: dhcp, slaac: *wanSLAAC, iid: iid, layout: layout, secret: secret}).run(ctx, hub)
+		go (&raClient{ifname: *wan, store: store, dhcp: dhcp, slaac: *wanSLAAC, iid: iids[0], layout: layout, secret: secret}).run(ctx, hub)
 	} else {
 		// Without RA there is no source for a default route, so point it at the device on a point-to-point link.
 		go hub.supervise(ctx, *wan, func(cctx context.Context, ifi *net.Interface) {
@@ -213,12 +213,12 @@ func main() {
 		if *wanTemp {
 			wcfg.mode = "both"
 		}
-		go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iid: iid, pick: Snapshot.wanSLAAC, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
+		go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanSLAAC, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
 	}
 	poolStart, poolEnd := parsePool(*poolRange)
 	for _, l := range lanDefs {
 		iface := l.iface
-		go (&addrManager{ifname: iface, secret: secret, cfg: tcfg, iid: lanIID, pick: func(s Snapshot) []Prefix { return s.LAN[iface] }, side: sideLAN, layout: layout}).run(ctx, hub, store, store.Subscribe())
+		go (&addrManager{ifname: iface, secret: secret, cfg: tcfg, iids: []iidPolicy{lanIID}, pick: func(s Snapshot) []Prefix { return s.LAN[iface] }, side: sideLAN, layout: layout}).run(ctx, hub, store, store.Subscribe())
 		go (&raServer{
 			ifname: l.iface, minI: *raMin, maxI: *raMax, lifetime: *raLifetime, mtu: uint32(*raMTU),
 			managed: srv == serverStateful, other: srv != serverOff, routes: rios, dns: dnsOverride, pref64: pref64,

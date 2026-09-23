@@ -165,6 +165,22 @@ func TestIIDPolicy(t *testing.T) {
 	}
 }
 
+func TestIIDPolicies(t *testing.T) {
+	ps, err := parseIIDPolicies("")
+	if err != nil || len(ps) != 1 || ps[0].mode != iidStable {
+		t.Fatal(ps, err)
+	}
+	ps, err = parseIIDPolicies("stable, ::1,eui64")
+	if err != nil || len(ps) != 3 || ps[0].mode != iidStable || ps[1].mode != iidFixed || ps[2].mode != iidEUI64 {
+		t.Fatal(ps, err)
+	}
+	for _, s := range []string{"::1,", "::1,::1", "::1,2001:db8::1"} {
+		if _, err := parseIIDPolicies(s); err == nil {
+			t.Fatalf("%q must fail", s)
+		}
+	}
+}
+
 func TestShared64Layout(t *testing.T) {
 	cases := []struct {
 		layout   shared64Layout
