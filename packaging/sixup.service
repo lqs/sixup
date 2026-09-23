@@ -1,0 +1,14 @@
+[Unit]
+Description=sixup IPv6 router
+Documentation=https://github.com/lqs/sixup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+EnvironmentFile=/etc/default/sixup
+ExecStart=/usr/bin/sixup $SIXUP_OPTS
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

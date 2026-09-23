@@ -17,7 +17,7 @@ jobs:
       - name: Cross-compile and check size
         run: |
           ./build.sh ci
-          test "$(stat -c %s dist/sixup-ci-linux-amd64)" -le 5242880
+          test "$(stat -c %s dist/sixup-ci-linux-x86_64)" -le 5242880
 
   nftables:
     # The unit tests cover what the rules should be; this covers the kernel accepting them.
@@ -51,3 +51,29 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: false
+
+  # Every push to main that passes the checks above replaces the dev pre-release.
+  # A fixed version keeps the download URLs stable; the packages still carry the commit
+  # time in their version, so package managers see each build as newer.
+  dev:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, nftables, lint, image]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: dev-release
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version-file: go.mod }
+      - run: ./build.sh dev
+      - name: Replace the dev release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete dev --cleanup-tag --yes || true
+          gh release create dev dist/* --prerelease --target "$GITHUB_SHA" --title dev \
+            --notes "Built from $GITHUB_SHA on main. Untested, and options may change from one build to the next; use a v* release for anything that matters."

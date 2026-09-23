@@ -20,7 +20,7 @@ jobs:
       - name: Cross-compile
         run: ./build.sh "${GITHUB_REF_NAME}"
       - name: Size limit 5 MiB (amd64)
-        run: test "$(stat -c %s dist/sixup-${GITHUB_REF_NAME}-linux-amd64)" -le 5242880
+        run: test "$(stat -c %s dist/sixup-${GITHUB_REF_NAME}-linux-x86_64)" -le 5242880
       - uses: actions/upload-artifact@v4
         with:
           name: sixup-${{ github.ref_name }}

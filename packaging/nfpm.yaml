@@ -1,0 +1,57 @@
+# nfpm configuration for the deb, rpm, apk and Arch packages; build.sh fills in the
+# environment variables. See https://nfpm.goreleaser.com/configuration/
+name: sixup
+arch: ${ARCH}
+platform: linux
+version: ${PKG_VERSION}
+version_schema: none
+maintainer: Qishuai Liu <qishuai.liu@elestyle.jp>
+description: IPv6 routing, fully automatic
+homepage: https://github.com/lqs/sixup
+license: Apache-2.0
+
+contents:
+  - src: dist/sixup
+    dst: /usr/bin/sixup
+    file_info:
+      mode: 0755
+  - src: LICENSE
+    dst: /usr/share/licenses/sixup/LICENSE
+  - src: NOTICE
+    dst: /usr/share/licenses/sixup/NOTICE
+  - dst: /var/lib/sixup
+    type: dir
+    file_info:
+      mode: 0700
+
+  # Alpine runs OpenRC, the other distributions systemd.
+  - src: packaging/sixup.initd
+    dst: /etc/init.d/sixup
+    packager: apk
+    file_info:
+      mode: 0755
+  - src: packaging/sixup.confd
+    dst: /etc/conf.d/sixup
+    type: config|noreplace
+    packager: apk
+  - src: packaging/sixup.service
+    dst: /usr/lib/systemd/system/sixup.service
+    packager: deb
+  - src: packaging/sixup.service
+    dst: /usr/lib/systemd/system/sixup.service
+    packager: rpm
+  - src: packaging/sixup.service
+    dst: /usr/lib/systemd/system/sixup.service
+    packager: archlinux
+  - src: packaging/sixup.default
+    dst: /etc/default/sixup
+    type: config|noreplace
+    packager: deb
+  - src: packaging/sixup.default
+    dst: /etc/default/sixup
+    type: config|noreplace
+    packager: rpm
+  - src: packaging/sixup.default
+    dst: /etc/default/sixup
+    type: config|noreplace
+    packager: archlinux

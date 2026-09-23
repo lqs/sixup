@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+
+description="sixup IPv6 router"
+command="/usr/bin/sixup"
+command_args="$SIXUP_OPTS"
+supervisor="supervise-daemon"
+output_log="/var/log/sixup.log"
+error_log="/var/log/sixup.log"
+
+depend() {
+	need net
+	after firewall
+}

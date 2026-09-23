@@ -1,0 +1,3 @@
+# Command-line flags for sixup, see `sixup -h`. -wan is required, for example:
+# SIXUP_OPTS="-wan eth0 -lan eth1"
+SIXUP_OPTS=""
