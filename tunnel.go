@@ -448,22 +448,13 @@ func (t *TunnelParams) hasDelivered() bool {
 	return t != nil && (t.AFTRName != "" || t.MAPE != nil || t.MAPT != nil || t.LW4o6 != nil)
 }
 
-// endpoints lists the tunnel local endpoint addresses to configure on the WAN interface: the rule-table MAP-E CE
-// and the local endpoint seen in the capture. Fixed IP plans are never guessed at, only captured; DS-Lite's B4
-// reuses the existing WAN address and is therefore excluded.
+// endpoints lists the tunnel local endpoint addresses to configure on the WAN interface: only the rule-table
+// MAP-E CE, which is computed and exists nowhere else. The local endpoint seen in a capture is never added:
+// capture is not promiscuous, so the upstream already resolved that address to this host's MAC, meaning it
+// is one of our addresses or one the NDP proxy answers for. DS-Lite's B4 reuses the existing WAN address.
 func (t *TunnelParams) endpoints() []netip.Addr {
-	var out []netip.Addr
 	if t.RuleMAPE != nil && t.RuleMAPE.CE.IsValid() {
-		out = append(out, t.RuleMAPE.CE)
+		return []netip.Addr{t.RuleMAPE.CE}
 	}
-	if t.Captured != nil && t.Captured.Local.IsValid() {
-		dup := false
-		for _, a := range out {
-			dup = dup || a == t.Captured.Local
-		}
-		if !dup {
-			out = append(out, t.Captured.Local)
-		}
-	}
-	return out
+	return nil
 }

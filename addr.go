@@ -120,7 +120,7 @@ type addrManager struct {
 	dadDue bool              // new addresses awaiting a DAD verdict
 	// Tunnel endpoints: /128, preferred=0 (never a source for ordinary traffic), kernel DAD for conflict detection; on failure report instead of re-addressing
 	extra     func(Snapshot) []netip.Addr
-	endpoints map[netip.Addr]string // configured endpoints and their state: tentative / ok / conflict
+	endpoints map[netip.Addr]string // configured endpoints and their state: tentative / ok / conflict / external (configured by another part of sixup)
 	store     *Store
 	snap      Snapshot
 	applied   map[netip.Addr]Prefix // currently configured prefix addresses
@@ -202,6 +202,8 @@ func (m *addrManager) checkDAD() {
 	for _, ia := range list {
 		if st, isEP := m.endpoints[ia.Addr]; isEP {
 			switch {
+			case st == "external":
+				// whoever configured it owns its DAD
 			case ia.Flags&ifaFDadFailed != 0:
 				if st != "conflict" {
 					warnf("[address %s] tunnel local endpoint %s failed DAD: another device on the link is using it (HGW or another tunnel endpoint still online?), not enabling", m.ifname, ia.Addr)
@@ -635,6 +637,13 @@ func (p iidPolicy) addr(secret []byte, prefix netip.Prefix, ifi *net.Interface, 
 	return stableIID(secret, prefix, ifi.Name, dad)
 }
 
+// ownedElsewhere reports whether another part of sixup configures a on this interface: one of
+// the prefix addresses, or the WAN address from IA_NA.
+func (m *addrManager) ownedElsewhere(a netip.Addr) bool {
+	_, ok := m.applied[a]
+	return ok || a == m.snap.WANAddr
+}
+
 // applyEndpoints configures tunnel local endpoint addresses. They are added tentative so the kernel runs DAD;
 // checkDAD marks them active. Conflicting ones are removed and reported, never re-addressed (the peer only knows the agreed address).
 func (m *addrManager) applyEndpoints() {
@@ -644,7 +653,19 @@ func (m *addrManager) applyEndpoints() {
 	want := map[netip.Addr]bool{}
 	for _, a := range m.extra(m.snap) {
 		want[a] = true
-		if _, ok := m.endpoints[a]; ok {
+		owned := m.ownedElsewhere(a)
+		if st, ok := m.endpoints[a]; ok && (st == "external") == owned {
+			continue
+		}
+		// An endpoint that is already one of our addresses (a -wan-iid suffix or the IA_NA address) is
+		// used as is: setting it again would fight its owner over the lifetimes, and removing it later
+		// would take the address away. Once its owner lets go, it is added as an endpoint of its own.
+		if owned {
+			if m.endpoints[a] == "conflict" && m.store != nil {
+				m.store.SetEndpointConflict(a, false)
+			}
+			infof("[address %s] tunnel local endpoint %s is also a -wan-iid or IA_NA address, using it as is", m.ifname, a)
+			m.endpoints[a] = "external"
 			continue
 		}
 		// preferred=0: tunnel endpoint only, never chosen as source for ordinary outbound traffic
@@ -660,7 +681,7 @@ func (m *addrManager) applyEndpoints() {
 		if want[a] {
 			continue
 		}
-		if st != "conflict" {
+		if st != "conflict" && st != "external" {
 			addrDel(m.ifi.Index, a, 128)
 		}
 		if st == "conflict" && m.store != nil {
