@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"strings"
 	"time"
 
 	"github.com/mdlayher/ndp"
@@ -70,6 +72,7 @@ func (r *raServer) reader() {
 		if !from.IsLinkLocalUnicast() && !from.IsUnspecified() {
 			continue
 		}
+		infof("[ra-server %s] received RS from %s", r.ifname, from)
 		select {
 		case r.rs <- struct{}{}:
 		default:
@@ -105,7 +108,7 @@ func (r *raServer) serve(ctx context.Context, store *Store, ch <-chan Snapshot) 
 					saved := r.lifetime
 					r.snap.LAN = nil
 					r.lifetime = 0
-					r.send()
+					r.send("exit")
 					r.lifetime = saved
 				}
 			}
@@ -118,7 +121,7 @@ func (r *raServer) serve(ctx context.Context, store *Store, ch <-chan Snapshot) 
 				next.Reset(r.interval())
 			}
 		case <-next.C:
-			r.send()
+			r.send("periodic")
 			next.Reset(r.interval())
 		case <-r.rs:
 			// RS reply is delayed 0..500ms at random, and further if within MIN_DELAY_BETWEEN_RAS (3s) of the last send
@@ -131,7 +134,7 @@ func (r *raServer) serve(ctx context.Context, store *Store, ch <-chan Snapshot) 
 				return
 			case <-time.After(delay):
 			}
-			r.send()
+			r.send("RS reply")
 			next.Reset(r.interval())
 		}
 	}
@@ -147,7 +150,7 @@ func (r *raServer) interval() time.Duration {
 // burst sends 3 RAs at most 3s apart (MAX_INITIAL_RTR_ADVERTISEMENTS).
 func (r *raServer) burst(ctx context.Context) {
 	for i := range 3 {
-		r.send()
+		r.send(fmt.Sprintf("initial %d/3", i+1))
 		if i == 2 {
 			return
 		}
@@ -242,14 +245,21 @@ func (r *raServer) build() *ndp.RouterAdvertisement {
 	return ra
 }
 
-func (r *raServer) send() {
+// send multicasts one RA; reason says what triggered it and goes into the log.
+func (r *raServer) send(reason string) {
 	ra := r.build()
 	if err := r.conn.WriteTo(ra, ifCM(r.ifi), allNodes.WithZone(r.ifi.Name)); err != nil {
-		warnf("[ra-server %s] send failed: %v", r.ifname, err)
+		warnf("[ra-server %s] send failed (%s): %v", r.ifname, reason, err)
 		return
 	}
 	r.lastSent = time.Now()
-	debugf("[ra-server %s] sent RA, %d options, lifetime=%s", r.ifname, len(ra.Options), ra.RouterLifetime)
+	var prefixes []string
+	for _, o := range ra.Options {
+		if pi, ok := o.(*ndp.PrefixInformation); ok {
+			prefixes = append(prefixes, fmt.Sprintf("%s/%d(preferred=%s valid=%s)", pi.Prefix, pi.PrefixLength, pi.PreferredLifetime.Round(time.Second), pi.ValidLifetime.Round(time.Second)))
+		}
+	}
+	infof("[ra-server %s] sent RA (%s), lifetime=%s, prefixes=[%s], %d options", r.ifname, reason, ra.RouterLifetime, strings.Join(prefixes, " "), len(ra.Options))
 }
 
 // ifCM pins the outgoing interface. Without it macOS reports no route to host for link-local
