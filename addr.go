@@ -106,7 +106,7 @@ type tempAddr struct {
 }
 
 // addrManager owns this host's global addresses on one LAN interface:
-// prefix addresses (::1 or RFC 7217 stable) follow the snapshot; temporary addresses rotate periodically and retire once no longer in use.
+// prefix addresses (one per -lan-iid / -wan-iid policy) follow the snapshot; temporary addresses rotate periodically and retire once no longer in use.
 type addrManager struct {
 	ifname string
 	ifi    *net.Interface

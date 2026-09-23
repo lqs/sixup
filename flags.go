@@ -25,6 +25,7 @@ var (
 	wanTemp    = flag.Bool("wan-tempaddr", false, "besides the static SLAAC address, also rotate temporary addresses on the WAN interface according to -tempaddr-regen and friends")
 	prefer     = flag.String("wan-prefer", "pd", "which prefix source wins when both are available: pd / ra")
 	shared64   = flag.String("wan-shared64", "lan", "layout when upstream hands out only one /64: lan(RFC 7278 /64 sharing: /64 on the LAN, /128 routes for same-subnet hosts on the WAN side, default) / wan(/64 on the WAN, one /128 route per LAN host) / split(/128 on both sides, the router itself cannot reach hosts it has not learned); all /128 routes are added automatically once the NDP proxy probes them")
+	lanIIDSpec = flag.String("lan-iid", "", "comma-separated suffixes of this host's static addresses on each LAN prefix, one address each, same syntax as -wan-iid; empty means an RFC 7217 stable address")
 	hold       = flag.Duration("lan-deprecate-hold", 600*time.Second, "how long a revoked prefix keeps being advertised with preferred=0 (one RA cycle)")
 	settle     = flag.Duration("settle", time.Second, "how long parameters must stay unchanged before they are pushed to the components (revocation does not wait); merges the RA, PD, DNS and capture results that arrive in batches at startup")
 	dhcpRel    = flag.Bool("dhcp6c-release", false, "send RELEASE to the server on exit to give back the prefix and addresses. Off by default: a persisted DUID renews the same range after a restart and avoids prefix churn; dry-run always releases")
@@ -163,7 +164,7 @@ var usageGroups = []struct {
 	title string
 	names []string
 }{
-	{"Interfaces and prefixes", []string{"wan", "lan", "lan-ula", "lan-deprecate-hold"}},
+	{"Interfaces and prefixes", []string{"wan", "lan", "lan-ula", "lan-iid", "lan-deprecate-hold"}},
 	{"WAN side: DHCPv6 client", []string{"dhcp6c-mode", "dhcp6c-pd-len", "dhcp6c-ia-na", "dhcp6c-pd-grace", "dhcp6c-release"}},
 	{"WAN side: upstream RA and addresses", []string{"wan-ra", "wan-slaac", "wan-iid", "wan-tempaddr", "wan-prefer", "wan-shared64"}},
 	{"LAN side: RA advertisement", []string{"ra-min", "ra-max", "ra-lifetime", "ra-mtu", "ra-dns", "ra-pref64", "ra-route"}},

@@ -109,6 +109,10 @@ func main() {
 	if err != nil {
 		fatalf("-wan-iid: %v", err)
 	}
+	lanIIDs, err := parseIIDPolicies(*lanIIDSpec)
+	if err != nil {
+		fatalf("-lan-iid: %v", err)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -201,11 +205,6 @@ func main() {
 		rios = append(rios, netip.MustParsePrefix(r))
 	}
 	tcfg := tempConfig{mode: tempMode(*tMode), regenInterval: *tRegen, preferredLft: *tPref, validLft: *tValid, maxConcurrent: *tMax, desync: *tDesync, skipDAD: *tSkipDAD, grace: *tGrace}
-	// stable/both keep the LAN static address stable across reboots via RFC 7217.
-	lanIID, _ := parseIIDPolicy("::1")
-	if *tMode == string(tempStable) || *tMode == string(tempBoth) {
-		lanIID, _ = parseIIDPolicy("")
-	}
 	if *upRA && *wanSLAAC {
 		// The static SLAAC address and the optional temporary addresses coexist on the WAN interface.
 		wcfg := tcfg
@@ -218,7 +217,7 @@ func main() {
 	poolStart, poolEnd := parsePool(*poolRange)
 	for _, l := range lanDefs {
 		iface := l.iface
-		go (&addrManager{ifname: iface, secret: secret, cfg: tcfg, iids: []iidPolicy{lanIID}, pick: func(s Snapshot) []Prefix { return s.LAN[iface] }, side: sideLAN, layout: layout}).run(ctx, hub, store, store.Subscribe())
+		go (&addrManager{ifname: iface, secret: secret, cfg: tcfg, iids: lanIIDs, pick: func(s Snapshot) []Prefix { return s.LAN[iface] }, side: sideLAN, layout: layout}).run(ctx, hub, store, store.Subscribe())
 		go (&raServer{
 			ifname: l.iface, minI: *raMin, maxI: *raMax, lifetime: *raLifetime, mtu: uint32(*raMTU),
 			managed: srv == serverStateful, other: srv != serverOff, routes: rios, dns: dnsOverride, pref64: pref64,
