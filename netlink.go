@@ -75,10 +75,22 @@ func addrSet(ifi int, addr netip.Addr, plen int, preferred, valid time.Duration,
 	hdr[1] = byte(plen)
 	hdr[3] = unix.RT_SCOPE_UNIVERSE
 	nativeEndian.PutUint32(hdr[4:8], uint32(ifi))
-	_, err = c.Execute(netlink.Message{
+	msg := netlink.Message{
 		Header: netlink.Header{Type: unix.RTM_NEWADDR, Flags: netlink.Request | netlink.Acknowledge | netlink.Create | netlink.Replace},
 		Data:   append(hdr, attrs...),
-	})
+	}
+	if _, err := c.Execute(msg); err != nil {
+		return err
+	}
+	if infiniteValid {
+		return nil
+	}
+	// Giving a permanent address a finite lifetime goes through the kernel's modify_prefix_route,
+	// which stores the relative lifetime as an absolute expiry, so the prefix route is already
+	// expired and the next route GC deletes it, taking the on-link route of the prefix with it.
+	// The address is no longer permanent after the first request, so a second one takes the
+	// addrconf_prefix_route path and overwrites the expiry with the correct value.
+	_, err = c.Execute(msg)
 	return err
 }
 
