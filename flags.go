@@ -173,7 +173,7 @@ var usageGroups = []struct {
 	{"Local address rotation", []string{"tempaddr-mode", "tempaddr-regen", "tempaddr-preferred", "tempaddr-valid", "tempaddr-max", "tempaddr-desync", "tempaddr-skip-dad", "tempaddr-drain-grace"}},
 	{"Tunnel", []string{"tunnel-dev", "tunnel-mtu", "tunnel-route4-metric", "tunnel-nat", "tunnel-mape-rules", "tunnel-capture", "tunnel-capture-max"}},
 	{"NAT64", []string{"nat64", "jool-instance", "jool-port-ranges"}},
-	{"Runtime", []string{"state-dir", "no-sysctl", "settle", "dry-run", "dry-run-timeout", "v", "version", "license"}},
+	{"Runtime", []string{"state-dir", "no-sysctl", "settle", "dry-run", "dry-run-timeout", "log-level", "v", "version", "license"}},
 }
 
 func printUsage() {
