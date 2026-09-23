@@ -85,11 +85,9 @@ func addrSet(ifi int, addr netip.Addr, plen int, preferred, valid time.Duration,
 	if infiniteValid {
 		return nil
 	}
-	// Giving a permanent address a finite lifetime goes through the kernel's modify_prefix_route,
-	// which stores the relative lifetime as an absolute expiry, so the prefix route is already
-	// expired and the next route GC deletes it, taking the on-link route of the prefix with it.
-	// The address is no longer permanent after the first request, so a second one takes the
-	// addrconf_prefix_route path and overwrites the expiry with the correct value.
+	// Kernel bug since 4.18: when a permanent address gets a finite lifetime, the prefix route is
+	// given an expiry in the past and GC deletes it. A second request sets the expiry right.
+	// Keep this: unfixed kernels will be around for years, and on fixed ones it is a no-op.
 	_, err = c.Execute(msg)
 	return err
 }
