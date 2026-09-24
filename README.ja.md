@@ -35,6 +35,10 @@ sixup はこれを 1 つのプログラムで行います。各段階の状態�
 
 <div lang="ja">
 
+[Releases ページ](https://github.com/lqs/sixup/releases) から、ディストリビューションに合った
+パッケージ（`.deb`、`.rpm`、`.apk`、Arch Linux の `.pkg.tar.zst`）か静的バイナリを入手して
+ください。正式版はまだなく、`dev` プレリリースのみです。
+
 回線が何を提供しているかを、システムを変更せずに確認する：
 
 ```sh

@@ -33,6 +33,10 @@ sixup 一个程序做完这些，各环节的状态和参数在内部流转，�
 
 <div lang="zh-Hans">
 
+从 [Releases 页面](https://github.com/lqs/sixup/releases) 下载适合自己发行版的包（`.deb`、
+`.rpm`、`.apk` 或 Arch Linux 的 `.pkg.tar.zst`），或者直接下载静态二进制。目前还没有正式
+版本，只有 `dev` 预发布版。
+
 查看线路提供了什么，不改动系统：
 
 ```sh
