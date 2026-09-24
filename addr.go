@@ -15,6 +15,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/mdlayher/ndp"
 )
 
 // IFA_F_* address flags (linux/if_addr.h)
@@ -118,6 +120,10 @@ type addrManager struct {
 	layout shared64Layout
 	dadCnt map[iidSlot]uint8 // DAD_Counter per prefix and policy
 	dadDue bool              // new addresses awaiting a DAD verdict
+	// New WAN addresses to announce to the first-hop routers (RFC 9131) and how many NAs each still
+	// gets; sent from the DAD poll, one per tick, so a removed address simply drops out
+	announce map[netip.Addr]int
+	wanAddr  netip.Addr // last IA_NA address seen, to notice a new one
 	// Tunnel endpoints: /128, preferred=0 (never a source for ordinary traffic), kernel DAD for conflict detection; on failure report instead of re-addressing
 	extra     func(Snapshot) []netip.Addr
 	endpoints map[netip.Addr]string // configured endpoints and their state: tentative / ok / conflict / external (configured by another part of sixup)
@@ -138,6 +144,8 @@ func (m *addrManager) run(ctx context.Context, hub *linkHub, store *Store, ch <-
 		m.temps = nil
 		m.dadCnt = map[iidSlot]uint8{}
 		m.endpoints = map[netip.Addr]string{}
+		m.announce = map[netip.Addr]int{}
+		m.wanAddr = netip.Addr{}
 		m.store = store
 		m.snap = store.Current()
 		m.serve(cctx, ch)
@@ -156,6 +164,7 @@ func (m *addrManager) serve(ctx context.Context, ch <-chan Snapshot) {
 	}
 	m.applyPrefixAddrs()
 	m.applyEndpoints()
+	m.watchWANAddr()
 	regen := time.NewTimer(time.Hour)
 	regen.Stop()
 	if temp && m.ensureTemps() {
@@ -163,8 +172,9 @@ func (m *addrManager) serve(ctx context.Context, ch <-chan Snapshot) {
 	}
 	drain := time.NewTicker(m.drainInterval())
 	defer drain.Stop()
-	// DAD results appear about 1s after adding an address; poll every 2s while any is still tentative
-	dad := time.NewTicker(2 * time.Second)
+	// DAD results appear about 1s after adding an address; poll every second while any is still
+	// tentative or awaiting announcement, which also paces the NAs at RetransTimer
+	dad := time.NewTicker(time.Second)
 	defer dad.Stop()
 	for {
 		select {
@@ -174,6 +184,7 @@ func (m *addrManager) serve(ctx context.Context, ch <-chan Snapshot) {
 			m.snap = s
 			m.applyPrefixAddrs()
 			m.applyEndpoints()
+			m.watchWANAddr()
 			if temp && m.ensureTemps() {
 				regen.Reset(m.nextRegen())
 			}
@@ -195,11 +206,29 @@ func (m *addrManager) serve(ctx context.Context, ch <-chan Snapshot) {
 func (m *addrManager) checkDAD() {
 	list, err := addrList(m.ifi.Index)
 	if err != nil {
-		m.dadDue = false
-		return
+		return // dadDue stays set, so the next tick tries again
 	}
 	pending := false
+	listed := map[netip.Addr]bool{}
 	for _, ia := range list {
+		listed[ia.Addr] = true
+		if n := m.announce[ia.Addr]; n > 0 {
+			switch {
+			case ia.Flags&ifaFDadFailed != 0:
+				delete(m.announce, ia.Addr)
+			case ia.Flags&ifaFTentative != 0 && ia.Flags&ifaFOptimistic == 0:
+				pending = true
+			default:
+				// An optimistic address is usable before DAD ends, and RFC 9131 announces it at once
+				announceAddr(m.ifi, ia.Addr)
+				if n == 1 {
+					delete(m.announce, ia.Addr)
+				} else {
+					m.announce[ia.Addr] = n - 1
+					pending = true
+				}
+			}
+		}
 		if st, isEP := m.endpoints[ia.Addr]; isEP {
 			switch {
 			case st == "external":
@@ -257,7 +286,53 @@ func (m *addrManager) checkDAD() {
 			pending = true
 		}
 	}
+	for a := range m.announce {
+		if !listed[a] {
+			delete(m.announce, a)
+		}
+	}
 	m.dadDue = pending
+}
+
+// awaitAnnounce queues a new address for announcement once DAD lets it go, or at once if it is
+// optimistic or exempt from DAD. Only the WAN side has first-hop routers to tell; on a LAN this
+// host is the router.
+func (m *addrManager) awaitAnnounce(a netip.Addr) {
+	if m.side == sideWAN {
+		m.announce[a] = 3 // MAX_NEIGHBOR_ADVERTISEMENT
+		m.dadDue = true
+	}
+}
+
+// watchWANAddr queues the IA_NA address for announcement when it changes. The DHCPv6 client adds
+// it without tracking DAD, and this is the manager watching the WAN interface.
+func (m *addrManager) watchWANAddr() {
+	if a := m.snap.WANAddr; m.side == sideWAN && a.IsValid() && a != m.wanAddr {
+		m.wanAddr = a
+		m.awaitAnnounce(a)
+	}
+}
+
+// announceAddr sends one of the unsolicited NAs RFC 9131 has a new address announce to
+// all-routers, so the first packet sent to it does not wait for address resolution. Override stays
+// clear, so a duplicate address cannot take over the entry of the host that really owns it.
+func announceAddr(ifi *net.Interface, a netip.Addr) {
+	c, err := openNDConn(ifi) // send only: the filter blocks every incoming ICMPv6 type
+	if err != nil {
+		debugf("[address %s] cannot announce %s: %v", ifi.Name, a, err)
+		return
+	}
+	defer c.Close()
+	na := &ndp.NeighborAdvertisement{
+		Router:        true,
+		TargetAddress: a,
+		Options:       []ndp.Option{&ndp.LinkLayerAddress{Direction: ndp.Target, Addr: ifi.HardwareAddr}},
+	}
+	if err := c.WriteTo(na, ifCM(ifi), allRouters2.WithZone(ifi.Name)); err != nil {
+		debugf("[address %s] announcing %s failed: %v", ifi.Name, a, err)
+		return
+	}
+	debugf("[address %s] announced %s to the routers", ifi.Name, a)
 }
 
 func (m *addrManager) tempOf(a netip.Addr) *tempAddr {
@@ -314,6 +389,7 @@ func (m *addrManager) applyPrefixAddrs() {
 		if _, ok := m.applied[a]; !ok {
 			infof("[address %s] added %s/%d preferred=%s valid=%s", m.ifname, a, plen, pref.Round(time.Second), valid.Round(time.Second))
 			m.dadDue = true
+			m.awaitAnnounce(a)
 		}
 	}
 	for a, p := range m.applied {
@@ -464,6 +540,7 @@ func (m *addrManager) rotateFor(targets, active []Prefix) bool {
 		}
 		made = true
 		m.dadDue = true
+		m.awaitAnnounce(na.addr)
 		debugf("[address %s] new temporary address %s", m.ifname, na.addr)
 		for _, old := range m.temps {
 			if old.prefix == p.Prefix && old.state == "preferred" {
@@ -676,6 +753,7 @@ func (m *addrManager) applyEndpoints() {
 		infof("[address %s] tunnel local endpoint %s added, awaiting DAD", m.ifname, a)
 		m.endpoints[a] = "tentative"
 		m.dadDue = true
+		m.awaitAnnounce(a)
 	}
 	for a, st := range m.endpoints {
 		if want[a] {
