@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -125,6 +127,21 @@ func main() {
 		grace = 0
 	}
 	store := newStore(prefixSource(*prefer), lanDefs, *hold, ula, *tunRules, grace, *settle)
+	if !dryRun {
+		names := []string{*wan}
+		for _, l := range lanDefs {
+			names = append(names, l.iface)
+		}
+		if *tunDev != "" {
+			names = append(names, *tunDev)
+		}
+		slices.Sort(names)
+		claims, err := claimInterfaces(slices.Compact(names))
+		if err != nil {
+			fatalf("%v", err)
+		}
+		defer closeAll(claims)
+	}
 	if !*noSysctl && !dryRun {
 		applySysctl(*wan, lanDefs)
 	}
@@ -256,4 +273,29 @@ func main() {
 		dhcp.WaitDone()
 	}
 	time.Sleep(500 * time.Millisecond)
+}
+
+// claimInterfaces binds one abstract Unix socket per interface, so a second sixup touching any of
+// them fails at startup instead of fighting over addresses and routes. Abstract sockets belong to
+// the network namespace, as interfaces do, and the kernel drops them however the process exits.
+func claimInterfaces(names []string) ([]net.Listener, error) {
+	var claims []net.Listener
+	for _, name := range names {
+		l, err := net.Listen("unix", "@sixup/"+name)
+		if err != nil {
+			closeAll(claims)
+			if errors.Is(err, syscall.EADDRINUSE) {
+				return nil, fmt.Errorf("another sixup is already using %s", name)
+			}
+			return nil, fmt.Errorf("claim %s: %w", name, err)
+		}
+		claims = append(claims, l)
+	}
+	return claims, nil
+}
+
+func closeAll(ls []net.Listener) {
+	for _, l := range ls {
+		l.Close()
+	}
 }
