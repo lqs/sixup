@@ -356,10 +356,19 @@ func resolveAFTR(ctx context.Context, name string) []netip.Addr {
 
 // aftrResolver turns the DS-Lite AFTR name of DHCPv6 option 64 into addresses and feeds them back
 // into the store, which is where TunnelParams.resolve picks the DS-Lite remote endpoint from.
-// A failed lookup is retried, since the name is useless without an address.
+// A failed lookup is retried, since the name is useless without an address. Lookups run outside
+// the loop so a new name is seen at once; a result of any lookup but the latest is dropped.
 type aftrResolver struct {
-	store *Store
-	retry time.Duration
+	store  *Store
+	retry  time.Duration
+	name   string
+	addrs  []netip.Addr
+	gen    int                // numbers the lookups, to tell the latest one's result
+	cancel context.CancelFunc // of the lookup in flight, nil when none
+}
+
+type aftrResult struct {
+	gen   int
 	name  string
 	addrs []netip.Addr
 }
@@ -370,6 +379,22 @@ func (r *aftrResolver) run(ctx context.Context, ch <-chan Snapshot) {
 	}
 	t := time.NewTicker(r.retry)
 	defer t.Stop()
+	results := make(chan aftrResult)
+	lookup := func() {
+		if r.cancel != nil {
+			r.cancel()
+		}
+		lctx, cancel := context.WithCancel(ctx)
+		r.cancel = cancel
+		r.gen++
+		go func(gen int, name string) {
+			res := aftrResult{gen, name, resolveAFTR(lctx, name)}
+			select {
+			case results <- res:
+			case <-lctx.Done():
+			}
+		}(r.gen, r.name)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -382,18 +407,22 @@ func (r *aftrResolver) run(ctx context.Context, ch <-chan Snapshot) {
 			if name == "" || name == r.name {
 				continue
 			}
-			r.lookup(ctx, name)
+			r.name, r.addrs = name, nil
+			lookup()
+		case res := <-results:
+			if res.gen != r.gen {
+				continue
+			}
+			r.cancel()
+			r.cancel = nil
+			r.addrs = res.addrs
+			r.store.SetAFTRAddrs(res.name, res.addrs)
 		case <-t.C:
-			if r.name != "" && len(r.addrs) == 0 {
-				r.lookup(ctx, r.name)
+			if r.name != "" && len(r.addrs) == 0 && r.cancel == nil {
+				lookup()
 			}
 		}
 	}
-}
-
-func (r *aftrResolver) lookup(ctx context.Context, name string) {
-	r.name, r.addrs = name, resolveAFTR(ctx, name)
-	r.store.SetAFTRAddrs(name, r.addrs)
 }
 
 // s46Env matches odhcp6c's MAPE variable format:
