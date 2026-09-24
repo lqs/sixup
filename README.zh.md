@@ -66,6 +66,13 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 
 ## 选项
 
+</div>
+
+> [!WARNING]
+> <span lang="zh-Hans">项目尚未发布，选项可能随时改名或删除，不另行通知。</span>
+
+<div lang="zh-Hans">
+
 `sixup -h` 按下面的分组列出全部选项。
 
 - 布尔选项用 `=false` 关闭，例如 `-wan-ra=false`。

@@ -71,6 +71,13 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 
 ## オプション
 
+</div>
+
+> [!WARNING]
+> <span lang="ja">まだリリースしていないため、オプションは予告なく名前が変わったり削除されたりすることがあります。</span>
+
+<div lang="ja">
+
 `sixup -h` は全オプションを以下のグループで一覧表示します。
 
 - 真偽値のオプションは `=false` で無効にします。例：`-wan-ra=false`。

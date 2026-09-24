@@ -67,6 +67,9 @@ own, `inet sixup`, removed when it exits. Pass `-tunnel-nat off` to write them y
 
 ## Options
 
+> [!WARNING]
+> sixup has not been released yet, so options may be renamed or removed without notice.
+
 `sixup -h` lists every option in the groups below.
 
 - A boolean option is turned off with `=false`, for example `-wan-ra=false`.
