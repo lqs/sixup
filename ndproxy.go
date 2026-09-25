@@ -83,7 +83,9 @@ func (n *ndProxy) setPrefixes(s Snapshot) {
 			return !p.Deprecated && s.sharedWith(p.Prefix)
 		})
 		if on != n.autoOn {
-			if on {
+			if reason, ask := s.proxyAdvice(); on && reason != "" {
+				warnf("[ndp-proxy] %s, proxying Neighbor Discovery as a workaround; ask your ISP: \"%s\"", reason, ask)
+			} else if on {
 				infof("[ndp-proxy] LAN shares the on-link /64 with the upstream, enabling NDP proxy (forward mode)")
 			} else {
 				infof("[ndp-proxy] LAN prefix is routed to us, disabling NDP proxy")

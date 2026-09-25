@@ -671,6 +671,38 @@ func (s Snapshot) sharedWith(p netip.Prefix) bool {
 	return false
 }
 
+// proxyAdvice says why a LAN would share the WAN link's on-link /64 and what to ask the ISP for, so
+// that the NDP proxy is not needed. Both are empty when a delegation clear of that /64 exists.
+func (s Snapshot) proxyAdvice() (reason, ask string) {
+	var onLink, delegated []netip.Prefix
+	for _, w := range s.WAN {
+		switch {
+		case w.Deprecated:
+		case w.Source == sourceRA && w.Prefix.Bits() == 64:
+			onLink = append(onLink, w.Prefix)
+		case w.Source == sourcePD:
+			delegated = append(delegated, w.Prefix)
+		}
+	}
+	if len(onLink) == 0 {
+		return "", ""
+	}
+	if len(delegated) == 0 {
+		return "LAN shares the WAN link's on-link /64", "please provide DHCPv6 prefix delegation (IA_PD) with a /56"
+	}
+	for _, d := range delegated {
+		if slices.ContainsFunc(onLink, d.Overlaps) {
+			verb := "contains"
+			if d.Bits() == 64 {
+				verb = "equals"
+			}
+			return fmt.Sprintf("delegated /%d %s the WAN link's on-link /64", d.Bits(), verb),
+				"please delegate a /56 that does not overlap the on-link prefix advertised on the WAN link"
+		}
+	}
+	return "", ""
+}
+
 // side names an interface role and matches the -wan and -lan flags. Direction words
 // (upstream, downstream) say where traffic goes; a side says which interface it is on.
 type side string

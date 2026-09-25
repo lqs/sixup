@@ -422,11 +422,11 @@ func TestStoreDNSOnlyChange(t *testing.T) {
 // A line whose only DNS server is link-local leaves LAN clients with nothing, so say so.
 func TestLinkLocalDNSOnly(t *testing.T) {
 	snap := Snapshot{DNS: []netip.Addr{netip.MustParseAddr("fe80::1")}}
-	hints := diagnoseSnapshot(snap)
+	hints := diagnoseSnapshot(snap, false)
 	if len(hints) != 1 || !strings.Contains(hints[0], "fe80::1") {
 		t.Fatalf("hints: %v", hints)
 	}
-	if len(diagnoseSnapshot(Snapshot{DNS: []netip.Addr{netip.MustParseAddr("2001:db8::53")}})) != 0 {
+	if len(diagnoseSnapshot(Snapshot{DNS: []netip.Addr{netip.MustParseAddr("2001:db8::53")}}, false)) != 0 {
 		t.Fatal("a routable DNS server is fine")
 	}
 }
@@ -460,5 +460,37 @@ func TestSingle64WithSeveralLANs(t *testing.T) {
 	}
 	if !strings.Contains(logged.String(), "eth2(subnet 1)") {
 		t.Fatalf("the report should name the segment left out:\n%s", logged.String())
+	}
+}
+
+// The advice names what is wrong with the line and what to ask the ISP for, and is silent when a
+// delegation clear of the on-link /64 exists.
+func TestProxyAdvice(t *testing.T) {
+	onLink := Prefix{Prefix: netip.MustParsePrefix("2001:db8::/64"), Source: "ra"}
+	pd := func(p string) Prefix { return Prefix{Prefix: netip.MustParsePrefix(p), Source: "pd"} }
+	cases := []struct {
+		name   string
+		wan    []Prefix
+		reason string
+		ask    string
+	}{
+		{"RA only", []Prefix{onLink}, "LAN shares the WAN link's on-link /64", "prefix delegation (IA_PD) with a /56"},
+		{"PD equals on-link", []Prefix{onLink, pd("2001:db8::/64")}, "delegated /64 equals", "does not overlap"},
+		{"PD contains on-link", []Prefix{onLink, pd("2001:db8::/56")}, "delegated /56 contains", "does not overlap"},
+		{"PD apart", []Prefix{onLink, pd("2001:db8:100::/56")}, "", ""},
+		{"PD without RA", []Prefix{pd("2001:db8::/64")}, "", ""},
+	}
+	for _, c := range cases {
+		reason, ask := Snapshot{WAN: c.wan}.proxyAdvice()
+		if (c.reason == "") != (reason == "") || !strings.Contains(reason, c.reason) || !strings.Contains(ask, c.ask) {
+			t.Errorf("%s: got %q / %q", c.name, reason, ask)
+		}
+	}
+	snap := Snapshot{WAN: []Prefix{onLink}}
+	if hints := diagnoseSnapshot(snap, false); len(hints) != 1 || !strings.Contains(hints[0], "ask your ISP") {
+		t.Fatalf("broadcast WAN: %v", hints)
+	}
+	if hints := diagnoseSnapshot(snap, true); len(hints) != 0 {
+		t.Fatalf("a point-to-point WAN needs no proxy: %v", hints)
 	}
 }

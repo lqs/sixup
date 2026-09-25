@@ -58,7 +58,7 @@ func runDry(ctx context.Context, store *Store, hub *linkHub, pkts *packetHub, o 
 		case <-ctx.Done():
 			infof("[dry-run] interrupted, printing the final parameters")
 			enc.Encode(dryReport(last, o))
-			dryDiagnose(last)
+			dryDiagnose(last, o.wan)
 			if dhcp != nil {
 				dhcp.WaitDone()
 			}
@@ -66,7 +66,7 @@ func runDry(ctx context.Context, store *Store, hub *linkHub, pkts *packetHub, o 
 		case <-deadline:
 			infof("[dry-run] deadline reached, printing the final parameters")
 			enc.Encode(dryReport(last, o))
-			dryDiagnose(last)
+			dryDiagnose(last, o.wan)
 			return
 		case s := <-ch:
 			last = s
@@ -151,7 +151,7 @@ func dryReport(s Snapshot, o dryOpts) map[string]any {
 }
 
 // dryDiagnose prints the packet counters and what to look at next.
-func dryDiagnose(s Snapshot) {
+func dryDiagnose(s Snapshot, wan string) {
 	m := statSnapshot()
 	fmt.Fprintln(os.Stderr, "packet counters:")
 	for _, k := range statKeys(m) {
@@ -160,7 +160,8 @@ func dryDiagnose(s Snapshot) {
 	for _, hint := range diagnose(m) {
 		fmt.Fprintln(os.Stderr, "hint: "+hint)
 	}
-	for _, hint := range diagnoseSnapshot(s) {
+	ifi, err := net.InterfaceByName(wan)
+	for _, hint := range diagnoseSnapshot(s, err == nil && ifi.Flags&net.FlagPointToPoint != 0) {
 		fmt.Fprintln(os.Stderr, "hint: "+hint)
 	}
 }

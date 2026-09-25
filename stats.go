@@ -68,8 +68,12 @@ func diagnose(m map[string]int) []string {
 }
 
 // diagnoseSnapshot reports what the parameters themselves say, which the packet counters cannot show.
-func diagnoseSnapshot(s Snapshot) []string {
+// A point-to-point WAN never needs the NDP proxy, so it gets no advice about one.
+func diagnoseSnapshot(s Snapshot, pointToPoint bool) []string {
 	var out []string
+	if reason, ask := s.proxyAdvice(); reason != "" && !pointToPoint {
+		out = append(out, reason+", so sixup would proxy Neighbor Discovery as a workaround; ask your ISP: \""+ask+"\"")
+	}
 	if len(s.DNS) > 0 && len(routableDNS(s.DNS)) == 0 {
 		out = append(out, "Upstream only offers link-local DNS servers ("+addrsString(s.DNS)+"): they are reachable on the WAN link alone, so they are dropped from the RA and the DHCPv6 server and LAN clients would get no DNS at all. Run a resolver on this router and point clients at it with -ra-dns")
 	}
