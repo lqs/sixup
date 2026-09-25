@@ -215,7 +215,8 @@ func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, ifi int, dst net
 	hdr[6] = unix.RT_SCOPE_UNIVERSE
 	hdr[7] = unix.RTN_UNICAST
 	// IPv6 routes come from an RA, IPv4 ones are ours; the protocol keeps them apart in the table.
-	if typ == unix.RTM_NEWROUTE && !v4 {
+	// A delete has to name the same protocol, or the kernel finds no IPv6 route to remove.
+	if !v4 {
 		hdr[5] = unix.RTPROT_RA
 	}
 	ae := netlink.NewAttributeEncoder()
