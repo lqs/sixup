@@ -40,7 +40,7 @@ var (
 	srvPref    = flag.Duration("dhcp6s-lease-preferred", time.Hour, "IA_NA preferred lifetime")
 	srvValid   = flag.Duration("dhcp6s-lease-valid", 2*time.Hour, "IA_NA valid lifetime")
 	poolRange  = flag.String("dhcp6s-pool", "1000-ffff", "IID range of the address pool (hexadecimal, low 64 bits)")
-	ndMode     = flag.String("ndproxy-mode", "auto", "NDP proxy: auto(enable forward mode when the obtained prefix is a /64) / off / static / prefix / forward; forward works in both directions and also proxies between same-subnet hosts on the LAN and WAN sides")
+	ndMode     = flag.String("ndproxy-mode", "auto", "NDP proxy: auto(enable forward mode when a LAN /64 is also the on-link /64 of a broadcast WAN) / off / static / prefix / forward; forward works in both directions and also proxies between same-subnet hosts on the LAN and WAN sides")
 	ndTTL      = flag.Duration("ndproxy-ttl", 30*time.Second, "TTL of an NDP proxy session")
 	tMode      = flag.String("tempaddr-mode", "off", "address mode of this host: off / stable / temporary / both")
 	tRegen     = flag.Duration("tempaddr-regen", time.Hour, "temporary address generation interval")

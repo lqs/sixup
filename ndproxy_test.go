@@ -258,3 +258,24 @@ func TestProxyAdmitRefusesWhenFullOfValid(t *testing.T) {
 		t.Fatal("learn should not have installed a /128 route past the cap")
 	}
 }
+
+// auto mode proxies a shared /64 on a broadcast WAN, a delegated one equal to the on-link /64
+// included, and never on a point-to-point WAN.
+func TestProxyAutoMode(t *testing.T) {
+	p := netip.MustParsePrefix("2001:db8::/64")
+	snap := Snapshot{
+		WAN: []Prefix{{Prefix: p, Source: "ra"}, {Prefix: p, Source: "pd"}},
+		LAN: map[string][]Prefix{"lan0": {{Prefix: p, Source: "pd"}}},
+	}
+	n := newTestProxy("lan")
+	n.mode, n.lanIf = "auto", "lan0"
+	n.setPrefixes(snap)
+	if !n.autoOn || len(n.prefixes) != 1 {
+		t.Fatalf("broadcast WAN: proxy should be on for %v", n.prefixes)
+	}
+	n.wanIfi = &net.Interface{Index: 2, Name: "ppp0", Flags: net.FlagUp | net.FlagPointToPoint}
+	n.setPrefixes(snap)
+	if n.autoOn || len(n.prefixes) != 0 {
+		t.Fatalf("point-to-point WAN: proxy should be off, scope %v", n.prefixes)
+	}
+}

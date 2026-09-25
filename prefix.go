@@ -407,9 +407,9 @@ func (s *Store) recompute(now time.Time) {
 	active := map[netip.Prefix]bool{}
 	activeW := map[netip.Prefix]bool{}
 	var short []shortPrefix
-	for _, p := range u.Prefixes {
+	addWAN := func(p Prefix) (Prefix, bool) {
 		if p.validLeft(now) == 0 {
-			continue
+			return p, false
 		}
 		activeW[p.Prefix] = true
 		if p.preferredLeft(now) == 0 {
@@ -417,6 +417,13 @@ func (s *Store) recompute(now time.Time) {
 		}
 		next.WAN = append(next.WAN, p)
 		delete(s.revokedW, p.Prefix)
+		return p, true
+	}
+	for _, p := range u.Prefixes {
+		p, ok := addWAN(p)
+		if !ok {
+			continue
+		}
 		for _, l := range s.lans {
 			sub, ok := splitLAN(p.Prefix, l.index)
 			if !ok {
@@ -428,6 +435,14 @@ func (s *Store) recompute(now time.Time) {
 			next.LAN[l.iface] = append(next.LAN[l.iface], lp)
 			active[sub] = true
 			delete(s.revoked, sub)
+		}
+	}
+
+	// The upstream RA's prefixes describe the WAN link whichever source feeds the LAN: they carry
+	// the WAN SLAAC address and show whether a delegated /64 is the on-link one.
+	if src != sourceRA || len(u.Prefixes) == 0 {
+		for _, p := range s.sources[sourceRA].Prefixes {
+			addWAN(p)
 		}
 	}
 
@@ -511,6 +526,23 @@ func (s *Store) recompute(now time.Time) {
 				} else if change == changeNone && (!old.Valid.Equal(p.Valid) || !old.Preferred.Equal(p.Preferred)) {
 					change = changeRenew
 				}
+			}
+		}
+		// A WAN prefix that feeds no LAN (the RA's while PD is in effect) still changes the WAN address.
+		type wanKey struct {
+			prefix netip.Prefix
+			source prefixSource
+		}
+		oldW := map[wanKey]Prefix{}
+		for _, p := range s.cur.WAN {
+			oldW[wanKey{p.Prefix, p.Source}] = p
+		}
+		for _, p := range next.WAN {
+			old, ok := oldW[wanKey{p.Prefix, p.Source}]
+			if !ok || (old.Deprecated && !p.Deprecated) {
+				change = changeAdd
+			} else if change == changeNone && (!old.Valid.Equal(p.Valid) || !old.Preferred.Equal(p.Preferred)) {
+				change = changeRenew
 			}
 		}
 		if change == changeNone && !tunnelEqual(s.cur.Tunnel, next.Tunnel) {
@@ -623,14 +655,16 @@ func splitLAN(p netip.Prefix, index int) (netip.Prefix, bool) {
 	return netip.PrefixFrom(netip.AddrFrom16(b), 64), true
 }
 
-// sharedWith reports whether a LAN prefix is the upstream RA's on-link /64, shared by both sides.
-// Only RA counts: a PD-delegated /64 is routed by the ISP and is not shared.
+// sharedWith reports whether a /64 is both the upstream RA's on-link prefix and a LAN prefix, so
+// the two sides share one subnet. The LAN prefix may come from PD: a delegated /64 equal to the
+// on-link one is still on-link for the upstream, which may resolve its addresses on the WAN
+// instead of using the delegation route.
 func (s Snapshot) sharedWith(p netip.Prefix) bool {
-	if p.Bits() != 64 {
+	if p.Bits() != 64 || !slices.ContainsFunc(s.WAN, func(w Prefix) bool { return w.Source == sourceRA && w.Prefix == p }) {
 		return false
 	}
-	for _, w := range s.WAN {
-		if w.Source == "ra" && w.Prefix == p {
+	for _, ps := range s.LAN {
+		if slices.ContainsFunc(ps, func(l Prefix) bool { return l.Source != sourceULA && l.Prefix == p }) {
 			return true
 		}
 	}
@@ -659,7 +693,7 @@ func (s side) other() side {
 //   - split: /128 on both sides, both directions rely on NDP proxy /128 routes
 //
 // The lan layout is the /64 sharing of RFC 7278, written there for a 3GPP interface, which is
-// point-to-point and therefore needs no proxy; on an Ethernet WAN the NDP proxy supplies what the
+// point-to-point and therefore needs no proxy; on a broadcast WAN the NDP proxy supplies what the
 // point-to-point link gave for free.
 //
 // The layout is irrelevant when the prefix is not shared (a /64 carved from a PD).

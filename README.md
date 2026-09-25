@@ -20,7 +20,7 @@ the tunnel endpoints all follow from that one event. No manual step, no restart.
 - Handles the whole job of an IPv6 router, with no other daemon to configure
 - Detects how the prefix arrives, DHCPv6-PD or an RA, and hands clients their addresses and configuration through its own RA and DHCPv6 services
 - When the ISP hands out a new prefix, addresses, RAs, leases, proxy entries and tunnel endpoints follow
-- Shares a single upstream /64 with the LAN as RFC 7278 prescribes, Neighbor Discovery proxy included, splits a shorter prefix across the segments
+- Shares a single upstream /64 with the LAN (RFC 7278), with a Neighbor Discovery proxy on broadcast WANs, splits a shorter prefix across the segments
 - Builds a DS-Lite, MAP-E or IPIP6 tunnel as needed, and keeps MAP-E source ports inside the assigned port set
 - One static binary under 5 MiB, dependent on no external command and no system service
 
@@ -133,7 +133,7 @@ own, `inet sixup`, removed when it exits. Pass `-tunnel-nat off` to write them y
 
 | Option | Default | Description |
 |---|---|---|
-| `-ndproxy-mode` | `auto` | `auto` turns `forward` on when the prefix is a /64 and stays off otherwise. `forward` probes the other side before answering, in both directions, so hosts on the WAN link and on the LAN reach each other too. `prefix` answers every WAN solicitation for an address in the LAN prefix without probing. `static` only puts the `-ndproxy-static` entries into the kernel proxy table. `off` disables the proxy. |
+| `-ndproxy-mode` | `auto` | `auto` turns `forward` on when a LAN /64 is also the on-link /64 of a broadcast WAN, and stays off otherwise, since a delegated prefix or a point-to-point WAN needs no proxy. `forward` probes the other side before answering, in both directions, so hosts on the WAN link and on the LAN reach each other too. `prefix` answers every WAN solicitation for an address in the LAN prefix without probing. `static` only puts the `-ndproxy-static` entries into the kernel proxy table. `off` disables the proxy. |
 | `-ndproxy-static` | | Address or prefix to proxy in `static` mode, repeatable. |
 | `-ndproxy-exclude` | | Prefix never proxied, repeatable. |
 | `-ndproxy-ttl` | `30s` | How long a learned proxy entry lives. |

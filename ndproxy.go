@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"time"
 
@@ -70,24 +71,22 @@ type solicitor struct {
 	side side
 }
 
-// setPrefixes updates the proxy scope from a snapshot. auto mode enables only when the delegated
-// prefix is itself a /64, so LAN and WAN share one subnet and it cannot be split further.
+// setPrefixes updates the proxy scope from a snapshot. auto mode enables only when a LAN /64 is
+// also the upstream's on-link /64 on a broadcast WAN, where the upstream resolves LAN addresses.
 func (n *ndProxy) setPrefixes(s Snapshot) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.mode == "auto" {
-		// Proxying is only needed when the LAN prefix is the upstream RA's on-link /64; a PD-delegated /64 is routed to us by the ISP
-		on := false
-		for _, p := range s.LAN[n.lanIf] {
-			if !p.Deprecated && s.sharedWith(p.Prefix) {
-				on = true
-			}
-		}
+		// A point-to-point WAN has no address resolution: the upstream sends the whole /64 down
+		// the link, so there is nothing to answer for (RFC 7278).
+		on := !n.wanPointToPoint() && slices.ContainsFunc(s.LAN[n.lanIf], func(p Prefix) bool {
+			return !p.Deprecated && s.sharedWith(p.Prefix)
+		})
 		if on != n.autoOn {
 			if on {
 				infof("[ndp-proxy] LAN shares the on-link /64 with the upstream, enabling NDP proxy (forward mode)")
 			} else {
-				infof("[ndp-proxy] LAN prefix is routed via PD, disabling NDP proxy")
+				infof("[ndp-proxy] LAN prefix is routed to us, disabling NDP proxy")
 			}
 			n.autoOn = on
 		}
@@ -102,6 +101,10 @@ func (n *ndProxy) setPrefixes(s Snapshot) {
 			n.prefixes = append(n.prefixes, p.Prefix)
 		}
 	}
+}
+
+func (n *ndProxy) wanPointToPoint() bool {
+	return n.wanIfi != nil && n.wanIfi.Flags&net.FlagPointToPoint != 0
 }
 
 func (n *ndProxy) effectiveMode() proxyMode {

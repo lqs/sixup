@@ -198,7 +198,10 @@ func TestShared64Layout(t *testing.T) {
 			t.Errorf("%s/%s shared=%v: got %d want %d", c.layout, c.side, c.shared, got, c.wantPlen)
 		}
 	}
-	snap := Snapshot{WAN: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8::/64"), Source: "ra"}}}
+	snap := Snapshot{
+		WAN: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8::/64"), Source: "ra"}},
+		LAN: map[string][]Prefix{"lan0": {{Prefix: netip.MustParsePrefix("2001:db8::/64"), Source: "ra"}}},
+	}
 	if !snap.sharedWith(netip.MustParsePrefix("2001:db8::/64")) || snap.sharedWith(netip.MustParsePrefix("2001:db8:1::/64")) {
 		t.Fatal("sharedWith decision wrong")
 	}
@@ -286,8 +289,10 @@ func TestStorePDGrace(t *testing.T) {
 	ch2 := st2.Subscribe()
 	recv(t, ch2)
 	st2.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}})
-	// During grace the RA prefix is held back, so the snapshot is unchanged and nothing is published.
-	noRecv(t, ch2, 100*time.Millisecond)
+	// During grace the RA prefix reaches the WAN only.
+	if s = recv(t, ch2); len(s.WAN) != 1 || len(s.LAN["lan0"]) != 0 {
+		t.Fatalf("during grace the RA prefix belongs to the WAN only: %+v", s)
+	}
 	if s = recv(t, ch2); s.Change != "add" || len(s.LAN["lan0"]) != 1 {
 		t.Fatalf("after grace expires the RA prefix should be used: %+v", s)
 	}
@@ -300,16 +305,63 @@ func TestRoutableDNS(t *testing.T) {
 	}
 }
 
-func TestSharedWithOnlyRA(t *testing.T) {
-	snap := Snapshot{WAN: []Prefix{
-		{Prefix: netip.MustParsePrefix("2409:8a00::/64"), Source: "ra"},
-		{Prefix: netip.MustParsePrefix("2409:8a00:0:4::/64"), Source: "pd"},
-	}}
-	if snap.sharedWith(netip.MustParsePrefix("2409:8a00:0:4::/64")) {
-		t.Fatal("a PD-delegated /64 does not count as shared")
+func TestSharedWith(t *testing.T) {
+	onLink := netip.MustParsePrefix("2409:8a00::/64")
+	other := netip.MustParsePrefix("2409:8a00:0:4::/64")
+	ra := Prefix{Prefix: onLink, Source: "ra"}
+	cases := []struct {
+		name   string
+		wan    []Prefix
+		lan    Prefix
+		shared bool
+	}{
+		{"RA /64 on the LAN", []Prefix{ra}, ra, true},
+		{"PD /64 equal to the on-link one", []Prefix{ra, {Prefix: onLink, Source: "pd"}}, Prefix{Prefix: onLink, Source: "pd"}, true},
+		{"PD /64 other than the on-link one", []Prefix{ra, {Prefix: other, Source: "pd"}}, Prefix{Prefix: other, Source: "pd"}, false},
+		{"PD /64 without an RA", []Prefix{{Prefix: onLink, Source: "pd"}}, Prefix{Prefix: onLink, Source: "pd"}, false},
 	}
-	if !snap.sharedWith(netip.MustParsePrefix("2409:8a00::/64")) {
-		t.Fatal("only an RA on-link /64 counts as shared")
+	for _, c := range cases {
+		snap := Snapshot{WAN: c.wan, LAN: map[string][]Prefix{"lan0": {c.lan}}}
+		if got := snap.sharedWith(c.lan.Prefix); got != c.shared {
+			t.Errorf("%s: LAN prefix shared=%v, want %v", c.name, got, c.shared)
+		}
+		// The WAN side asks about the on-link prefix, which is shared only when the LAN uses it.
+		if got := snap.sharedWith(onLink); got != (c.lan.Prefix == onLink && c.shared) {
+			t.Errorf("%s: on-link prefix shared=%v", c.name, got)
+		}
+	}
+}
+
+// With PD in effect the RA prefixes stay in the WAN list, so the WAN keeps its SLAAC address and a
+// delegated /64 equal to the on-link one is recognised as shared.
+func TestStoreRAPrefixesUnderPD(t *testing.T) {
+	now := time.Now()
+	onLink := netip.MustParsePrefix("2001:db8:0:1::/64")
+	ra := Prefix{Prefix: onLink, Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: "ra", SLAAC: true}
+	for _, c := range []struct {
+		name   string
+		pd     netip.Prefix
+		shared bool
+	}{
+		{"different", netip.MustParsePrefix("2001:db8:0:2::/64"), false},
+		{"same", onLink, true},
+	} {
+		st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0)
+		ch := st.Subscribe()
+		recv(t, ch)
+		st.Set("pd", SourceUpdate{Prefixes: []Prefix{{Prefix: c.pd, Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: "pd"}}})
+		recv(t, ch)
+		st.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}})
+		s := recv(t, ch)
+		if s.Source != "pd" || len(s.LAN["lan0"]) != 1 || s.LAN["lan0"][0].Prefix != c.pd {
+			t.Fatalf("%s: the LAN should hold the PD prefix: %+v", c.name, s)
+		}
+		if w := s.wanSLAAC(); len(w) != 1 || w[0].Prefix != onLink {
+			t.Fatalf("%s: the WAN should keep the RA prefix for SLAAC: %+v", c.name, s.WAN)
+		}
+		if got := s.sharedWith(c.pd); got != c.shared {
+			t.Fatalf("%s: shared=%v, want %v", c.name, got, c.shared)
+		}
 	}
 }
 
