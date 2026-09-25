@@ -62,6 +62,7 @@ type dhcpClient struct {
 	store    *Store
 	stateDir string
 	pdLen    int  // IA_PD length hint; 0 means no PD request
+	unhinted bool // the hint was refused; SOLICIT with an empty IA_PD until the next backoff
 	wantNA   bool // request IA_NA
 	infoOnly bool // Information-Request only (upstream RA has only O bit and PD probing failed)
 	raOther  bool // upstream RA set only the O bit
@@ -363,6 +364,9 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 	}
 	adv, err := c.solicit(ctx)
 	if errors.Is(err, errNoPrefix) {
+		if c.retryUnhinted() {
+			return
+		}
 		statInc("pd_refused")
 		c.store.Set("pd", SourceUpdate{})
 		if c.fallbackInfo() {
@@ -388,6 +392,9 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 	lease := c.apply(reply)
 	if lease == nil {
 		if refusesEverything(reply) {
+			if c.retryUnhinted() {
+				return
+			}
 			statInc("pd_refused")
 			if c.fallbackInfo() {
 				return
@@ -605,7 +612,7 @@ func (c *dhcpClient) iaOptions(lease *lease) []dhcpv6.Modifier {
 			for _, p := range lease.prefixes {
 				pd.Options.Add(&dhcpv6.OptIAPrefix{Prefix: prefixToIPNet(p.Prefix), PreferredLifetime: p.preferredLeft(time.Now()), ValidLifetime: p.validLeft(time.Now())})
 			}
-		} else {
+		} else if !c.unhinted {
 			pd.Options.Add(&dhcpv6.OptIAPrefix{Prefix: &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(c.pdLen, 128)}})
 		}
 		mods = append(mods, dhcpv6.WithOption(pd))
@@ -699,7 +706,20 @@ func refusesEverything(m *dhcpv6.Message) bool {
 }
 
 // refusedWait waits after an explicit refusal, doubling the backoff up to 1 hour.
+// retryUnhinted reports whether a refusal is to be retried at once without the length hint. Some
+// servers refuse a length they cannot supply instead of delegating what they have, as a router
+// with a /56 of its own does when asked for another /56.
+func (c *dhcpClient) retryUnhinted() bool {
+	if c.pdLen == 0 || c.unhinted {
+		return false
+	}
+	c.unhinted = true
+	infof("[dhcpv6-client] request with a /%d hint refused, asking again without a length hint", c.pdLen)
+	return true
+}
+
 func (c *dhcpClient) refusedWait(ctx context.Context, why string) {
+	c.unhinted = false // after the backoff, try the hint again
 	if c.refuseBackoff == 0 {
 		c.refuseBackoff = 5 * time.Minute
 	} else if c.refuseBackoff < time.Hour {

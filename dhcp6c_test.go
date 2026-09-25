@@ -196,3 +196,36 @@ func TestRefusesEverything(t *testing.T) {
 		t.Fatal("no IA at all is not a refusal")
 	}
 }
+
+// A refused hint is retried once with an empty IA_PD, leaving the length to the server.
+func TestPDHintRetry(t *testing.T) {
+	c := &dhcpClient{pdLen: 56}
+	hint := func() int {
+		m, _ := dhcpv6.NewMessage(c.iaOptions(nil)...)
+		pds := m.Options.IAPD()
+		if len(pds) != 1 {
+			t.Fatalf("want one IA_PD, got %d", len(pds))
+		}
+		ps := pds[0].Options.Prefixes()
+		if len(ps) == 0 {
+			return 0
+		}
+		ones, _ := ps[0].Prefix.Mask.Size()
+		return ones
+	}
+	if got := hint(); got != 56 {
+		t.Fatalf("first SOLICIT should hint /56, got /%d", got)
+	}
+	if !c.retryUnhinted() {
+		t.Fatal("the first refusal should be retried")
+	}
+	if got := hint(); got != 0 {
+		t.Fatalf("the retry should carry no hint, got /%d", got)
+	}
+	if c.retryUnhinted() {
+		t.Fatal("a refusal without the hint goes to the backoff")
+	}
+	if (&dhcpClient{}).retryUnhinted() {
+		t.Fatal("no PD requested, nothing to retry")
+	}
+}

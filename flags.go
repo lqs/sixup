@@ -16,7 +16,7 @@ var (
 	lans, statics, routes, ndStatic, ndExclude multiFlag
 
 	wan        = flag.String("wan", "", "WAN interface name (required)")
-	pdLen      = flag.Int("dhcp6c-pd-len", 56, "prefix length hint for IA_PD; 0 means do not request PD")
+	pdLen      = flag.Int("dhcp6c-pd-len", 56, "prefix length hint for IA_PD, retried once without a hint if refused; 0 means do not request PD")
 	wantNA     = flag.Bool("dhcp6c-ia-na", true, "request IA_NA (an address for the WAN interface itself)")
 	dhcpMode   = flag.String("dhcp6c-mode", "auto", "DHCPv6 client: auto(follow the M/O bits of the upstream RA) / on / off")
 	upRA       = flag.Bool("wan-ra", true, "listen to RA on the WAN side as a second prefix source and maintain the default route")

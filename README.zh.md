@@ -94,7 +94,7 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 | 选项 | 默认值 | 说明 |
 |---|---|---|
 | `-dhcp6c-mode` | `auto` | `auto` 按上游 RA 的 M、O 标志决定，`on` 总是运行客户端，`off` 不运行。 |
-| `-dhcp6c-pd-len` | `56` | 请求委派前缀（IA_PD）时提示的前缀长度。`0` 表示不请求。 |
+| `-dhcp6c-pd-len` | `56` | 请求委派前缀（IA_PD）时提示的前缀长度。实际委派多长由服务器决定；服务器拒绝这个提示时，sixup 会不带提示再请求一次。`0` 表示不请求。 |
 | `-dhcp6c-ia-na` | `true` | 同时为 WAN 接口本身请求一个地址（IA_NA）。 |
 | `-dhcp6c-pd-grace` | `10s` | 启动后等待委派前缀的时间。在此期间，RA 前缀只用于 WAN 侧，不分给内网，因此以后不必再撤回。 |
 | `-dhcp6c-release` | `false` | 退出时发送 RELEASE，归还前缀和地址。默认关闭：DUID 会保存下来，重启后续租的仍是同一个前缀。试运行总会归还。 |
