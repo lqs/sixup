@@ -38,6 +38,11 @@ const (
 
 	jnlarOperand = 10 // JNLAR_OPERAND
 
+	joolHdrLen    = 4 + 4 + 4 + joolINameLen // struct joolnlhdr, already aligned
+	joolFlagError = 1 << 0                   // JOOLNLHDR_FLAGS_ERROR
+	jnlaerrCode   = 1                        // JNLAERR_CODE
+	jnlaerrMsg    = 2                        // JNLAERR_MSG
+
 	jnlaiaXF    = 1 // JNLAIA_XF
 	jnlaiaPool6 = 2 // JNLAIA_POOL6
 
@@ -311,14 +316,49 @@ func (m *joolManager) configure() error {
 	return nil
 }
 
+// joolRequest sends one request. Jool answers each with a message of its own, which carries its
+// error when there is one (jresponse_send_simple in its nl_common.c). Asking for an ACK as well
+// would leave that second reply queued, and the next request on the connection would read it and
+// fail on its sequence number.
 func joolRequest(c *genetlink.Conn, family uint16, ver uint32, op uint8, attrs []byte) error {
 	data := append(joolHeader(ver, joolIName), attrs...)
-	_, err := c.Execute(
+	msgs, err := c.Execute(
 		genetlink.Message{Header: genetlink.Header{Command: op, Version: 1}, Data: data},
 		family,
-		netlink.Request|netlink.Acknowledge,
+		netlink.Request,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	for _, m := range msgs {
+		if err := joolReplyError(m.Data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// joolReplyError reads the error report in a reply: the header's error flag, then the code, an
+// errno, and Jool's own message as attributes.
+func joolReplyError(b []byte) error {
+	if len(b) < joolHdrLen || b[9]&joolFlagError == 0 {
+		return nil
+	}
+	ad, err := netlink.NewAttributeDecoder(b[joolHdrLen:])
+	if err != nil {
+		return fmt.Errorf("unreadable error report from jool: %w", err)
+	}
+	var code uint16
+	var msg string
+	for ad.Next() {
+		switch ad.Type() {
+		case jnlaerrCode:
+			code = ad.Uint16()
+		case jnlaerrMsg:
+			msg = ad.String()
+		}
+	}
+	return fmt.Errorf("%s: %w", strings.TrimSpace(msg), unix.Errno(code))
 }
 
 // joolHeader is struct joolnlhdr: the module rejects a request whose version is not exactly its own,

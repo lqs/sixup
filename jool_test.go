@@ -4,10 +4,13 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"net/netip"
+	"strings"
 	"testing"
 
 	"github.com/mdlayher/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // The module compares the version in every request against its own and refuses anything else, so
@@ -148,5 +151,29 @@ func TestJoolPool4(t *testing.T) {
 		if gotProto != proto || min != 1 || max != 65535 || addr != inside || bits != 32 {
 			t.Fatalf("protocol %d: got proto %d, ports %d-%d, %s/%d", proto, gotProto, min, max, addr, bits)
 		}
+	}
+}
+
+// Jool reports a failure inside its own reply rather than as a netlink error, so the reply has to
+// be read for it: an instance that already exists must come back as EEXIST.
+func TestJoolReplyError(t *testing.T) {
+	reply := func(flags byte, attrs []byte) []byte {
+		h := joolHeader(0x04010700, "sixup")
+		h[9] = flags
+		return append(h, attrs...)
+	}
+	if err := joolReplyError(reply(0, nil)); err != nil {
+		t.Fatalf("a reply without the error flag is a success, got %v", err)
+	}
+	attrs := encodeAttrs(func(ae *netlink.AttributeEncoder) {
+		ae.Uint16(jnlaerrCode, uint16(unix.EEXIST))
+		ae.String(jnlaerrMsg, "This namespace already has a Jool instance named 'sixup'.")
+	})
+	err := joolReplyError(reply(joolFlagError, attrs))
+	if !errors.Is(err, unix.EEXIST) || !strings.Contains(err.Error(), "already has a Jool instance") {
+		t.Fatalf("want EEXIST with Jool's message, got %v", err)
+	}
+	if joolReplyError([]byte("jool")) != nil {
+		t.Fatal("a reply too short for the header carries no report")
 	}
 }
