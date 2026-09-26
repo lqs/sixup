@@ -201,17 +201,22 @@ func (m *natManager) warnConflicts(c *nftables.Conn) {
 		if ch.Table == nil || ch.Table.Name == natTable || ch.Type != nftables.ChainTypeNAT {
 			continue
 		}
+		// Only these families see the IPv4 that leaves through the tunnel
+		family := map[nftables.TableFamily]string{nftables.TableFamilyIPv4: "ip", nftables.TableFamilyINet: "inet"}[ch.Table.Family]
+		if family == "" {
+			continue
+		}
 		if ch.Hooknum == nil || *ch.Hooknum != *nftables.ChainHookPostrouting {
 			continue
 		}
-		other = append(other, ch.Table.Name+"/"+ch.Name)
+		other = append(other, family+" "+ch.Table.Name+"/"+ch.Name)
 	}
 	m.warned = true
 	if len(other) > 0 {
 		warnf("[nat] other source NAT chains are loaded (%s). A masquerade rule covering %s would "+
 			"translate to a port outside the range this line owns, and only some connections would work. "+
 			"Restrict those rules to the interfaces they are meant for, or run with -tunnel-nat off",
-			strings.Join(other, " "), m.dev)
+			strings.Join(other, ", "), m.dev)
 	}
 }
 

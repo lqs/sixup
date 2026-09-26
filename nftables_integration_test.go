@@ -154,11 +154,18 @@ func TestNATReportsAForeignSourceNATChain(t *testing.T) {
 		Name: "srcnat", Table: foreign, Type: nftables.ChainTypeNAT,
 		Hooknum: nftables.ChainHookPostrouting, Priority: nftables.ChainPriorityNATSource,
 	})
+	// An IPv6 table cannot translate the tunnel's IPv4, so it is not worth a warning
+	foreign6 := c.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv6, Name: "someone-else6"})
+	c.AddChain(&nftables.Chain{
+		Name: "srcnat", Table: foreign6, Type: nftables.ChainTypeNAT,
+		Hooknum: nftables.ChainHookPostrouting, Priority: nftables.ChainPriorityNATSource,
+	})
 	if err := c.Flush(); err != nil {
 		t.Fatalf("installing the other table: %v", err)
 	}
 	t.Cleanup(func() {
 		c.DelTable(foreign)
+		c.DelTable(foreign6)
 		c.Flush()
 	})
 
@@ -170,8 +177,11 @@ func TestNATReportsAForeignSourceNATChain(t *testing.T) {
 	t.Cleanup(m.remove)
 	m.apply(mapeSnapshot(0x56))
 
-	if !bytes.Contains(logged.Bytes(), []byte("someone-else/srcnat")) {
-		t.Fatalf("the other chain should be named in the warning:\n%s", logged.String())
+	if !bytes.Contains(logged.Bytes(), []byte("ip someone-else/srcnat")) {
+		t.Fatalf("the other chain should be named in the warning, with its family:\n%s", logged.String())
+	}
+	if bytes.Contains(logged.Bytes(), []byte("someone-else6")) {
+		t.Fatalf("an IPv6 NAT chain cannot touch the tunnel's IPv4:\n%s", logged.String())
 	}
 }
 
