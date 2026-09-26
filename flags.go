@@ -37,8 +37,9 @@ var (
 	raDNS      = flag.String("ra-dns", "", "override the upstream DNS, comma separated")
 	raPref64   = flag.String("ra-pref64", "", "NAT64 prefix advertised in the RA (RFC 8781), e.g. 64:ff9b::/96; empty passes through the value from the upstream RA. NAT64 itself is provided by external tools")
 	srvMode    = flag.String("dhcp6s-mode", "off", "DHCPv6 server on the LAN side: off / stateless / stateful")
-	srvPref    = flag.Duration("dhcp6s-lease-preferred", time.Hour, "IA_NA preferred lifetime")
-	srvValid   = flag.Duration("dhcp6s-lease-valid", 2*time.Hour, "IA_NA valid lifetime")
+	srvPref    = flag.Duration("dhcp6s-lease-preferred", 45*time.Minute, "preferred lifetime of IA_NA addresses and IA_PD prefixes, capped by the upstream's (RFC 9096)")
+	srvValid   = flag.Duration("dhcp6s-lease-valid", 90*time.Minute, "valid lifetime of IA_NA addresses and IA_PD prefixes, capped by the upstream's (RFC 9096)")
+	srvPDLen   = flag.Int("dhcp6s-pd-len", 60, "shortest prefix delegated to a downstream router; a longer hint is honoured, a shorter one cut down; 0 disables downstream PD")
 	poolRange  = flag.String("dhcp6s-pool", "1000-ffff", "IID range of the address pool (hexadecimal, low 64 bits)")
 	ndMode     = flag.String("ndproxy-mode", "auto", "NDP proxy: auto(enable forward mode when a LAN /64 is also the on-link /64 of a broadcast WAN) / off / static / prefix / forward; forward works in both directions and also proxies between same-subnet hosts on the LAN and WAN sides")
 	ndTTL      = flag.Duration("ndproxy-ttl", 30*time.Second, "TTL of an NDP proxy session")
@@ -168,7 +169,7 @@ var usageGroups = []struct {
 	{"WAN side: DHCPv6 client", []string{"dhcp6c-mode", "dhcp6c-pd-len", "dhcp6c-ia-na", "dhcp6c-pd-grace", "dhcp6c-release"}},
 	{"WAN side: upstream RA and addresses", []string{"wan-ra", "wan-slaac", "wan-iid", "wan-tempaddr", "wan-prefer", "wan-shared64"}},
 	{"LAN side: RA advertisement", []string{"ra-min", "ra-max", "ra-lifetime", "ra-mtu", "ra-dns", "ra-pref64", "ra-route"}},
-	{"LAN side: DHCPv6 server", []string{"dhcp6s-mode", "dhcp6s-pool", "dhcp6s-static", "dhcp6s-lease-preferred", "dhcp6s-lease-valid"}},
+	{"LAN side: DHCPv6 server", []string{"dhcp6s-mode", "dhcp6s-pool", "dhcp6s-static", "dhcp6s-lease-preferred", "dhcp6s-lease-valid", "dhcp6s-pd-len"}},
 	{"NDP proxy", []string{"ndproxy-mode", "ndproxy-static", "ndproxy-exclude", "ndproxy-ttl"}},
 	{"Local address rotation", []string{"tempaddr-mode", "tempaddr-regen", "tempaddr-preferred", "tempaddr-valid", "tempaddr-max", "tempaddr-desync", "tempaddr-skip-dad", "tempaddr-drain-grace"}},
 	{"Tunnel", []string{"tunnel-dev", "tunnel-mtu", "tunnel-route4-metric", "tunnel-nat", "tunnel-mape-rules", "tunnel-capture", "tunnel-capture-max"}},

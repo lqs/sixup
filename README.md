@@ -21,6 +21,7 @@ the tunnel endpoints all follow from that one event. No manual step, no restart.
 - Detects how the prefix arrives, DHCPv6-PD or an RA, and hands clients their addresses and configuration through its own RA and DHCPv6 services
 - When the ISP hands out a new prefix, addresses, RAs, leases, proxy entries and tunnel endpoints follow
 - Shares a single upstream /64 with the LAN (RFC 7278), with a Neighbor Discovery proxy on broadcast WANs, splits a shorter prefix across the segments
+- Delegates prefixes to downstream routers, so one sixup can sit behind another
 - Builds a DS-Lite, MAP-E or IPIP6 tunnel as needed, and keeps MAP-E source ports inside the assigned port set
 - One static binary under 5 MiB, dependent on no external command and no system service
 
@@ -123,11 +124,12 @@ own, `inet sixup`, removed when it exits. Pass `-tunnel-nat off` to write them y
 
 | Option | Default | Description |
 |---|---|---|
-| `-dhcp6s-mode` | `off` | `stateless` answers only with options such as DNS; `stateful` also assigns addresses; `off` runs no server. The RA flags follow this choice. |
+| `-dhcp6s-mode` | `off` | `stateless` assigns no addresses and answers with options such as DNS; `stateful` also assigns addresses; both delegate prefixes to downstream routers (`-dhcp6s-pd-len`); `off` runs no server. The RA flags follow this choice. |
 | `-dhcp6s-pool` | `1000-ffff` | Range of interface identifiers to assign from, in hexadecimal, as the low 64 bits. |
 | `-dhcp6s-static` | | Fixed assignment, repeatable: `mac=<MAC>,addr=::100`, or `duid=<hex>,addr=2001:db8::5`. |
-| `-dhcp6s-lease-preferred` | `1h` | Preferred lifetime of an assigned address. |
-| `-dhcp6s-lease-valid` | `2h` | Valid lifetime of an assigned address. |
+| `-dhcp6s-lease-preferred` | `45m` | Preferred lifetime of an assigned address or delegated prefix, never longer than what is left upstream. The default is the limit RFC 9096 recommends. |
+| `-dhcp6s-lease-valid` | `90m` | Valid lifetime of an assigned address or delegated prefix, capped the same way. |
+| `-dhcp6s-pd-len` | `60` | Largest prefix delegated to a downstream router, as a prefix length. A router hinting a longer one gets it; one hinting a shorter one gets this, or a longer one when space runs short. Delegations come from the upstream delegation, clear of the LAN subnets, in both server modes. `0` disables downstream PD. |
 
 ### NDP proxy
 

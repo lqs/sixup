@@ -101,6 +101,9 @@ func main() {
 	default:
 		fatalf("-ndproxy-mode must be auto / off / static / prefix / forward")
 	}
+	if *srvPDLen < 0 || *srvPDLen > 64 {
+		fatalf("-dhcp6s-pd-len must be between 0 and 64")
+	}
 	if *raMin > *raMax || *raMin < 3*time.Second {
 		fatalf("-ra-min must be at least 3 seconds and no larger than -ra-max")
 	}
@@ -233,6 +236,10 @@ func main() {
 		go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanSLAAC, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
 	}
 	poolStart, poolEnd := parsePool(*poolRange)
+	var pd *pdPool
+	if *srvMode != "off" && *srvPDLen > 0 {
+		pd = newPDPool(*srvPDLen, filepath.Join(*stateDir, "pd-leases.json"))
+	}
 	for _, l := range lanDefs {
 		iface := l.iface
 		go (&addrManager{ifname: iface, secret: secret, cfg: tcfg, iids: lanIIDs, pick: func(s Snapshot) []Prefix { return s.LAN[iface] }, side: sideLAN, layout: layout}).run(ctx, hub, store, store.Subscribe())
@@ -243,7 +250,7 @@ func main() {
 		if *srvMode != "off" {
 			s := &dhcpServer{
 				ifname: l.iface, stateful: *srvMode == "stateful", leaseFile: filepath.Join(*stateDir, "leases-"+l.iface+".json"),
-				statics: parseStatics(statics), poolStart: poolStart, poolEnd: poolEnd, preferred: *srvPref, valid: *srvValid, dns: dnsOverride,
+				statics: parseStatics(statics), poolStart: poolStart, poolEnd: poolEnd, preferred: *srvPref, valid: *srvValid, dns: dnsOverride, pd: pd,
 			}
 			go func(s *dhcpServer) {
 				s.duid = serverDUID(ctx, dhcp, *stateDir, *wan)
