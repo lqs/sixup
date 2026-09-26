@@ -70,6 +70,11 @@ func TestJoolNamespaceAgainstKernel(t *testing.T) {
 		if err != nil || strings.TrimSpace(string(b)) != "1" {
 			t.Errorf("IPv4 forwarding is off inside: %q %v", b, err)
 		}
+		// Jool accepts a pool4 only clear of the ephemeral range
+		b, err = os.ReadFile("/proc/sys/net/ipv4/ip_local_port_range")
+		if f := strings.Fields(string(b)); err != nil || len(f) != 2 || f[0] != "65534" || f[1] != "65535" {
+			t.Errorf("the ephemeral range inside should sit above pool4: %q %v", b, err)
+		}
 		return nil
 	}); err != nil {
 		t.Fatal(err)

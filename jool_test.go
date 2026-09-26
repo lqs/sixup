@@ -108,8 +108,9 @@ func TestJoolInstanceAttributes(t *testing.T) {
 	}
 }
 
-// pool4 is Jool's side of the /31 with every port: nothing else in its namespace uses the address,
-// and the line's ports belong to the source NAT outside.
+// pool4 is Jool's side of the /31 with every port short of the namespace's ephemeral range, which
+// Jool refuses to overlap: nothing else in its namespace uses the address, and the line's ports
+// belong to the source NAT outside.
 func TestJoolPool4(t *testing.T) {
 	outside, inside := joolAddrs(netip.MustParsePrefix("192.168.255.254/31"))
 	if outside != netip.MustParseAddr("192.168.255.254") || inside != netip.MustParseAddr("192.168.255.255") {
@@ -148,7 +149,11 @@ func TestJoolPool4(t *testing.T) {
 				}
 			}
 		}
-		if gotProto != proto || min != 1 || max != 65535 || addr != inside || bits != 32 {
+		wantMax := uint16(joolPortMax) // below the namespace's ephemeral range, which Jool checks
+		if proto == joolICMP {
+			wantMax = 65535 // identifiers, which Jool does not check against it
+		}
+		if gotProto != proto || min != 1 || max != wantMax || addr != inside || bits != 32 {
 			t.Fatalf("protocol %d: got proto %d, ports %d-%d, %s/%d", proto, gotProto, min, max, addr, bits)
 		}
 	}

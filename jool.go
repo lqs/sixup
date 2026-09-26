@@ -63,7 +63,9 @@ const (
 )
 
 // l4 protocols, in Jool's own numbering rather than the IP one
-var joolProtos = []uint8{0, 1, 2} // L4PROTO_TCP, L4PROTO_UDP, L4PROTO_ICMP
+const joolICMP = 2 // L4PROTO_ICMP
+
+var joolProtos = []uint8{0, 1, joolICMP} // L4PROTO_TCP, L4PROTO_UDP, L4PROTO_ICMP
 
 // joolManager runs one NAT64 instance in a network namespace of its own, joined to this one by a
 // veth pair. Jool hooks PREROUTING, so in the host's own namespace it would never see the router's
@@ -87,6 +89,10 @@ type joolManager struct {
 	family  uint16 // Jool's generic netlink family then; the kernel hands out a new one when the module is reloaded
 	lastErr string // the module may be absent for hours; the same complaint is logged once
 }
+
+// joolPortMax is the top of pool4 for TCP and UDP; the two ports above it are the namespace's
+// ephemeral range.
+const joolPortMax = 65533
 
 const (
 	joolIName   = "sixup"
@@ -225,6 +231,12 @@ func (m *joolManager) setup() (err error) {
 		// all, the rest would follow the default route back out and bounce between the two
 		// namespaces until the hop limit ran out; this sends an unreachable instead.
 		if err := routeUnreachable(m.prefix, 0, false); err != nil {
+			return err
+		}
+		// Jool refuses a pool4 that overlaps the namespace's ephemeral ports, which would belong to
+		// its sockets. The namespace has none, so the ephemeral range shrinks to two ports at the
+		// top, of different parity as the kernel prefers, and pool4 gets every port below them.
+		if err := sysctlWrite("/proc/sys/net/ipv4/ip_local_port_range", fmt.Sprintf("%d %d", joolPortMax+1, joolPortMax+2)); err != nil {
 			return err
 		}
 		// Jool translates in PREROUTING and the result is forwarded like any packet
@@ -383,8 +395,9 @@ func instanceAttrs(pool6 netip.Prefix) []byte {
 	})
 }
 
-// pool4Attrs puts every port of addr in pool4 for one protocol: nothing else in the namespace
-// uses the address, and the source NAT outside owns the line's ports.
+// pool4Attrs puts the ports of addr in pool4 for one protocol: every ICMP identifier, and every
+// TCP and UDP port below the namespace's ephemeral range. Nothing else in the namespace uses the
+// address, and the source NAT outside owns the line's ports.
 func pool4Attrs(addr netip.Addr, proto uint8) []byte {
 	return encodeAttrs(func(ae *netlink.AttributeEncoder) {
 		ae.Nested(jnlarOperand, func(ae *netlink.AttributeEncoder) error {
@@ -394,7 +407,11 @@ func pool4Attrs(addr netip.Addr, proto uint8) []byte {
 			ae.Uint8(jnlap4Proto, proto)
 			ae.Nested(jnlap4Prefix, prefix4Attrs(netip.PrefixFrom(addr, 32)))
 			ae.Uint16(jnlap4PortMin, 1)
-			ae.Uint16(jnlap4PortMax, 65535)
+			if proto == joolICMP {
+				ae.Uint16(jnlap4PortMax, 65535)
+			} else {
+				ae.Uint16(jnlap4PortMax, joolPortMax)
+			}
 			return nil
 		})
 	})
