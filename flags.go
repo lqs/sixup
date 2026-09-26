@@ -80,7 +80,7 @@ func init() {
 	flag.Var(&routes, "ra-route", "Route Information carried in the RA, repeatable")
 	flag.Var(&ndStatic, "ndproxy-static", "static address or prefix for the NDP proxy, repeatable")
 	flag.Var(&ndExclude, "ndproxy-exclude", "prefix excluded from the NDP proxy, repeatable")
-	flag.IntVar(&verbose, "v", 0, "shorthand for -log-level debug")
+	flag.BoolVar(&verbose, "v", false, "shorthand for -log-level debug")
 	showVersion = flag.Bool("version", false, "print the version and exit")
 	showLicense = flag.Bool("license", false, "print the licence of sixup and of the work it derives from, and exit")
 }

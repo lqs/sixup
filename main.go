@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	verbose int
+	verbose bool
 	dryRun  bool
 	version = "dev" // injected by build.sh via -ldflags -X
 )
@@ -49,7 +49,7 @@ func main() {
 
 	setupLogging(*logLevelName)
 	// -v and dry-run both mean "show everything", but an explicit -log-level still wins.
-	if verbose > 0 || (dryRun && !flagGiven("log-level")) {
+	if verbose || (dryRun && !flagGiven("log-level")) {
 		setDebug()
 	}
 	if *wan == "" {
