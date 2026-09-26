@@ -6,10 +6,12 @@ import (
 	"bytes"
 	"encoding/binary"
 	"log"
+	"net"
 	"net/netip"
 	"os"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
@@ -79,8 +81,8 @@ func TestNATAgainstKernel(t *testing.T) {
 			t.Fatalf("rule %d came back as %d-%d, want %s", i, start, end, ports[i])
 		}
 	}
-	if n := len(rulesIn(t, c, "forward")); n != 1 {
-		t.Fatalf("the MSS clamp should be one rule, got %d", n)
+	if n := len(rulesIn(t, c, "forward")); n != 2 {
+		t.Fatalf("the MSS clamp should be one rule per direction, got %d", n)
 	}
 
 	// A renumbering rewrites the set; the old ranges must not survive it
@@ -133,8 +135,8 @@ func TestNATAgainstKernelDSLite(t *testing.T) {
 			t.Fatal("DS-Lite must not translate here, the AFTR does")
 		}
 	}
-	if n := len(rulesIn(t, c, "forward")); n != 1 {
-		t.Fatalf("the clamp applies on DS-Lite too, got %d rules", n)
+	if n := len(rulesIn(t, c, "forward")); n != 2 {
+		t.Fatalf("the clamp applies on DS-Lite too, one rule per direction, got %d rules", n)
 	}
 }
 
@@ -170,5 +172,132 @@ func TestNATReportsAForeignSourceNATChain(t *testing.T) {
 
 	if !bytes.Contains(logged.Bytes(), []byte("someone-else/srcnat")) {
 		t.Fatalf("the other chain should be named in the warning:\n%s", logged.String())
+	}
+}
+
+// openTun creates a TUN device carrying bare IPv4 packets, up and with a route to dst through it.
+func openTun(t *testing.T, name string, dst netip.Prefix) *os.File {
+	t.Helper()
+	// Attach first and hand the fd to the poller after, as wireguard-go does: registered while
+	// still unattached, the fd is not reliably pollable and the read deadline cannot work.
+	fd, err := unix.Open("/dev/net/tun", unix.O_RDWR|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Skipf("no TUN device: %v", err)
+	}
+	ifr, _ := unix.NewIfreq(name)
+	ifr.SetUint16(unix.IFF_TUN | unix.IFF_NO_PI)
+	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
+		unix.Close(fd)
+		t.Fatalf("TUNSETIFF %s: %v", name, err)
+	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatal(err)
+	}
+	f := os.NewFile(uintptr(fd), name)
+	t.Cleanup(func() { f.Close() })
+	ifi, err := net.InterfaceByName(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkUp(t, ifi.Index)
+	if err := routeSet(ifi.Index, dst, netip.Addr{}, 0, 0); err != nil {
+		t.Fatalf("route %s via %s: %v", dst, name, err)
+	}
+	if err := sysctlWrite("/proc/sys/net/ipv4/conf/"+name+"/rp_filter", "0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := sysctlWrite("/proc/sys/net/ipv4/conf/"+name+"/forwarding", "1"); err != nil {
+		t.Fatal(err)
+	}
+	return f
+}
+
+// syn builds an IPv4 TCP SYN from src to dst, with an MSS option unless mss is 0.
+func syn(src, dst netip.Addr, mss uint16) []byte {
+	opts := 0
+	if mss > 0 {
+		opts = 4
+	}
+	p := make([]byte, 20+20+opts)
+	p[0], p[8], p[9] = 0x45, 64, unix.IPPROTO_TCP
+	binary.BigEndian.PutUint16(p[2:], uint16(len(p)))
+	s4, d4 := src.As4(), dst.As4()
+	copy(p[12:], s4[:])
+	copy(p[16:], d4[:])
+	var sum uint32
+	for i := 0; i < 20; i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(p[i:]))
+	}
+	for sum > 0xffff {
+		sum = sum>>16 + sum&0xffff
+	}
+	binary.BigEndian.PutUint16(p[10:], ^uint16(sum))
+	tcp := p[20:]
+	binary.BigEndian.PutUint16(tcp[0:], 40000)
+	binary.BigEndian.PutUint16(tcp[2:], 80)
+	tcp[12], tcp[13] = byte((20+opts)/4)<<4, 0x02
+	if mss > 0 {
+		tcp[20], tcp[21] = 2, 4
+		binary.BigEndian.PutUint16(tcp[22:], mss)
+	}
+	return p
+}
+
+// forwardedMSS sends a SYN in through in and returns the MSS option of what comes out of out, or
+// 0 when the SYN carries none.
+func forwardedMSS(t *testing.T, in, out *os.File, pkt []byte) uint16 {
+	t.Helper()
+	if _, err := in.Write(pkt); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	out.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 2048)
+	for {
+		n, err := out.Read(buf)
+		if err != nil {
+			t.Fatalf("the SYN was not forwarded: %v", err)
+		}
+		p := buf[:n]
+		if n < 40 || p[0]>>4 != 4 || p[9] != unix.IPPROTO_TCP {
+			continue // the kernel's own traffic on the device
+		}
+		tcp := p[20:]
+		if tcp[12]>>4 == 5 {
+			return 0
+		}
+		return binary.BigEndian.Uint16(tcp[22:])
+	}
+}
+
+// The clamp lowers the MSS of a SYN leaving through the tunnel and of one arriving from it. The
+// kernel never raises an MSS it writes, so a smaller one and a SYN without the option pass as they are.
+func TestMSSClampAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	lan, far := netip.MustParseAddr("192.0.2.10"), netip.MustParseAddr("198.51.100.20")
+	lanDev := openTun(t, "lan-test0", netip.MustParsePrefix("192.0.2.0/24"))
+	tunDev := openTun(t, "sixup-test0", netip.MustParsePrefix("198.51.100.0/24"))
+	m := &natManager{dev: "sixup-test0", mtu: 1460, warned: true}
+	t.Cleanup(m.remove)
+	m.apply(Snapshot{Tunnel: &TunnelParams{
+		Kind: "ds-lite", Local: netip.MustParseAddr("2001:db8::1"), Remote: netip.MustParseAddr("2001:db8::2"),
+		IPv4: netip.MustParseAddr("192.0.0.2"),
+	}})
+	cases := []struct {
+		name    string
+		in, out *os.File
+		src     netip.Addr
+		dst     netip.Addr
+		mss     uint16
+		want    uint16
+	}{
+		{"leaving, too large", lanDev, tunDev, lan, far, 1460, 1420},
+		{"leaving, already small", lanDev, tunDev, lan, far, 1200, 1200},
+		{"leaving, no option", lanDev, tunDev, lan, far, 0, 0},
+		{"arriving, too large", tunDev, lanDev, far, lan, 1460, 1420},
+	}
+	for _, c := range cases {
+		if got := forwardedMSS(t, c.in, c.out, syn(c.src, c.dst, c.mss)); got != c.want {
+			t.Errorf("%s: MSS %d came out as %d, want %d", c.name, c.mss, got, c.want)
+		}
 	}
 }

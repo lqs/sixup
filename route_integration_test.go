@@ -12,7 +12,9 @@ import (
 )
 
 // loUp brings up the loopback of the fresh namespace, which starts down and takes no routes.
-func loUp(t *testing.T) {
+func loUp(t *testing.T) { linkUp(t, 1) }
+
+func linkUp(t *testing.T, index int) {
 	t.Helper()
 	c, err := rtDial()
 	if err != nil {
@@ -20,11 +22,11 @@ func loUp(t *testing.T) {
 	}
 	defer c.Close()
 	hdr := make([]byte, 16)
-	nativeEndian.PutUint32(hdr[4:8], 1)
+	nativeEndian.PutUint32(hdr[4:8], uint32(index))
 	nativeEndian.PutUint32(hdr[8:12], unix.IFF_UP)
 	nativeEndian.PutUint32(hdr[12:16], unix.IFF_UP)
 	if _, err := c.Execute(netlink.Message{Header: netlink.Header{Type: unix.RTM_NEWLINK, Flags: netlink.Request | netlink.Acknowledge}, Data: hdr}); err != nil {
-		t.Fatalf("lo up: %v", err)
+		t.Fatalf("link %d up: %v", index, err)
 	}
 }
 

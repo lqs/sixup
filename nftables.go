@@ -99,7 +99,9 @@ func (m *natManager) apply(snap Snapshot) {
 			Hooknum: nftables.ChainHookForward, Priority: nftables.ChainPriorityMangle,
 			Policy: chainPolicy(nftables.ChainPolicyAccept),
 		})
-		c.AddRule(m.mssRule(tbl, fwd, plan.mtu))
+		for _, r := range m.mssRules(tbl, fwd, plan.mtu) {
+			c.AddRule(r)
+		}
 	}
 	if err := c.Flush(); err != nil {
 		errorf("[nat] failed to install the ruleset: %v", err)
@@ -159,21 +161,27 @@ func (m *natManager) egress() []expr.Any {
 	}
 }
 
-// mssRule clamps the MSS of outgoing SYNs to what fits the tunnel. Large transfers stall without it
-// whenever the ICMP that path MTU discovery depends on is filtered upstream.
-func (m *natManager) mssRule(tbl *nftables.Table, ch *nftables.Chain, mtu int) *nftables.Rule {
-	mss := uint16(mtu - 40) // IPv4 and TCP headers
-	return &nftables.Rule{Table: tbl, Chain: ch, Exprs: []expr.Any{
-		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(m.dev)},
-		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
-		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 13, Len: 1},
-		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 1, Mask: []byte{0x02 | 0x04}, Xor: []byte{0x00}},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x02}}, // SYN set, RST clear
-		&expr.Immediate{Register: 1, Data: binaryutil.BigEndian.PutUint16(mss)},
-		&expr.Exthdr{SourceRegister: 1, Type: 2, Offset: 2, Len: 2, Op: expr.ExthdrOpTcpopt},
-	}}
+// mssRules clamp the MSS of SYNs through the tunnel to what fits it, in both directions: the LAN
+// host's, so the far end sends segments that fit, and the far end's, so the LAN host does too.
+// Large transfers stall without it whenever the ICMP that path MTU discovery depends on is filtered.
+// The kernel only ever lowers an MSS it writes, so a smaller one is left alone.
+func (m *natManager) mssRules(tbl *nftables.Table, ch *nftables.Chain, mtu int) []*nftables.Rule {
+	mss := binaryutil.BigEndian.PutUint16(uint16(mtu - 40)) // IPv4 and TCP headers
+	var out []*nftables.Rule
+	for _, dir := range []expr.MetaKey{expr.MetaKeyOIFNAME, expr.MetaKeyIIFNAME} {
+		out = append(out, &nftables.Rule{Table: tbl, Chain: ch, Exprs: []expr.Any{
+			&expr.Meta{Key: dir, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(m.dev)},
+			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 13, Len: 1},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 1, Mask: []byte{0x02 | 0x04}, Xor: []byte{0x00}},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x02}}, // SYN set, RST clear
+			&expr.Immediate{Register: 1, Data: mss},
+			&expr.Exthdr{SourceRegister: 1, Type: 2, Offset: 2, Len: 2, Op: expr.ExthdrOpTcpopt},
+		}})
+	}
+	return out
 }
 
 // warnConflicts reports other source-NAT chains that may translate the same traffic first. netfilter

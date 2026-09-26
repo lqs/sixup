@@ -91,17 +91,28 @@ func TestSNATRuleWithoutPortRestriction(t *testing.T) {
 	}
 }
 
-// The clamp has to leave room for the IPv4 and TCP headers the tunnel adds back.
-func TestMSSRuleClampsToTunnelMTU(t *testing.T) {
+// The clamp has to leave room for the IPv4 and TCP headers the tunnel adds back, and apply in both
+// directions.
+func TestMSSRulesClampToTunnelMTU(t *testing.T) {
 	m := &natManager{dev: "sixup-ipv4"}
-	r := m.mssRule(nil, nil, 1460)
-	im := immediates(r)
-	if got := binary.BigEndian.Uint16(im[1]); got != 1420 {
-		t.Fatalf("MSS should be the tunnel MTU less 40 bytes, got %d", got)
+	rules := m.mssRules(nil, nil, 1460)
+	if len(rules) != 2 {
+		t.Fatalf("want one rule per direction, got %d", len(rules))
 	}
-	eh, ok := firstOf[*expr.Exthdr](r)
-	if !ok || eh.Op != expr.ExthdrOpTcpopt || eh.Type != 2 || eh.Len != 2 {
-		t.Fatalf("the maximum segment size option is not the one being written: %+v", eh)
+	var dirs []expr.MetaKey
+	for _, r := range rules {
+		dir, _ := firstOf[*expr.Meta](r)
+		dirs = append(dirs, dir.Key)
+		if got := binary.BigEndian.Uint16(immediates(r)[1]); got != 1420 {
+			t.Fatalf("MSS should be the tunnel MTU less 40 bytes, got %d", got)
+		}
+		eh, ok := firstOf[*expr.Exthdr](r)
+		if !ok || eh.Op != expr.ExthdrOpTcpopt || eh.Type != 2 || eh.Len != 2 {
+			t.Fatalf("the maximum segment size option is not the one being written: %+v", eh)
+		}
+	}
+	if dirs[0] != expr.MetaKeyOIFNAME || dirs[1] != expr.MetaKeyIIFNAME {
+		t.Fatalf("want the outgoing and the incoming direction, got %v", dirs)
 	}
 }
 
