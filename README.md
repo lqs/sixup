@@ -116,7 +116,7 @@ own, `inet sixup`, removed when it exits. Pass `-tunnel-nat off` to write them y
 | `-ra-max` | `10m` | Maximum interval between unsolicited RAs (MaxRtrAdvInterval). |
 | `-ra-lifetime` | `30m` | Router lifetime carried in the RA. |
 | `-ra-mtu` | `0` | MTU advertised in the RA. `0` advertises the WAN path MTU when it is smaller than the LAN interface MTU, taken from the upstream RA or the WAN interface, so a PPPoE line with 1492 no longer depends on path MTU discovery. |
-| `-ra-dns` | | DNS servers to advertise instead of the upstream ones, comma separated. Also used by the DHCPv6 server. |
+| `-ra-dns` | `upstream` | DNS servers announced on the LAN, by the RA and the DHCPv6 server. `off` announces none; otherwise a comma-separated list, in order, of `upstream` (the servers the upstream hands out), `self` (this router's address on that LAN, in its ULA when there is one, so renumbering leaves it valid) and IPv6 addresses. For example `self,upstream`. |
 | `-ra-pref64` | | NAT64 prefix to advertise (RFC 8781), such as `64:ff9b::/96`. Empty passes on the one from the upstream RA. The length must be 32, 40, 48, 56, 64 or 96. |
 | `-ra-route` | | Prefix to advertise as a Route Information option, repeatable. |
 

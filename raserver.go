@@ -31,7 +31,7 @@ type raServer struct {
 	other    bool
 	routes   []netip.Prefix // extra RIOs
 	pref64   netip.Prefix   // configured NAT64 prefix, overrides upstream
-	dns      []netip.Addr   // configured DNS, overrides upstream
+	dns      lanDNS
 	snap     Snapshot
 	rs       chan struct{}
 	lastSent time.Time
@@ -208,10 +208,7 @@ func (r *raServer) build() *ndp.RouterAdvertisement {
 	if !hasActive && len(r.snap.WAN) == 0 {
 		ra.RouterLifetime = 0
 	}
-	dns := r.dns
-	if len(dns) == 0 {
-		dns = routableDNS(r.snap.DNS)
-	}
+	dns := r.dns.resolve(r.snap, r.ifi)
 	// RFC 8106: RDNSS/DNSSL lifetime between MaxRtrAdvInterval and twice that, capped by the upstream prefix's remaining valid time
 	dnsLft := 2 * r.maxI
 	for _, p := range r.snap.WAN {
@@ -266,4 +263,75 @@ func (r *raServer) send(reason string) {
 // multicast and Linux may pick the wrong interface, so every NDP send carries the index.
 func ifCM(ifi *net.Interface) *ipv6.ControlMessage {
 	return &ipv6.ControlMessage{IfIndex: ifi.Index}
+}
+
+// lanDNS is -ra-dns: the DNS servers announced on a LAN, in order.
+type lanDNS struct {
+	list   []dnsEntry
+	iid    iidPolicy // the first -lan-iid, which self is built from
+	secret []byte
+}
+
+// dnsEntry is one -ra-dns entry: a fixed address, self, or upstream.
+type dnsEntry struct {
+	addr     netip.Addr
+	self     bool // this router's address on the LAN
+	upstream bool // the routable servers the upstream hands out
+}
+
+// parseLANDNS reads -ra-dns: off, or a comma-separated list of self, upstream and IPv6 addresses.
+func parseLANDNS(spec string) ([]dnsEntry, error) {
+	if strings.TrimSpace(spec) == "off" {
+		return nil, nil
+	}
+	var out []dnsEntry
+	for f := range strings.SplitSeq(spec, ",") {
+		switch f = strings.TrimSpace(f); f {
+		case "self":
+			out = append(out, dnsEntry{self: true})
+		case "upstream":
+			out = append(out, dnsEntry{upstream: true})
+		default:
+			a, err := netip.ParseAddr(f)
+			if err != nil || !a.Is6() || a.Zone() != "" {
+				return nil, fmt.Errorf("%q is not off, self, upstream or an IPv6 address", f)
+			}
+			out = append(out, dnsEntry{addr: a})
+		}
+	}
+	return out, nil
+}
+
+// resolve returns the DNS servers for the LAN on ifi. self takes the router's address in the
+// LAN's ULA when it has one, which renumbering leaves valid, else in its global prefix; it is
+// left out while the LAN has neither.
+func (d lanDNS) resolve(s Snapshot, ifi *net.Interface) []netip.Addr {
+	var out []netip.Addr
+	for _, e := range d.list {
+		switch {
+		case e.upstream:
+			out = append(out, routableDNS(s.DNS)...)
+		case e.self:
+			if p, ok := selfPrefix(s.LAN[ifi.Name]); ok {
+				out = append(out, d.iid.addr(d.secret, p, ifi, 0))
+			}
+		default:
+			out = append(out, e.addr)
+		}
+	}
+	return out
+}
+
+func selfPrefix(ps []Prefix) (netip.Prefix, bool) {
+	var gua netip.Prefix
+	for _, p := range ps {
+		switch {
+		case p.Deprecated:
+		case p.Source == sourceULA:
+			return p.Prefix, true
+		case !gua.IsValid():
+			gua = p.Prefix
+		}
+	}
+	return gua, gua.IsValid()
 }

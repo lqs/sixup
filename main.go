@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -197,11 +196,9 @@ func main() {
 		go (&tunnelWatcher{ifname: *wan, store: store, pkts: pkts, maxRun: *tunCapMax}).run(ctx, store.Subscribe())
 	}
 
-	var dnsOverride []netip.Addr
-	if *raDNS != "" {
-		for _, s := range strings.Split(*raDNS, ",") {
-			dnsOverride = append(dnsOverride, netip.MustParseAddr(strings.TrimSpace(s)))
-		}
+	dnsOverride := lanDNS{iid: lanIIDs[0], secret: secret}
+	if dnsOverride.list, err = parseLANDNS(*raDNS); err != nil {
+		fatalf("-ra-dns: %v", err)
 	}
 	var pref64 netip.Prefix
 	if *raPref64 == "" && *nat64 != "off" {

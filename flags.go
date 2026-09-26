@@ -34,7 +34,7 @@ var (
 	raMax      = flag.Duration("ra-max", 600*time.Second, "MaxRtrAdvInterval")
 	raLifetime = flag.Duration("ra-lifetime", 1800*time.Second, "router lifetime of the RA")
 	raMTU      = flag.Uint("ra-mtu", 0, "MTU advertised in the RA; 0 means automatic: advertised when the WAN path MTU (the MTU option of the upstream RA or the WAN interface MTU) is smaller than the LAN interface, so PPPoE 1492 and similar no longer depend on PMTU discovery")
-	raDNS      = flag.String("ra-dns", "", "override the upstream DNS, comma separated")
+	raDNS      = flag.String("ra-dns", "upstream", "DNS servers announced on the LAN: off, or a comma-separated list, in order, of upstream (the servers the upstream hands out), self (this router's address on that LAN, in the ULA when there is one) and IPv6 addresses")
 	raPref64   = flag.String("ra-pref64", "", "NAT64 prefix advertised in the RA (RFC 8781), e.g. 64:ff9b::/96; empty passes through the value from the upstream RA. NAT64 itself is provided by external tools")
 	srvMode    = flag.String("dhcp6s-mode", "off", "DHCPv6 server on the LAN side: off / stateless / stateful")
 	srvPref    = flag.Duration("dhcp6s-lease-preferred", 45*time.Minute, "preferred lifetime of IA_NA addresses and IA_PD prefixes, capped by the upstream's (RFC 9096)")

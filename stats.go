@@ -75,7 +75,7 @@ func diagnoseSnapshot(s Snapshot, pointToPoint bool) []string {
 		out = append(out, reason+", so sixup would proxy Neighbor Discovery as a workaround; ask your ISP: \""+ask+"\"")
 	}
 	if len(s.DNS) > 0 && len(routableDNS(s.DNS)) == 0 {
-		out = append(out, "Upstream only offers link-local DNS servers ("+addrsString(s.DNS)+"): they are reachable on the WAN link alone, so they are dropped from the RA and the DHCPv6 server and LAN clients would get no DNS at all. Run a resolver on this router and point clients at it with -ra-dns")
+		out = append(out, "Upstream only offers link-local DNS servers ("+addrsString(s.DNS)+"): they are reachable on the WAN link alone, so they are dropped from the RA and the DHCPv6 server and LAN clients would get no DNS at all. Run a resolver on this router and point clients at it with -ra-dns self")
 	}
 	return out
 }

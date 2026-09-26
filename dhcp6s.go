@@ -65,7 +65,7 @@ type dhcpServer struct {
 	poolEnd   uint64
 	preferred time.Duration
 	valid     time.Duration
-	dns       []netip.Addr
+	dns       lanDNS
 	pd        *pdPool // downstream prefix delegation; nil when disabled
 
 	mu     sync.Mutex
@@ -286,10 +286,7 @@ func (s *dhcpServer) iaStatus(iaid [4]byte, code iana.StatusCode, text string) *
 
 // addInfo appends DNS and search list from upstream or the config override.
 func (s *dhcpServer) addInfo(resp *dhcpv6.Message) {
-	dns := s.dns
-	if len(dns) == 0 {
-		dns = routableDNS(s.snap.DNS)
-	}
+	dns := s.dns.resolve(s.snap, s.ifi)
 	if len(dns) > 0 {
 		var ips []net.IP
 		for _, d := range dns {

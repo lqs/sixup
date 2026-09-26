@@ -119,7 +119,7 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 | `-ra-max` | `10m` | 主动发送 RA 的最大间隔（MaxRtrAdvInterval）。 |
 | `-ra-lifetime` | `30m` | RA 中的路由器生存期。 |
 | `-ra-mtu` | `0` | RA 中通告的 MTU。`0` 表示当 WAN 路径 MTU 小于内网接口 MTU 时通告前者，WAN 路径 MTU 取自上游 RA 或 WAN 接口。这样 PPPoE 的 1492 等情况不必再依赖路径 MTU 发现。 |
-| `-ra-dns` | | 代替上游 DNS 通告的 DNS 服务器，逗号分隔。DHCPv6 服务器也使用它。 |
+| `-ra-dns` | `upstream` | 向内网下发的 DNS 服务器，RA 和 DHCPv6 服务器都使用。`off` 表示不下发；否则按顺序列出以下各项，逗号分隔：`upstream`（上游下发的服务器）、`self`（路由器在该内网上的地址，有 ULA 时用 ULA，换前缀后仍然有效）、IPv6 地址。例如 `self,upstream`。 |
 | `-ra-pref64` | | 通告的 NAT64 前缀（RFC 8781），如 `64:ff9b::/96`。留空则转发上游 RA 中的值。长度必须是 32、40、48、56、64 或 96。 |
 | `-ra-route` | | 以路由信息选项（Route Information）通告的前缀，可重复。 |
 

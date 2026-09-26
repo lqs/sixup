@@ -13,6 +13,7 @@ func newTestRA(snap Snapshot) *raServer {
 	return &raServer{
 		ifname: "lan0", ifi: &net.Interface{Index: 3, Name: "lan0", MTU: 1500, HardwareAddr: net.HardwareAddr{2, 0, 0, 0, 0, 1}},
 		minI: 200 * time.Second, maxI: 600 * time.Second, lifetime: 1800 * time.Second, snap: snap,
+		dns: lanDNS{list: []dnsEntry{{upstream: true}}},
 	}
 }
 
@@ -115,7 +116,7 @@ func TestRABuildOverridesAndExtras(t *testing.T) {
 	snap.PREF64 = netip.MustParsePrefix("64:ff9b::/96")
 	snap.WAN[0].Valid = now.Add(10 * time.Minute) // shorter than 2*maxI
 	r := newTestRA(snap)
-	r.dns = []netip.Addr{netip.MustParseAddr("2001:db8::53")}
+	r.dns.list, _ = parseLANDNS("2001:db8::53")
 	r.pref64 = netip.MustParsePrefix("2001:db8:64::/96")
 	r.routes = []netip.Prefix{netip.MustParsePrefix("2001:db8:ff::/48")}
 	r.managed, r.other = false, true
@@ -141,5 +142,51 @@ func TestRABuildOverridesAndExtras(t *testing.T) {
 	ri, ok := findOpt[*ndp.RouteInformation](ra.Options)
 	if !ok || ri.PrefixLength != 48 || ri.RouteLifetime != r.lifetime {
 		t.Fatalf("RIO: %+v", ri)
+	}
+}
+
+func TestParseLANDNS(t *testing.T) {
+	got, err := parseLANDNS("self, upstream, 2001:db8::53")
+	if err != nil || len(got) != 3 || !got[0].self || !got[1].upstream || got[2].addr != netip.MustParseAddr("2001:db8::53") {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	if got, err := parseLANDNS(" off "); err != nil || len(got) != 0 {
+		t.Fatalf("off: %+v, %v", got, err)
+	}
+	for _, bad := range []string{"", "router", "192.0.2.1", "fe80::1%eth0", "self,", "off,self"} {
+		if _, err := parseLANDNS(bad); err == nil {
+			t.Errorf("%q should be refused", bad)
+		}
+	}
+}
+
+// self is the router's own address on the LAN the RA goes out on, in the ULA when there is one,
+// and follows the prefix; upstream passes the routable upstream servers through, in place.
+func TestLANDNS(t *testing.T) {
+	now := time.Now()
+	snap := lanSnap(now)
+	ifi := &net.Interface{Index: 3, Name: "lan0"}
+	fixed, _ := parseIIDPolicy("::1")
+	d := lanDNS{iid: fixed}
+	resolve := func(spec string, s Snapshot) []netip.Addr {
+		d.list, _ = parseLANDNS(spec)
+		return d.resolve(s, ifi)
+	}
+	google := netip.MustParseAddr("2001:4860:4860::8888")
+	if got := resolve("upstream", snap); len(got) != 1 || got[0] != google {
+		t.Fatalf("upstream: want the routable upstream server, got %v", got)
+	}
+	if got := resolve("off", snap); len(got) != 0 {
+		t.Fatalf("off: %v", got)
+	}
+	if got := resolve("self,upstream,2001:db8::53", snap); len(got) != 3 || got[0] != netip.MustParseAddr("2001:db8:1::1") || got[1] != google || got[2] != netip.MustParseAddr("2001:db8::53") {
+		t.Fatalf("self in the global prefix, in order: %v", got)
+	}
+	snap.LAN["lan0"] = append(snap.LAN["lan0"], Prefix{Prefix: netip.MustParsePrefix("fd00:1::/64"), Source: "ula"})
+	if got := resolve("self", snap); len(got) != 1 || got[0] != netip.MustParseAddr("fd00:1::1") {
+		t.Fatalf("self prefers the ULA: %v", got)
+	}
+	if got := resolve("self", Snapshot{DNS: snap.DNS}); len(got) != 0 {
+		t.Fatalf("self with no LAN prefix is left out: %v", got)
 	}
 }

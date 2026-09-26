@@ -26,6 +26,7 @@ func newTestServer(stateful bool) *dhcpServer {
 	return &dhcpServer{
 		ifname: "lan0", ifi: &net.Interface{Index: 3, Name: "lan0"}, stateful: stateful, duid: srvDUID,
 		poolStart: 0x1000, poolEnd: 0x1003, preferred: time.Hour, valid: 2 * time.Hour,
+		dns:    lanDNS{list: []dnsEntry{{upstream: true}}},
 		leases: map[string]*Lease{},
 		snap: Snapshot{
 			LAN:   map[string][]Prefix{"lan0": {{Prefix: netip.MustParsePrefix("2001:db8:1::/64"), Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: "pd"}}},

@@ -124,7 +124,7 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 | `-ra-max` | `10m` | 定期 RA の最大送信間隔（MaxRtrAdvInterval）。 |
 | `-ra-lifetime` | `30m` | RA に載せるルーター寿命。 |
 | `-ra-mtu` | `0` | RA で広告する MTU。`0` のときは、WAN 経路の MTU が LAN インターフェイスの MTU より小さければそれを広告します。WAN 経路の MTU は上流 RA または WAN インターフェイスから取ります。これで PPPoE の 1492 なども経路 MTU 探索に頼らずに済みます。 |
-| `-ra-dns` | | 上流の DNS の代わりに広告する DNS サーバー。カンマ区切り。DHCPv6 サーバーもこれを使います。 |
+| `-ra-dns` | `upstream` | LAN に通知する DNS サーバー。RA と DHCPv6 サーバーの両方で使います。`off` なら通知しません。それ以外は次の項目を順にカンマ区切りで並べます：`upstream`（上流から配布されたサーバー）、`self`（この LAN 上のルーター自身のアドレス。ULA があれば ULA を使うので、プレフィックスが変わっても有効です）、IPv6 アドレス。例：`self,upstream`。 |
 | `-ra-pref64` | | 広告する NAT64 プレフィックス（RFC 8781）。例：`64:ff9b::/96`。空なら上流 RA の値をそのまま渡します。長さは 32、40、48、56、64、96 のいずれか。 |
 | `-ra-route` | | ルート情報オプション（Route Information）として広告するプレフィックス。繰り返し指定可。 |
 
