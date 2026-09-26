@@ -94,7 +94,7 @@ own, `inet sixup`, removed when it exits. Pass `-tunnel-nat off` to write them y
 | `-dhcp6c-mode` | `auto` | `auto` follows the M and O flags of the upstream RA, `on` always runs the client, `off` never does. |
 | `-dhcp6c-pd-len` | `56` | Prefix length hinted when requesting a delegated prefix (IA_PD). The server decides the length it delegates; if it refuses the hint, sixup asks once more without one. `0` requests none. |
 | `-dhcp6c-ia-na` | `true` | Also request an address for the WAN interface itself (IA_NA). |
-| `-dhcp6c-pd-grace` | `10s` | How long to wait for a delegated prefix after startup. Until then an RA prefix only serves the WAN side and is not handed to the LAN, so it never has to be withdrawn again. |
+| `-dhcp6c-pd-grace` | `10s` | Longest wait for a delegated prefix after startup; it ends as soon as PD succeeds or is refused, usually within a few seconds. Until then an RA prefix is not handed to the LAN, so it never has to be withdrawn again. When the RA sets M or O, the WAN also takes no address in it yet, since whether the LAN will share the /64 decides the address's prefix length. |
 | `-dhcp6c-release` | `false` | Send RELEASE on exit to give back the prefix and addresses. Off by default: the DUID is kept, so a restart renews the same prefix. A dry run always releases. |
 
 ### WAN side: upstream RA and addresses

@@ -494,3 +494,42 @@ func TestProxyAdvice(t *testing.T) {
 		t.Fatalf("a point-to-point WAN needs no proxy: %v", hints)
 	}
 }
+
+// While PD is still out on a link whose RA announces DHCPv6, the WAN takes no address in the RA
+// /64, since whether the LAN will share it decides the address's prefix length. An RA without M
+// or O promises no DHCPv6 answer, so nothing waits for one.
+func TestStorePDPending(t *testing.T) {
+	now := time.Now()
+	ra := Prefix{Prefix: netip.MustParsePrefix("2001:db8:0:1::/64"), Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: "ra", SLAAC: true}
+
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, time.Minute, 0)
+	ch := st.Subscribe()
+	recv(t, ch)
+	st.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}, DHCPv6: true})
+	s := recv(t, ch)
+	if !s.PDPending || len(s.wanSLAAC()) != 0 {
+		t.Fatalf("RA with M/O during grace: the WAN address waits for PD, got pending=%v %v", s.PDPending, s.wanSLAAC())
+	}
+	st.Set("pd", SourceUpdate{}) // refused
+	s = recv(t, ch)
+	if s.PDPending || len(s.wanSLAAC()) != 1 || !s.sharedWith(ra.Prefix) {
+		t.Fatalf("once PD is refused the WAN address comes, already knowing the /64 is shared: %+v", s)
+	}
+
+	st = newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, time.Minute, 0)
+	ch = st.Subscribe()
+	recv(t, ch)
+	st.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}})
+	if s = recv(t, ch); s.PDPending || len(s.wanSLAAC()) != 1 {
+		t.Fatalf("RA without M/O: nothing to wait for: %+v", s)
+	}
+
+	st = newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 200*time.Millisecond, 0)
+	ch = st.Subscribe()
+	recv(t, ch)
+	st.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}, DHCPv6: true})
+	recv(t, ch)
+	if s = recv(t, ch); s.PDPending || len(s.wanSLAAC()) != 1 {
+		t.Fatalf("the wait ends with the grace period even when DHCPv6 never answers: %+v", s)
+	}
+}

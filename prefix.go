@@ -67,6 +67,7 @@ type SourceUpdate struct {
 	MTU      int           // WAN path MTU: the RA MTU option, else the WAN interface MTU
 	WANAddr  netip.Addr    // WAN address from IA_NA or SLAAC
 	Tunnel   *TunnelParams // set only by the pd source
+	DHCPv6   bool          // ra source only: a router set M or O, so a DHCPv6 answer is worth waiting for
 }
 
 // Snapshot is the consistent view handed to every consumer.
@@ -83,10 +84,17 @@ type Snapshot struct {
 	WANMTU  int                 `json:"wan_mtu,omitempty"` // drives both the downstream RA MTU option and the tunnel MTU
 	WANAddr netip.Addr          `json:"wan_addr"`
 	Tunnel  *TunnelParams       `json:"tunnel,omitempty"`
+	// The PD result is still awaited on a link whose RA announces DHCPv6. Until it arrives nobody
+	// knows whether the RA /64 will be shared with the LAN, so the WAN takes no address in it yet:
+	// one made now might need another prefix length a moment later.
+	PDPending bool `json:"pd_pending,omitempty"`
 }
 
 // wanSLAAC returns the SLAAC-capable /64s from the upstream RA, including deprecated ones so addresses can be retired.
 func (s Snapshot) wanSLAAC() []Prefix {
+	if s.PDPending {
+		return nil
+	}
 	var out []Prefix
 	for _, p := range s.WAN {
 		if p.Source == "ra" && p.SLAAC && p.Prefix.Bits() == 64 {
@@ -342,6 +350,8 @@ func (s *Store) recompute(now time.Time) {
 	}
 	if pd, ok := s.sources[sourcePD]; ok {
 		next.Tunnel = pd.Tunnel
+	} else {
+		next.PDPending = s.sources[sourceRA].DHCPv6 && now.Before(s.pdGrace)
 	}
 	if next.Tunnel != nil && next.Tunnel.MAPE != nil {
 		t := *next.Tunnel
@@ -548,7 +558,7 @@ func (s *Store) recompute(now time.Time) {
 		if change == changeNone && !tunnelEqual(s.cur.Tunnel, next.Tunnel) {
 			change = changeRenew
 		}
-		if change == changeNone && s.cur.WANAddr != next.WANAddr {
+		if change == changeNone && (s.cur.WANAddr != next.WANAddr || s.cur.PDPending != next.PDPending) {
 			change = changeRenew
 		}
 		// DNS, search list, PREF64 and MTU reach hosts through the RA and the DHCPv6 server, so a

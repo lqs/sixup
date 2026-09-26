@@ -40,6 +40,7 @@ type routerInfo struct {
 	mtu      int
 	routes   map[netip.Prefix]time.Time
 	seen     time.Time
+	dhcp     bool // M or O set: the router says DHCPv6 is available
 }
 
 func routerMetric(p ndp.Preference) uint32 {
@@ -263,6 +264,7 @@ func (c *raClient) handle(ra *ndp.RouterAdvertisement, from netip.Addr) {
 	}
 	r.seen = now
 	r.pref = ra.RouterSelectionPreference
+	r.dhcp = ra.ManagedConfiguration || ra.OtherConfiguration
 	if ra.RouterLifetime > 0 {
 		r.lifetime = now.Add(ra.RouterLifetime)
 		if err := routeSet(c.ifi.Index, netip.MustParsePrefix("::/0"), from, routerMetric(r.pref), ra.RouterLifetime); err != nil {
@@ -345,6 +347,7 @@ func (c *raClient) publish() {
 			seen[p.Prefix] = true
 			upd.Prefixes = append(upd.Prefixes, p)
 		}
+		upd.DHCPv6 = upd.DHCPv6 || r.dhcp
 		if prefRank(r.pref) > prefRank(best) || best == -10 {
 			best = r.pref
 			upd.DNS, upd.DNSSL, upd.PREF64 = r.dns, r.dnssl, r.pref64

@@ -29,7 +29,7 @@ var (
 	hold       = flag.Duration("lan-deprecate-hold", 600*time.Second, "how long a revoked prefix keeps being advertised with preferred=0 (one RA cycle)")
 	settle     = flag.Duration("settle", time.Second, "how long parameters must stay unchanged before they are pushed to the components (revocation does not wait); merges the RA, PD, DNS and capture results that arrive in batches at startup")
 	dhcpRel    = flag.Bool("dhcp6c-release", false, "send RELEASE to the server on exit to give back the prefix and addresses. Off by default: a persisted DUID renews the same range after a restart and avoids prefix churn; dry-run always releases")
-	pdGrace    = flag.Duration("dhcp6c-pd-grace", 10*time.Second, "how long to wait after startup for a PD result; meanwhile RA prefixes are only used as WAN information and not handed to the LAN, so no wrong prefix has to be revoked later")
+	pdGrace    = flag.Duration("dhcp6c-pd-grace", 10*time.Second, "longest wait after startup for a PD result, which ends as soon as PD succeeds or is refused; meanwhile RA prefixes are not handed to the LAN, so no wrong prefix has to be revoked later, and when the RA sets M or O the WAN takes no address in them yet, since its prefix length depends on the result")
 	raMin      = flag.Duration("ra-min", 200*time.Second, "MinRtrAdvInterval")
 	raMax      = flag.Duration("ra-max", 600*time.Second, "MaxRtrAdvInterval")
 	raLifetime = flag.Duration("ra-lifetime", 1800*time.Second, "router lifetime of the RA")

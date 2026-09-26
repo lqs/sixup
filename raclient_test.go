@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -136,5 +137,28 @@ func TestRouterMetricAndRank(t *testing.T) {
 	c := map[netip.Prefix]bool{netip.MustParsePrefix("2001:db8:1::/64"): true}
 	if !samePrefixSet(a, b) || samePrefixSet(a, c) || samePrefixSet(a, map[netip.Prefix]bool{}) {
 		t.Fatal("samePrefixSet wrong")
+	}
+}
+
+// The M and O bits of the upstream RA reach the store, which waits for PD only when they promise
+// a DHCPv6 answer.
+func TestRAClientPassesDHCPv6Flags(t *testing.T) {
+	old := dryRun
+	dryRun = true // routes and sysctls go through stubs
+	defer func() { dryRun = old }()
+	for _, other := range []bool{true, false} {
+		st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, time.Minute, 0)
+		ch := st.Subscribe()
+		recv(t, ch)
+		stable, _ := parseIIDPolicy("stable")
+		c := &raClient{ifname: "wan0", ifi: &net.Interface{Index: 2, Name: "wan0", MTU: 1500}, store: st, slaac: true, iid: stable, routers: map[netip.Addr]*routerInfo{}}
+		c.handle(&ndp.RouterAdvertisement{
+			OtherConfiguration: other, RouterLifetime: 30 * time.Minute,
+			Options: []ndp.Option{pio("2001:db8:0:1::/64", time.Hour, time.Hour, true, true)},
+		}, netip.MustParseAddr("fe80::1"))
+		c.publish()
+		if s := recv(t, ch); s.PDPending != other {
+			t.Fatalf("O=%v: want pd_pending=%v, got %v", other, other, s.PDPending)
+		}
 	}
 }
