@@ -31,10 +31,10 @@ var licenseText string
 //go:embed NOTICE
 var noticeText string
 
-// joolNAT64 is the well-known prefix of RFC 6052, which Jool translates unless -ra-pref64 names
-// another. Carving one out of the delegated prefix would tie the translator to a prefix that
-// changes, and every client would have to be told again.
-var joolNAT64 = netip.MustParsePrefix("64:ff9b::/96")
+// nat64WKP is the well-known prefix of RFC 6052, the default of -nat64-prefix. Carving one out of
+// the delegated prefix would tie the translator to a prefix that changes, and every client would
+// have to be told again.
+var nat64WKP = netip.MustParsePrefix("64:ff9b::/96")
 
 func main() {
 	flag.Usage = printUsage
@@ -89,24 +89,16 @@ func main() {
 	if err != nil || !joolLink.Addr().Is4() || joolLink.Bits() != 31 {
 		fatalf("-jool-ipv4 must be an IPv4 /31, such as 192.168.255.254/31")
 	}
-	// -ra-pref64 names an external NAT64 to announce; with -nat64 jool it is the prefix Jool
-	// translates instead, announced only while it does
-	var pref64 netip.Prefix
-	if *raPref64 != "" {
-		p, err := netip.ParsePrefix(*raPref64)
-		if err != nil || !p.Addr().Is6() || p.Addr().Is4In6() {
-			fatalf("-ra-pref64 must be an IPv6 prefix, such as 64:ff9b::/96")
-		}
-		switch p.Bits() {
-		case 32, 40, 48, 56, 64, 96:
-		default:
-			fatalf("-ra-pref64 length must be 32/40/48/56/64/96")
-		}
-		pref64 = p.Masked()
+	nat64Pfx, err := parseNAT64Prefix(*nat64Prefix)
+	if err != nil {
+		fatalf("-nat64-prefix: %v", err)
 	}
-	joolPrefix := joolNAT64
-	if *nat64 == "jool" && pref64.IsValid() {
-		joolPrefix, pref64 = pref64, netip.Prefix{}
+	pref64, pref64Off, err := parsePref64(*raPref64)
+	if err != nil {
+		fatalf("-ra-pref64: %v", err)
+	}
+	if *nat64 != "off" && pref64.IsValid() {
+		fatalf("-ra-pref64 %s would announce a prefix nothing here translates while -nat64 %s translates %s; set -nat64-prefix instead", pref64, *nat64, nat64Pfx)
 	}
 	// Refused before anything is configured, so a conflict leaves the host as it was
 	if *nat64 == "jool" && !dryRun {
@@ -221,7 +213,7 @@ func main() {
 				warnf("[sysctl] ipv4/ip_forward=1 failed: %v", err)
 			}
 		}
-		go (&joolManager{prefix: joolPrefix, link: joolLink, store: store}).run(ctx)
+		go (&joolManager{prefix: nat64Pfx, link: joolLink, store: store}).run(ctx)
 	}
 	if *tunCap && dhcp != nil {
 		go (&tunnelWatcher{ifname: *wan, store: store, pkts: pkts, maxRun: *tunCapMax}).run(ctx, store.Subscribe())
@@ -255,7 +247,7 @@ func main() {
 		go (&addrManager{ifname: iface, secret: secret, cfg: tcfg, iids: lanIIDs, pick: func(s Snapshot) []Prefix { return s.LAN[iface] }, side: sideLAN, layout: layout}).run(ctx, hub, store, store.Subscribe())
 		go (&raServer{
 			ifname: l.iface, minI: *raMin, maxI: *raMax, lifetime: *raLifetime, mtu: uint32(*raMTU),
-			managed: srv == serverStateful, other: srv != serverOff, routes: rios, dns: dnsOverride, pref64: pref64,
+			managed: srv == serverStateful, other: srv != serverOff, routes: rios, dns: dnsOverride, pref64: pref64, pref64Off: pref64Off,
 		}).run(ctx, hub, store, store.Subscribe())
 		if *srvMode != "off" {
 			s := &dhcpServer{

@@ -23,12 +23,12 @@ func TestJoolNamespaceAgainstKernel(t *testing.T) {
 	if err := checkJoolIPv4(link); err != nil {
 		t.Fatalf("an empty namespace has nothing to overlap: %v", err)
 	}
-	m := &joolManager{prefix: joolNAT64, link: link}
+	m := &joolManager{prefix: nat64WKP, link: link}
 	if err := m.setup(); err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	if len(routeTypes(t, joolNAT64)) != 1 {
-		t.Fatalf("%s is not routed into the namespace", joolNAT64)
+	if len(routeTypes(t, nat64WKP)) != 1 {
+		t.Fatalf("%s is not routed into the namespace", nat64WKP)
 	}
 	outside, inside := joolAddrs(link)
 
@@ -85,13 +85,13 @@ func TestJoolNamespaceAgainstKernel(t *testing.T) {
 	st := newStore("pd", nil, time.Second, nil, false, 0, 0)
 	ch := st.Subscribe()
 	recv(t, ch)
-	again := &joolManager{prefix: joolNAT64, link: link, store: st}
+	again := &joolManager{prefix: nat64WKP, link: link, store: st}
 	if err := again.setup(); err != nil {
 		t.Fatalf("setup over an earlier run's veth: %v", err)
 	}
 	// start would get here once Jool had its instance; without the module the test stands in for it
 	again.active = true
-	st.SetNAT64(joolNAT64)
+	st.SetNAT64(nat64WKP)
 	recv(t, ch)
 	unix.Close(m.ns)
 

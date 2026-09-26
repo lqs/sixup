@@ -20,18 +20,19 @@ var (
 
 // raServer advertises RAs on one LAN interface, replacing radvd.
 type raServer struct {
-	ifname   string
-	ifi      *net.Interface
-	conn     *ndp.Conn
-	minI     time.Duration
-	maxI     time.Duration
-	lifetime time.Duration
-	mtu      uint32
-	managed  bool
-	other    bool
-	routes   []netip.Prefix // extra RIOs
-	pref64   netip.Prefix   // configured NAT64 prefix, overrides upstream
-	dns      lanDNS
+	ifname    string
+	ifi       *net.Interface
+	conn      *ndp.Conn
+	minI      time.Duration
+	maxI      time.Duration
+	lifetime  time.Duration
+	mtu       uint32
+	managed   bool
+	other     bool
+	routes    []netip.Prefix // extra RIOs
+	pref64    netip.Prefix   // -ra-pref64 naming a NAT64 elsewhere
+	pref64Off bool           // -ra-pref64 off
+	dns       lanDNS
 	// A PREF64 no longer announced is withdrawn with lifetime 0 (RFC 8781) in the next few RAs;
 	// left out, clients would go on using it for the rest of its lifetime.
 	withdraw     netip.Prefix
@@ -161,11 +162,14 @@ func (r *raServer) update(s Snapshot) bool {
 	return true
 }
 
-// pref64Now is the NAT64 prefix to announce: -ra-pref64 for an external NAT64, then this router's
-// own while Jool translates it, then the upstream's. A prefix nothing translates would send the
-// CLAT of an IPv6-only client into a void.
+// pref64Now is the NAT64 prefix to announce. -ra-pref64 auto takes this router's own while it
+// translates, else the upstream's; a prefix nothing translates would send the CLAT of an
+// IPv6-only client into a void. -ra-pref64 off announces none, and a prefix given there is a NAT64
+// elsewhere, which cannot be combined with one here.
 func (r *raServer) pref64Now() netip.Prefix {
 	switch {
+	case r.pref64Off:
+		return netip.Prefix{}
 	case r.pref64.IsValid():
 		return r.pref64
 	case r.snap.NAT64.IsValid():
@@ -371,4 +375,32 @@ func selfPrefix(ps []Prefix) (netip.Prefix, bool) {
 		}
 	}
 	return gua, gua.IsValid()
+}
+
+// parseNAT64Prefix accepts a prefix that RFC 6052 can embed an IPv4 address in and RFC 8781 can
+// announce.
+func parseNAT64Prefix(s string) (netip.Prefix, error) {
+	p, err := netip.ParsePrefix(s)
+	if err != nil || !p.Addr().Is6() || p.Addr().Is4In6() {
+		return netip.Prefix{}, fmt.Errorf("%q is not an IPv6 prefix, such as 64:ff9b::/96", s)
+	}
+	switch p.Bits() {
+	case 32, 40, 48, 56, 64, 96:
+		return p.Masked(), nil
+	}
+	return netip.Prefix{}, fmt.Errorf("%s: the length must be 32, 40, 48, 56, 64 or 96", p)
+}
+
+// parsePref64 reads -ra-pref64: auto, off, or the prefix of a NAT64 elsewhere.
+func parsePref64(s string) (p netip.Prefix, off bool, err error) {
+	switch s {
+	case "auto":
+		return netip.Prefix{}, false, nil
+	case "off":
+		return netip.Prefix{}, true, nil
+	}
+	if p, err = parseNAT64Prefix(s); err != nil {
+		return p, false, fmt.Errorf("not auto or off, and %w", err)
+	}
+	return p, false, nil
 }

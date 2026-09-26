@@ -239,6 +239,32 @@ func TestRAPref64FollowsNAT64(t *testing.T) {
 
 	r.pref64 = netip.MustParsePrefix("2001:db8:ff64::/96")
 	if got := pref64s(r); got[r.pref64] == 0 {
-		t.Fatalf("-ra-pref64 wins, got %v", got)
+		t.Fatalf("-ra-pref64 names a NAT64 elsewhere, got %v", got)
+	}
+	r.pref64, r.pref64Off = netip.Prefix{}, true
+	on.Change = "renew"
+	r.update(on)
+	if got := pref64s(r); len(got) != 0 {
+		t.Fatalf("-ra-pref64 off announces nothing, even with Jool translating, got %v", got)
+	}
+}
+
+func TestParsePref64(t *testing.T) {
+	if p, off, err := parsePref64("auto"); err != nil || off || p.IsValid() {
+		t.Fatalf("auto: %v %v %v", p, off, err)
+	}
+	if p, off, err := parsePref64("off"); err != nil || !off || p.IsValid() {
+		t.Fatalf("off: %v %v %v", p, off, err)
+	}
+	if p, _, err := parsePref64("2001:db8:64::1/96"); err != nil || p != netip.MustParsePrefix("2001:db8:64::/96") {
+		t.Fatalf("a prefix is masked: %v %v", p, err)
+	}
+	for _, bad := range []string{"", "on", "192.0.2.0/32", "::ffff:0:0/96", "2001:db8::/95", "2001:db8::/128"} {
+		if _, _, err := parsePref64(bad); err == nil {
+			t.Errorf("%q should be refused", bad)
+		}
+	}
+	if p, err := parseNAT64Prefix("fd00:64::/96"); err != nil || p.Bits() != 96 {
+		t.Fatalf("a ULA network-specific prefix: %v %v", p, err)
 	}
 }
