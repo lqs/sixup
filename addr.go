@@ -130,9 +130,12 @@ type addrManager struct {
 	store     *Store
 	snap      Snapshot
 	applied   map[netip.Addr]Prefix // currently configured prefix addresses
-	temps     []*tempAddr
-	ctAvail   bool
-	ctWarn    bool
+	// The prefix length each address went in with. It changes when a /64 starts or stops being
+	// shared, and the kernel keeps the old one across a replace, so a change means delete and re-add.
+	plens   map[netip.Addr]int
+	temps   []*tempAddr
+	ctAvail bool
+	ctWarn  bool
 }
 
 func (m *addrManager) run(ctx context.Context, hub *linkHub, store *Store, ch <-chan Snapshot) {
@@ -141,6 +144,13 @@ func (m *addrManager) run(ctx context.Context, hub *linkHub, store *Store, ch <-
 		m.ifi = ifi
 		// A recreated interface loses all addresses; start from scratch
 		m.applied = map[netip.Addr]Prefix{}
+		m.plens = map[netip.Addr]int{}
+		// An address left by an earlier run may carry a length the layout no longer wants
+		if list, err := addrList(ifi.Index); err == nil {
+			for _, ia := range list {
+				m.plens[ia.Addr] = ia.PrefixLen
+			}
+		}
 		m.temps = nil
 		m.dadCnt = map[iidSlot]uint8{}
 		m.endpoints = map[netip.Addr]string{}
@@ -267,6 +277,7 @@ func (m *addrManager) checkDAD() {
 			warnf("[address %s] %s failed DAD, switching to address with DAD_Counter=%d", m.ifname, ia.Addr, m.dadCnt[slot])
 			addrDel(m.ifi.Index, ia.Addr, ia.PrefixLen)
 			delete(m.applied, ia.Addr)
+			delete(m.plens, ia.Addr)
 			m.applyPrefixAddrs()
 			pending = true
 			continue
@@ -382,11 +393,20 @@ func (m *addrManager) applyPrefixAddrs() {
 	for a, p := range want {
 		pref, valid := p.preferredLeft(now), p.validLeft(now)
 		plen := m.plen(p.Prefix)
+		_, had := m.applied[a]
+		if old, ok := m.plens[a]; ok && old != plen {
+			infof("[address %s] %s changes from /%d to /%d, re-adding it", m.ifname, a, old, plen)
+			if err := addrDel(m.ifi.Index, a, old); err != nil {
+				warnf("[address %s] failed to delete %s/%d: %v", m.ifname, a, old, err)
+			}
+			had = false
+		}
 		if err := addrSet(m.ifi.Index, a, plen, pref, valid, false, 0); err != nil {
 			errorf("[address %s] failed to configure %s: %v", m.ifname, a, err)
 			continue
 		}
-		if _, ok := m.applied[a]; !ok {
+		m.plens[a] = plen
+		if !had {
 			infof("[address %s] added %s/%d preferred=%s valid=%s", m.ifname, a, plen, pref.Round(time.Second), valid.Round(time.Second))
 			m.dadDue = true
 			m.awaitAnnounce(a)
@@ -395,9 +415,14 @@ func (m *addrManager) applyPrefixAddrs() {
 	for a, p := range m.applied {
 		if _, ok := want[a]; !ok {
 			infof("[address %s] removing %s", m.ifname, a)
-			if err := addrDel(m.ifi.Index, a, m.plen(p.Prefix)); err != nil {
+			plen, ok := m.plens[a]
+			if !ok {
+				plen = m.plen(p.Prefix)
+			}
+			if err := addrDel(m.ifi.Index, a, plen); err != nil {
 				warnf("[address %s] failed to delete %s: %v", m.ifname, a, err)
 			}
+			delete(m.plens, a)
 		}
 	}
 	m.applied = want
