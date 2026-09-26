@@ -31,8 +31,9 @@ var licenseText string
 //go:embed NOTICE
 var noticeText string
 
-// joolNAT64 is the well-known prefix of RFC 6052. Carving one out of the delegated prefix instead
-// would tie the translator to a prefix that changes, and every client would have to be told again.
+// joolNAT64 is the well-known prefix of RFC 6052, which Jool translates unless -ra-pref64 names
+// another. Carving one out of the delegated prefix would tie the translator to a prefix that
+// changes, and every client would have to be told again.
 var joolNAT64 = netip.MustParsePrefix("64:ff9b::/96")
 
 func main() {
@@ -81,13 +82,37 @@ func main() {
 	if *tunNAT != "auto" && *tunNAT != "off" {
 		fatalf("-tunnel-nat must be auto / off")
 	}
-	// The two translators divide one port set, so the ruleset has to know what was lent out.
-	joolShare := 0
-	if *nat64 == "jool" {
-		joolShare = *joolRanges
-	}
 	if *nat64 != "jool" && *nat64 != "off" {
 		fatalf("-nat64 must be jool / off")
+	}
+	joolLink, err := netip.ParsePrefix(*joolIPv4)
+	if err != nil || !joolLink.Addr().Is4() || joolLink.Bits() != 31 {
+		fatalf("-jool-ipv4 must be an IPv4 /31, such as 192.168.255.254/31")
+	}
+	// -ra-pref64 names an external NAT64 to announce; with -nat64 jool it is the prefix Jool
+	// translates instead, announced only while it does
+	var pref64 netip.Prefix
+	if *raPref64 != "" {
+		p, err := netip.ParsePrefix(*raPref64)
+		if err != nil || !p.Addr().Is6() || p.Addr().Is4In6() {
+			fatalf("-ra-pref64 must be an IPv6 prefix, such as 64:ff9b::/96")
+		}
+		switch p.Bits() {
+		case 32, 40, 48, 56, 64, 96:
+		default:
+			fatalf("-ra-pref64 length must be 32/40/48/56/64/96")
+		}
+		pref64 = p.Masked()
+	}
+	joolPrefix := joolNAT64
+	if *nat64 == "jool" && pref64.IsValid() {
+		joolPrefix, pref64 = pref64, netip.Prefix{}
+	}
+	// Refused before anything is configured, so a conflict leaves the host as it was
+	if *nat64 == "jool" && !dryRun {
+		if err := checkJoolIPv4(joolLink); err != nil {
+			fatalf("-jool-ipv4: %v", err)
+		}
 	}
 	layout := shared64Layout(*shared64)
 	switch layout {
@@ -186,11 +211,17 @@ func main() {
 			}
 		}
 		if *tunNAT == "auto" {
-			go (&natManager{dev: *tunDev, mtu: *tunMTU, joolRanges: joolShare}).run(ctx, store.Subscribe())
+			go (&natManager{dev: *tunDev, mtu: *tunMTU}).run(ctx, store.Subscribe())
 		}
 	}
 	if *nat64 == "jool" {
-		go (&joolManager{iname: *joolIName, ranges: *joolRanges}).run(ctx, store.Subscribe())
+		// Jool's IPv4 output comes back through the veth and is forwarded out of this namespace
+		if !*noSysctl {
+			if err := sysctlWrite("/proc/sys/net/ipv4/ip_forward", "1"); err != nil {
+				warnf("[sysctl] ipv4/ip_forward=1 failed: %v", err)
+			}
+		}
+		go (&joolManager{prefix: joolPrefix, link: joolLink, store: store}).run(ctx)
 	}
 	if *tunCap && dhcp != nil {
 		go (&tunnelWatcher{ifname: *wan, store: store, pkts: pkts, maxRun: *tunCapMax}).run(ctx, store.Subscribe())
@@ -199,24 +230,6 @@ func main() {
 	dnsOverride := lanDNS{iid: lanIIDs[0], secret: secret}
 	if dnsOverride.list, err = parseLANDNS(*raDNS); err != nil {
 		fatalf("-ra-dns: %v", err)
-	}
-	var pref64 netip.Prefix
-	if *raPref64 == "" && *nat64 != "off" {
-		// Clients that do their own translation (RFC 8781 with a CLAT) need the prefix announced;
-		// the others reach it through DNS64, which is configured elsewhere.
-		pref64 = joolNAT64
-	}
-	if *raPref64 != "" {
-		p, err := netip.ParsePrefix(*raPref64)
-		if err != nil {
-			fatalf("-ra-pref64: %v", err)
-		}
-		switch p.Bits() {
-		case 32, 40, 48, 56, 64, 96:
-		default:
-			fatalf("-ra-pref64 length must be 32/40/48/56/64/96")
-		}
-		pref64 = p.Masked()
 	}
 	var rios []netip.Prefix
 	for _, r := range routes {

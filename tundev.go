@@ -178,7 +178,7 @@ func (m *tunnelManager) apply(spec tunnelSpec) {
 			warnf("[tunnel-dev %s] IPv4 %s is already configured on %s, leaving the tunnel without an address and without a route: remove it there, or point -tunnel-dev at that device", m.dev, spec.IPv4, other)
 			return
 		}
-		if err := addr4Set(m.dev, spec.IPv4); err != nil {
+		if err := addr4Set(m.dev, netip.PrefixFrom(spec.IPv4, 32)); err != nil {
 			errorf("[tunnel-dev %s] failed to configure IPv4 %s: %v", m.dev, spec.IPv4, err)
 		} else {
 			infof("[tunnel-dev %s] IPv4 %s/32 configured; NAT is left to external policy", m.dev, spec.IPv4)

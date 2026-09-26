@@ -35,7 +35,7 @@ var (
 	raLifetime = flag.Duration("ra-lifetime", 1800*time.Second, "router lifetime of the RA")
 	raMTU      = flag.Uint("ra-mtu", 0, "MTU advertised in the RA; 0 means automatic: advertised when the WAN path MTU (the MTU option of the upstream RA or the WAN interface MTU) is smaller than the LAN interface, so PPPoE 1492 and similar no longer depend on PMTU discovery")
 	raDNS      = flag.String("ra-dns", "upstream", "DNS servers announced on the LAN: off, or a comma-separated list, in order, of upstream (the servers the upstream hands out), self (this router's address on that LAN, in the ULA when there is one) and IPv6 addresses")
-	raPref64   = flag.String("ra-pref64", "", "NAT64 prefix advertised in the RA (RFC 8781), e.g. 64:ff9b::/96; empty passes through the value from the upstream RA. NAT64 itself is provided by external tools")
+	raPref64   = flag.String("ra-pref64", "", "NAT64 prefix advertised in the RA (RFC 8781), e.g. 64:ff9b::/96; empty passes through the value from the upstream RA. With -nat64 jool it is the prefix Jool translates instead, 64:ff9b::/96 when empty, and advertised only while Jool runs; reaching private IPv4 addresses needs a network-specific prefix such as fd00:64::/96 (RFC 6052), and one carved from the delegated prefix would change with it")
 	srvMode    = flag.String("dhcp6s-mode", "off", "DHCPv6 server on the LAN side: off / stateless / stateful")
 	srvPref    = flag.Duration("dhcp6s-lease-preferred", 45*time.Minute, "preferred lifetime of IA_NA addresses and IA_PD prefixes, capped by the upstream's (RFC 9096)")
 	srvValid   = flag.Duration("dhcp6s-lease-valid", 90*time.Minute, "valid lifetime of IA_NA addresses and IA_PD prefixes, capped by the upstream's (RFC 9096)")
@@ -61,9 +61,8 @@ var (
 	tunMetric4 = flag.Uint("tunnel-route4-metric", 4096, "metric of the IPv4 default route added through the tunnel device once its IPv4 is known; the metric is high on purpose, so an existing IPv4 default route keeps winning and the tunnel only takes over when there is none. 0 adds no route")
 	tunCap     = flag.Bool("tunnel-capture", true, "when running as a daemon and DHCPv6 sends no tunnel option, capture tunnel traffic to infer the parameters")
 	tunCapMax  = flag.Duration("tunnel-capture-max", 2*time.Minute, "how long capture-based inference waits: it settles as soon as a tunnel packet is seen, otherwise it gives up at the deadline and retries when the prefix or the address changes")
-	nat64      = flag.String("nat64", "off", "which NAT64 implementation to configure: jool uses the Jool kernel module (https://jool.mx, 4.1 or later, modprobe jool), creating an instance that translates the well-known prefix 64:ff9b::/96, advertising it in the RA and letting the source NAT above rewrite the result, so the port budget of a MAP-E line stays with one allocator; off configures none. DNS64 is not part of this and is left to a resolver of your choosing")
-	joolIName  = flag.String("jool-instance", "sixup", "name of the Jool instance to create and remove")
-	joolRanges = flag.Int("jool-port-ranges", 3, "how many of the port ranges a MAP-E line owns are given to the translator; netfilter keeps the rest, and neither hands out a port the other might. Ignored where the line owns every port of its address")
+	nat64      = flag.String("nat64", "off", "which NAT64 implementation to configure: jool uses the Jool kernel module (https://jool.mx, 4.1 or later, modprobe jool), run in a network namespace of its own behind the veth sixup-nat64, translating 64:ff9b::/96, or the prefix -ra-pref64 names, for the LAN and this router alike. The namespace exists, and the prefix is advertised in the RA, only while the module is loaded, which is checked every minute. The IPv4 output leaves by this host's IPv4 route, through the tunnel's source NAT or any other, so a MAP-E line's ports have one allocator. A firewall has to let traffic through sixup-nat64: the LAN's, forwarded, and the answers to this router's own, arriving on it. off configures none. DNS64 is not part of this and is left to a resolver of your choosing")
+	joolIPv4   = flag.String("jool-ipv4", "192.168.255.254/31", "the IPv4 /31 between this namespace and Jool's: the lower address is the gateway on this side, the upper one Jool's pool4. It must not overlap any address or route of this host")
 	tunNAT     = flag.String("tunnel-nat", "auto", "maintain the nftables table sixup for traffic leaving the tunnel device: auto configures the port-restricted source NAT a MAP-E customer edge is required to have (RFC 7597), an ordinary source NAT on a line with its own public IPv4, none on DS-Lite where the AFTR translates, and in every case an MSS clamp to the tunnel MTU; off writes no rules. Nothing outside that table is read or changed, and it is removed on exit")
 
 	logLevelName = flag.String("log-level", "info", "minimum level printed: debug / info / warn / error")
@@ -173,7 +172,7 @@ var usageGroups = []struct {
 	{"NDP proxy", []string{"ndproxy-mode", "ndproxy-static", "ndproxy-exclude", "ndproxy-ttl"}},
 	{"Local address rotation", []string{"tempaddr-mode", "tempaddr-regen", "tempaddr-preferred", "tempaddr-valid", "tempaddr-max", "tempaddr-desync", "tempaddr-skip-dad", "tempaddr-drain-grace"}},
 	{"Tunnel", []string{"tunnel-dev", "tunnel-mtu", "tunnel-route4-metric", "tunnel-nat", "tunnel-mape-rules", "tunnel-capture", "tunnel-capture-max"}},
-	{"NAT64", []string{"nat64", "jool-instance", "jool-port-ranges"}},
+	{"NAT64", []string{"nat64", "jool-ipv4"}},
 	{"Runtime", []string{"state-dir", "no-sysctl", "settle", "dry-run", "dry-run-timeout", "log-level", "v", "version", "license"}},
 }
 

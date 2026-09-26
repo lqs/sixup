@@ -15,7 +15,7 @@ func TestNATPlanPerLineType(t *testing.T) {
 	dsl := Snapshot{Tunnel: &TunnelParams{
 		Kind: "ds-lite", Local: local, Remote: remote, IPv4: netip.MustParseAddr("192.0.0.2"),
 	}}
-	p, ok := natPlanFor(dsl, 1460, 0)
+	p, ok := natPlanFor(dsl, 1460)
 	if !ok || p.ipv4.IsValid() || len(p.ports) != 0 {
 		t.Fatalf("DS-Lite is translated by the AFTR, not here: %+v", p)
 	}
@@ -28,7 +28,7 @@ func TestNATPlanPerLineType(t *testing.T) {
 		Kind: "map-e", Local: local, Remote: remote, IPv4: netip.MustParseAddr("203.0.113.9"),
 		RuleMAPE: &mapeResult{IPv4: netip.MustParseAddr("203.0.113.9"), Ports: ports},
 	}}
-	p, _ = natPlanFor(mape, 1460, 0)
+	p, _ = natPlanFor(mape, 1460)
 	if p.ipv4 != netip.MustParseAddr("203.0.113.9") || len(p.ports) != len(ports) {
 		t.Fatalf("MAP-E must translate into its own port set: %+v", p)
 	}
@@ -36,21 +36,21 @@ func TestNATPlanPerLineType(t *testing.T) {
 	fixed := Snapshot{Tunnel: &TunnelParams{
 		Kind: "4in6", Local: local, Remote: remote, IPv4: netip.MustParseAddr("198.51.100.7"),
 	}}
-	p, _ = natPlanFor(fixed, 1460, 0)
+	p, _ = natPlanFor(fixed, 1460)
 	if p.ipv4 != netip.MustParseAddr("198.51.100.7") || len(p.ports) != 0 {
 		t.Fatalf("a line with its own IPv4 translates without a port restriction: %+v", p)
 	}
 
 	// An unresolved tunnel has no endpoints to translate towards
-	if _, ok := natPlanFor(Snapshot{Tunnel: &TunnelParams{Kind: "map-e"}}, 1460, 0); ok {
+	if _, ok := natPlanFor(Snapshot{Tunnel: &TunnelParams{Kind: "map-e"}}, 1460); ok {
 		t.Fatal("without endpoints there is nothing to install")
 	}
 
 	// The key is what decides whether the ruleset is rewritten; a renumbering must change it
 	other := portSpans(4, 8, 0x57)
-	p1, _ := natPlanFor(mape, 1460, 0)
+	p1, _ := natPlanFor(mape, 1460)
 	mape.Tunnel.RuleMAPE = &mapeResult{IPv4: netip.MustParseAddr("203.0.113.9"), Ports: other}
-	p2, _ := natPlanFor(mape, 1460, 0)
+	p2, _ := natPlanFor(mape, 1460)
 	if p1.key() == p2.key() {
 		t.Fatal("a different port set must produce a different key")
 	}

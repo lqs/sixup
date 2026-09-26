@@ -533,3 +533,18 @@ func TestStorePDPending(t *testing.T) {
 		t.Fatalf("the wait ends with the grace period even when DHCPv6 never answers: %+v", s)
 	}
 }
+
+// Jool starting or stopping changes what the RA announces, so it has to be published.
+func TestStoreNAT64(t *testing.T) {
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0)
+	ch := st.Subscribe()
+	recv(t, ch)
+	st.SetNAT64(joolNAT64)
+	if s := recv(t, ch); s.NAT64 != joolNAT64 {
+		t.Fatal("NAT64 on is not published")
+	}
+	st.SetNAT64(netip.Prefix{})
+	if s := recv(t, ch); s.NAT64.IsValid() {
+		t.Fatal("NAT64 off is not published")
+	}
+}

@@ -32,9 +32,13 @@ type raServer struct {
 	routes   []netip.Prefix // extra RIOs
 	pref64   netip.Prefix   // configured NAT64 prefix, overrides upstream
 	dns      lanDNS
-	snap     Snapshot
-	rs       chan struct{}
-	lastSent time.Time
+	// A PREF64 no longer announced is withdrawn with lifetime 0 (RFC 8781) in the next few RAs;
+	// left out, clients would go on using it for the rest of its lifetime.
+	withdraw     netip.Prefix
+	withdrawLeft int
+	snap         Snapshot
+	rs           chan struct{}
+	lastSent     time.Time
 }
 
 func (r *raServer) open() error {
@@ -106,6 +110,10 @@ func (r *raServer) serve(ctx context.Context, store *Store, ch <-chan Snapshot) 
 			if ctx.Err() != nil && r.ifi != nil {
 				if ifi, err := ifaceByName(r.ifname); err == nil && ifi.Flags&net.FlagUp != 0 {
 					saved := r.lifetime
+					// Jool's namespace goes with this process
+					exit := r.snap
+					exit.NAT64 = netip.Prefix{}
+					r.update(exit)
 					r.snap.LAN = nil
 					r.lifetime = 0
 					r.send("exit")
@@ -114,9 +122,7 @@ func (r *raServer) serve(ctx context.Context, store *Store, ch <-chan Snapshot) 
 			}
 			return
 		case s := <-ch:
-			changed := s.Change == "add" || s.Change == "revoke"
-			r.snap = s
-			if changed {
+			if r.update(s) {
 				r.burst(ctx)
 				next.Reset(r.interval())
 			}
@@ -138,6 +144,34 @@ func (r *raServer) serve(ctx context.Context, store *Store, ch <-chan Snapshot) 
 			next.Reset(r.interval())
 		}
 	}
+}
+
+// update takes a new snapshot and reports whether it calls for RAs right away: a prefix appeared or
+// went, or the PREF64 changed, whose old value is then withdrawn.
+func (r *raServer) update(s Snapshot) bool {
+	old := r.pref64Now()
+	r.snap = s
+	cur := r.pref64Now()
+	if cur == old {
+		return s.Change == "add" || s.Change == "revoke"
+	}
+	if old.IsValid() {
+		r.withdraw, r.withdrawLeft = old, 3 // as many as a burst sends
+	}
+	return true
+}
+
+// pref64Now is the NAT64 prefix to announce: -ra-pref64 for an external NAT64, then this router's
+// own while Jool translates it, then the upstream's. A prefix nothing translates would send the
+// CLAT of an IPv6-only client into a void.
+func (r *raServer) pref64Now() netip.Prefix {
+	switch {
+	case r.pref64.IsValid():
+		return r.pref64
+	case r.snap.NAT64.IsValid():
+		return r.snap.NAT64
+	}
+	return r.snap.PREF64
 }
 
 func (r *raServer) interval() time.Duration {
@@ -224,12 +258,12 @@ func (r *raServer) build() *ndp.RouterAdvertisement {
 	}
 	// PREF64 (RFC 8781) lets 464XLAT-capable hosts enable CLAT. Lifetime should be at least
 	// 3 * MaxRtrAdvInterval; the library rounds it to the 8s granularity the RFC requires.
-	pref64 := r.pref64
-	if !pref64.IsValid() {
-		pref64 = r.snap.PREF64
-	}
+	pref64 := r.pref64Now()
 	if pref64.IsValid() {
 		ra.Options = append(ra.Options, &ndp.PREF64{Lifetime: 3 * r.maxI, Prefix: pref64})
+	}
+	if r.withdrawLeft > 0 && r.withdraw != pref64 {
+		ra.Options = append(ra.Options, &ndp.PREF64{Lifetime: 0, Prefix: r.withdraw})
 	}
 	for _, rt := range r.routes {
 		ra.Options = append(ra.Options, &ndp.RouteInformation{
@@ -250,6 +284,9 @@ func (r *raServer) send(reason string) {
 		return
 	}
 	r.lastSent = time.Now()
+	if r.withdrawLeft > 0 {
+		r.withdrawLeft--
+	}
 	var prefixes []string
 	for _, o := range ra.Options {
 		if pi, ok := o.(*ndp.PrefixInformation); ok {

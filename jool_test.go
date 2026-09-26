@@ -64,11 +64,11 @@ func decodeNested(t *testing.T, b []byte, want uint16) *netlink.AttributeDecoder
 	return nil
 }
 
-// The instance carries the prefix it translates, which is the well-known one: a prefix carved out
-// of the delegation would have to be re-announced to every client on a renumbering.
+// The instance carries the prefix it translates: the well-known one by default, or a
+// network-specific one from -ra-pref64, which private IPv4 destinations need (RFC 6052).
 func TestJoolInstanceAttributes(t *testing.T) {
-	m := &joolManager{iname: "sixup"}
-	ad := decodeNested(t, m.instanceAttrs(), jnlarOperand)
+	nsp := netip.MustParsePrefix("fd00:64::/96")
+	ad := decodeNested(t, instanceAttrs(nsp), jnlarOperand)
 	var xf uint8
 	var prefix netip.Prefix
 	for ad.Next() {
@@ -100,100 +100,53 @@ func TestJoolInstanceAttributes(t *testing.T) {
 	if xf != xfNetfilter {
 		t.Fatalf("the instance should hook into netfilter, got xf=%d", xf)
 	}
-	if prefix != joolNAT64 {
-		t.Fatalf("pool6 should be %s, got %s", joolNAT64, prefix)
+	if prefix != nsp {
+		t.Fatalf("pool6 should be %s, got %s", nsp, prefix)
 	}
 }
 
-// A MAP-E subscriber may use only its own ports, so one pool4 entry describes each range it was
-// given. Jool has to carry that restriction itself: its output reaches POSTROUTING without a
-// conntrack entry, where a nat chain does nothing.
-func TestJoolPool4Entries(t *testing.T) {
-	m := &joolManager{iname: "sixup"}
-	pool := pool4Entry{addr: netip.MustParseAddr("203.0.113.9"), ports: portSpans(4, 8, 0x56)[12:]}
+// pool4 is Jool's side of the /31 with every port: nothing else in its namespace uses the address,
+// and the line's ports belong to the source NAT outside.
+func TestJoolPool4(t *testing.T) {
+	outside, inside := joolAddrs(netip.MustParsePrefix("192.168.255.254/31"))
+	if outside != netip.MustParseAddr("192.168.255.254") || inside != netip.MustParseAddr("192.168.255.255") {
+		t.Fatalf("the /31 splits into %s outside and %s inside", outside, inside)
+	}
 	for _, proto := range joolProtos {
-		entries := m.pool4Entries(pool, proto)
-		if len(entries) != len(pool.ports) {
-			t.Fatalf("%d entries for %d ranges", len(entries), len(pool.ports))
-		}
-		for i, e := range entries {
-			ad := decodeNested(t, e, jnlarOperand)
-			var gotProto uint8
-			var min, max uint16
-			var addr netip.Addr
-			var bits uint8
-			for ad.Next() {
-				switch ad.Type() {
-				case jnlap4Proto:
-					gotProto = ad.Uint8()
-				case jnlap4PortMin:
-					min = ad.Uint16()
-				case jnlap4PortMax:
-					max = ad.Uint16()
-				case jnlap4Prefix:
-					inner, err := netlink.NewAttributeDecoder(ad.Bytes())
-					if err != nil {
-						t.Fatalf("prefix: %v", err)
-					}
-					for inner.Next() {
-						switch inner.Type() {
-						case jnlapAddr:
-							a, ok := netip.AddrFromSlice(inner.Bytes())
-							if !ok {
-								t.Fatalf("pool4 address: %v", inner.Bytes())
-							}
-							addr = a
-						case jnlapLen:
-							bits = inner.Uint8()
+		ad := decodeNested(t, pool4Attrs(inside, proto), jnlarOperand)
+		var gotProto uint8
+		var min, max uint16
+		var addr netip.Addr
+		var bits uint8
+		for ad.Next() {
+			switch ad.Type() {
+			case jnlap4Proto:
+				gotProto = ad.Uint8()
+			case jnlap4PortMin:
+				min = ad.Uint16()
+			case jnlap4PortMax:
+				max = ad.Uint16()
+			case jnlap4Prefix:
+				inner, err := netlink.NewAttributeDecoder(ad.Bytes())
+				if err != nil {
+					t.Fatalf("prefix: %v", err)
+				}
+				for inner.Next() {
+					switch inner.Type() {
+					case jnlapAddr:
+						a, ok := netip.AddrFromSlice(inner.Bytes())
+						if !ok {
+							t.Fatalf("pool4 address: %v", inner.Bytes())
 						}
+						addr = a
+					case jnlapLen:
+						bits = inner.Uint8()
 					}
 				}
 			}
-			if gotProto != proto {
-				t.Fatalf("protocol %d came back as %d", proto, gotProto)
-			}
-			if min != pool.ports[i].Start || max != pool.ports[i].End {
-				t.Fatalf("entry %d covers %d-%d, want %s", i, min, max, pool.ports[i])
-			}
-			if addr != pool.addr || bits != 32 {
-				t.Fatalf("pool4 should be %s/32, got %s/%d", pool.addr, addr, bits)
-			}
 		}
-	}
-
-	// A line that owns its whole address needs no restriction
-	entries := m.pool4Entries(pool4Entry{addr: netip.MustParseAddr("198.51.100.7")}, 0)
-	if len(entries) != 1 {
-		t.Fatalf("one entry covers every port, got %d", len(entries))
-	}
-}
-
-// The two translators must never be told they own the same port.
-func TestPortSetSplitDoesNotOverlap(t *testing.T) {
-	spans := portSpans(4, 8, 0x56)
-	forNAT, forJool := splitPortSpans(spans, 3)
-	if len(forNAT) != 12 || len(forJool) != 3 {
-		t.Fatalf("split gave %d and %d ranges", len(forNAT), len(forJool))
-	}
-	seen := map[uint16]bool{}
-	for _, s := range append(append([]portSpan{}, forNAT...), forJool...) {
-		for p := int(s.Start); p <= int(s.End); p++ {
-			if seen[uint16(p)] {
-				t.Fatalf("port %d is in both shares", p)
-			}
-			seen[uint16(p)] = true
+		if gotProto != proto || min != 1 || max != 65535 || addr != inside || bits != 32 {
+			t.Fatalf("protocol %d: got proto %d, ports %d-%d, %s/%d", proto, gotProto, min, max, addr, bits)
 		}
-	}
-	if len(seen) != portCount(spans) {
-		t.Fatalf("the two shares cover %d ports, the set has %d", len(seen), portCount(spans))
-	}
-
-	// Asking for everything still leaves the source NAT a range to work with
-	forNAT, forJool = splitPortSpans(spans, len(spans)+5)
-	if len(forNAT) != 1 || len(forJool) != len(spans)-1 {
-		t.Fatalf("an oversized share gave %d and %d", len(forNAT), len(forJool))
-	}
-	if forNAT, forJool = splitPortSpans(spans, 0); forJool != nil || len(forNAT) != len(spans) {
-		t.Fatal("without NAT64 the whole set stays with the source NAT")
 	}
 }

@@ -87,7 +87,8 @@ type Snapshot struct {
 	// The PD result is still awaited on a link whose RA announces DHCPv6. Until it arrives nobody
 	// knows whether the RA /64 will be shared with the LAN, so the WAN takes no address in it yet:
 	// one made now might need another prefix length a moment later.
-	PDPending bool `json:"pd_pending,omitempty"`
+	PDPending bool         `json:"pd_pending,omitempty"`
+	NAT64     netip.Prefix `json:"nat64,omitzero"` // the prefix this router's Jool translates, while it does
 }
 
 // wanSLAAC returns the SLAAC-capable /64s from the upstream RA, including deprecated ones so addresses can be retired.
@@ -126,6 +127,8 @@ type Store struct {
 	sources  map[prefixSource]SourceUpdate
 	captured *tunnelGuess
 	capIn    chan *tunnelGuess
+	nat64    netip.Prefix
+	nat64In  chan netip.Prefix
 	// DS-Lite option 64 carries a name; the resolved addresses come back from aftrResolver.
 	aftrName  string
 	aftrAddrs []netip.Addr
@@ -162,6 +165,7 @@ func newStore(prefer prefixSource, lans []lanDef, hold time.Duration, ula []neti
 		subReq:    make(chan chan Snapshot),
 		curReq:    make(chan chan Snapshot),
 		capIn:     make(chan *tunnelGuess, 4),
+		nat64In:   make(chan netip.Prefix, 4),
 		aftrIn:    make(chan aftrUpdate, 4),
 		confIn:    make(chan endpointState, 8),
 		conflicts: map[netip.Addr]bool{},
@@ -222,6 +226,12 @@ func (s *Store) SetCaptured(g *tunnelGuess) {
 	s.capIn <- g
 }
 
+// SetNAT64 reports the prefix Jool translates, or none once it stops; the RA announces it only
+// while it is set.
+func (s *Store) SetNAT64(p netip.Prefix) {
+	s.nat64In <- p
+}
+
 func (s *Store) Current() Snapshot {
 	ch := make(chan Snapshot, 1)
 	s.curReq <- ch
@@ -243,6 +253,9 @@ func (s *Store) loop() {
 			expire = s.nextExpiry()
 		case g := <-s.capIn:
 			s.captured = g
+			s.recompute(time.Now())
+		case p := <-s.nat64In:
+			s.nat64 = p
 			s.recompute(time.Now())
 		case a := <-s.aftrIn:
 			s.aftrName, s.aftrAddrs = a.name, a.addrs
@@ -322,6 +335,7 @@ func (s *Store) recompute(now time.Time) {
 		DNS:     u.DNS,
 		DNSSL:   u.DNSSL,
 		PREF64:  u.PREF64,
+		NAT64:   s.nat64,
 		WANMTU:  u.MTU,
 		WANAddr: u.WANAddr,
 	}
@@ -569,7 +583,7 @@ func (s *Store) recompute(now time.Time) {
 		if change == changeNone && !slices.Equal(s.cur.DNSSL, next.DNSSL) {
 			change = changeRenew
 		}
-		if change == changeNone && (s.cur.PREF64 != next.PREF64 || s.cur.WANMTU != next.WANMTU) {
+		if change == changeNone && (s.cur.PREF64 != next.PREF64 || s.cur.NAT64 != next.NAT64 || s.cur.WANMTU != next.WANMTU) {
 			change = changeRenew
 		}
 	}

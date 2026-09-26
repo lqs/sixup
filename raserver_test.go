@@ -190,3 +190,55 @@ func TestLANDNS(t *testing.T) {
 		t.Fatalf("self with no LAN prefix is left out: %v", got)
 	}
 }
+
+// The prefix of this router's own NAT64 is announced only while Jool translates; -ra-pref64 wins
+// over it, and without either the upstream's passes through. A prefix that stops being announced
+// is withdrawn with lifetime 0 in the RAs sent right away, then left out.
+func TestRAPref64FollowsNAT64(t *testing.T) {
+	upstream := netip.MustParsePrefix("2001:db8:64::/96")
+	pref64s := func(r *raServer) map[netip.Prefix]time.Duration {
+		out := map[netip.Prefix]time.Duration{}
+		for _, o := range r.build().Options {
+			if p, ok := o.(*ndp.PREF64); ok {
+				out[p.Prefix] = p.Lifetime
+			}
+		}
+		return out
+	}
+	snap := lanSnap(time.Now())
+	snap.PREF64 = upstream
+	r := newTestRA(snap)
+	if got := pref64s(r); len(got) != 1 || got[upstream] == 0 {
+		t.Fatalf("Jool not translating: the upstream's prefix, got %v", got)
+	}
+
+	on := snap
+	on.NAT64, on.Change = netip.MustParsePrefix("fd00:64::/96"), "renew"
+	if !r.update(on) {
+		t.Fatal("a new PREF64 calls for RAs right away")
+	}
+	if got := pref64s(r); got[on.NAT64] == 0 || got[upstream] != 0 || len(got) != 2 {
+		t.Fatalf("Jool translating: the prefix it translates, and the upstream's withdrawn, got %v", got)
+	}
+
+	off := on
+	off.NAT64 = netip.Prefix{}
+	r.update(off)
+	if got := pref64s(r); got[upstream] == 0 || got[on.NAT64] != 0 || len(got) != 2 {
+		t.Fatalf("Jool stopped: its prefix withdrawn, got %v", got)
+	}
+	for range 3 {
+		r.withdrawLeft-- // what send does after each RA
+	}
+	if got := pref64s(r); len(got) != 1 {
+		t.Fatalf("after the burst the withdrawn prefix is left out, got %v", got)
+	}
+	if r.update(off) {
+		t.Fatal("an unchanged snapshot needs no RA right away")
+	}
+
+	r.pref64 = netip.MustParsePrefix("2001:db8:ff64::/96")
+	if got := pref64s(r); got[r.pref64] == 0 {
+		t.Fatalf("-ra-pref64 wins, got %v", got)
+	}
+}

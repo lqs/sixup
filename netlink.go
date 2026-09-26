@@ -644,10 +644,11 @@ func tunnelSet(name string, link int, local, remote netip.Addr, mtu int) error {
 	return err
 }
 
-// addr4Set assigns a /32 IPv4 address to the tunnel device, replacing any existing one.
-func addr4Set(dev string, a netip.Addr) error {
+// addr4Set assigns an IPv4 address to a device, replacing any existing one: a /32 on the tunnel,
+// the /31 on each end of Jool's veth, whose connected route makes the far end a usable gateway.
+func addr4Set(dev string, p netip.Prefix) error {
 	if dryRun {
-		debugf("[dry-run] skip configuring IPv4 %s/32 on %s", a, dev)
+		debugf("[dry-run] skip configuring IPv4 %s on %s", p, dev)
 		return nil
 	}
 	ifi, err := net.InterfaceByName(dev)
@@ -660,7 +661,7 @@ func addr4Set(dev string, a netip.Addr) error {
 	}
 	defer c.Close()
 	ae := netlink.NewAttributeEncoder()
-	v4 := a.As4()
+	v4 := p.Addr().As4()
 	ae.Bytes(unix.IFA_LOCAL, v4[:])
 	ae.Bytes(unix.IFA_ADDRESS, v4[:])
 	attrs, err := ae.Encode()
@@ -669,7 +670,7 @@ func addr4Set(dev string, a netip.Addr) error {
 	}
 	hdr := make([]byte, 8)
 	hdr[0] = unix.AF_INET
-	hdr[1] = 32
+	hdr[1] = byte(p.Bits())
 	hdr[3] = unix.RT_SCOPE_UNIVERSE
 	nativeEndian.PutUint32(hdr[4:8], uint32(ifi.Index))
 	_, err = c.Execute(netlink.Message{

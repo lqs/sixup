@@ -117,7 +117,7 @@ own, `inet sixup`, removed when it exits. Pass `-tunnel-nat off` to write them y
 | `-ra-lifetime` | `30m` | Router lifetime carried in the RA. |
 | `-ra-mtu` | `0` | MTU advertised in the RA. `0` advertises the WAN path MTU when it is smaller than the LAN interface MTU, taken from the upstream RA or the WAN interface, so a PPPoE line with 1492 no longer depends on path MTU discovery. |
 | `-ra-dns` | `upstream` | DNS servers announced on the LAN, by the RA and the DHCPv6 server. `off` announces none; otherwise a comma-separated list, in order, of `upstream` (the servers the upstream hands out), `self` (this router's address on that LAN, in its ULA when there is one, so renumbering leaves it valid) and IPv6 addresses. For example `self,upstream`. |
-| `-ra-pref64` | | NAT64 prefix to advertise (RFC 8781), such as `64:ff9b::/96`. Empty passes on the one from the upstream RA. The length must be 32, 40, 48, 56, 64 or 96. |
+| `-ra-pref64` | | NAT64 prefix to advertise (RFC 8781), such as `64:ff9b::/96`. Empty passes on the one from the upstream RA. The length must be 32, 40, 48, 56, 64 or 96. With `-nat64 jool` it is the prefix Jool translates instead, `64:ff9b::/96` when empty, and it is advertised only while Jool runs. Reaching private IPv4 addresses through NAT64 needs a network-specific prefix, such as the ULA `fd00:64::/96` (RFC 6052); one carved from the delegated prefix would change with it. |
 | `-ra-route` | | Prefix to advertise as a Route Information option, repeatable. |
 
 ### LAN side: DHCPv6 server
@@ -171,9 +171,8 @@ These options govern the router's own addresses on the LAN, and on the WAN with 
 
 | Option | Default | Description |
 |---|---|---|
-| `-nat64` | `off` | `jool` configures NAT64 with the [Jool](https://jool.mx) kernel module (4.1 or later, loaded with `modprobe jool`): an instance translating `64:ff9b::/96`, advertised in the RA, whose output goes through the source NAT above, so the ports of a MAP-E line have one owner. `off` configures none. DNS64 is left to a resolver of your choice. |
-| `-jool-instance` | `sixup` | Name of the Jool instance sixup creates and removes. |
-| `-jool-port-ranges` | `3` | How many of the port ranges of a MAP-E line go to the translator; netfilter keeps the rest, and the two never hand out the same port. Ignored when the line owns every port of its address. |
+| `-nat64` | `off` | `jool` configures NAT64 with the [Jool](https://jool.mx) kernel module (4.1 or later, loaded with `modprobe jool`). Jool runs in a network namespace of its own behind the veth `sixup-nat64` and translates `64:ff9b::/96`, or the prefix `-ra-pref64` names, for the LAN and for this router alike. The namespace exists, and the prefix is advertised in the RA, only while the module is loaded; sixup checks every minute, so loading, unloading and reloading it need no restart. The IPv4 output leaves by this host's IPv4 route: through the tunnel it goes through the source NAT above, so the ports of a MAP-E line have one owner, and without a tunnel it takes whatever IPv4 uplink is configured. A firewall has to let traffic through `sixup-nat64`, both the LAN's, which is forwarded, and the answers to this router's own, which arrive on it. The namespace goes away with sixup. `off` configures none. DNS64 is left to a resolver of your choice. |
+| `-jool-ipv4` | `192.168.255.254/31` | IPv4 /31 between this namespace and Jool's. The lower address is the gateway on this side, the upper one Jool's pool4. sixup refuses to start when it overlaps an address or a route of this host. |
 
 ### Runtime
 

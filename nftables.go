@@ -29,14 +29,11 @@ const natTable = "sixup"
 // line with its own public IPv4 needs an ordinary one. Both still want the MSS clamp, since the
 // tunnel costs 40 bytes and path MTU discovery is blocked often enough to matter.
 type natManager struct {
-	dev string // tunnel device; rules are scoped to traffic leaving through it
-	mtu int    // tunnel MTU, for the MSS clamp; 0 leaves the clamp out
-	// How many of the port ranges are Jool's rather than ours, so that the two never hand out the
-	// same port; see splitPortSpans.
-	joolRanges int
-	applied    string // fingerprint of what is installed, so an unchanged snapshot writes nothing
-	warned     bool
-	dial       func() (*nftables.Conn, error) // tests substitute a connection that talks to no kernel
+	dev     string // tunnel device; rules are scoped to traffic leaving through it
+	mtu     int    // tunnel MTU, for the MSS clamp; 0 leaves the clamp out
+	applied string // fingerprint of what is installed, so an unchanged snapshot writes nothing
+	warned  bool
+	dial    func() (*nftables.Conn, error) // tests substitute a connection that talks to no kernel
 }
 
 func (m *natManager) conn() (*nftables.Conn, error) {
@@ -59,7 +56,7 @@ func (m *natManager) run(ctx context.Context, ch <-chan Snapshot) {
 }
 
 func (m *natManager) apply(snap Snapshot) {
-	plan, ok := natPlanFor(snap, m.tunnelMTU(), m.joolRanges)
+	plan, ok := natPlanFor(snap, m.tunnelMTU())
 	if !ok {
 		m.remove()
 		return

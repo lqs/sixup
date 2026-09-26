@@ -77,6 +77,6 @@ func packetCapture(int, chan<- []byte, frameKind, func()) (func(), error) { retu
 func tunnelSet(name string, _ int, local, remote netip.Addr, mtu int) error {
 	return skipOrUnsupported(fmt.Sprintf("tunnel device %s: %s → %s mtu %d", name, local, remote, mtu))
 }
-func addr4Set(dev string, a netip.Addr) error {
-	return skipOrUnsupported(fmt.Sprintf("IPv4 %s/32 on %s", a, dev))
+func addr4Set(dev string, p netip.Prefix) error {
+	return skipOrUnsupported(fmt.Sprintf("IPv4 %s on %s", p, dev))
 }
