@@ -182,11 +182,11 @@ func addrList(ifi int) ([]ifAddr, error) {
 
 // routeSet adds or replaces a route; an invalid gw means a directly connected route.
 func routeSet(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires time.Duration) error {
-	return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNICAST, ifi, dst, gw, metric, expires)
+	return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNICAST, 0, ifi, dst, gw, metric, expires)
 }
 
 func routeDel(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32) error {
-	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, ifi, dst, gw, metric, 0)
+	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, 0, ifi, dst, gw, metric, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return nil
 	}
@@ -197,16 +197,29 @@ func routeDel(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32) error {
 // Destination Unreachable.
 func routeUnreachable(dst netip.Prefix, expires time.Duration, del bool) error {
 	if !del {
-		return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNREACHABLE, 0, dst, netip.Addr{}, 0, expires)
+		return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNREACHABLE, 0, 0, dst, netip.Addr{}, 0, expires)
 	}
-	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNREACHABLE, 0, dst, netip.Addr{}, 0, 0)
+	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNREACHABLE, 0, 0, dst, netip.Addr{}, 0, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return nil
 	}
 	return err
 }
 
-func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, rtn uint8, ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires time.Duration) error {
+// prefixRouteDel removes the on-link route the kernel added for the prefix of an address on ifi.
+// Deleting an address with a finite lifetime leaves that route behind until it expires, on kernels
+// that clean it up only for permanent addresses, so an address that stops covering its prefix
+// needs its route taken away by hand.
+func prefixRouteDel(ifi int, dst netip.Prefix) error {
+	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, unix.RTPROT_KERNEL, ifi, dst, netip.Addr{}, 0, 0)
+	if errors.Is(err, unix.ESRCH) {
+		return nil
+	}
+	return err
+}
+
+// routeOp sends one route request; proto 0 means ours, RTPROT_RA for IPv6 and RTPROT_STATIC for IPv4.
+func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, rtn, proto uint8, ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires time.Duration) error {
 	if dryRun {
 		debugf("[dry-run] skip route %s -> %s dev %d", dst, gw, ifi)
 		return nil
@@ -231,6 +244,9 @@ func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, rtn uint8, ifi i
 	// A delete has to name the same protocol, or the kernel finds no IPv6 route to remove.
 	if !v4 {
 		hdr[5] = unix.RTPROT_RA
+	}
+	if proto != 0 {
+		hdr[5] = proto
 	}
 	ae := netlink.NewAttributeEncoder()
 	ae.Bytes(unix.RTA_DST, addrBytes(dst.Masked().Addr()))

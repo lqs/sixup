@@ -107,3 +107,27 @@ func TestRouteUnreachableAgainstKernel(t *testing.T) {
 		t.Fatal("deleting the unreachable route must leave the LAN route alone")
 	}
 }
+
+// The on-link route the kernel adds for an address's prefix is found and removed by its protocol,
+// on kernels that leave it behind when the address goes. A route of ours to the same prefix on
+// another device stays.
+func TestRoutePrefixDeleteAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	loUp(t)
+	dst := netip.MustParsePrefix("2001:db8:1::/64")
+	if err := routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create, unix.RTN_UNICAST, unix.RTPROT_KERNEL, 1, dst, netip.Addr{}, 256, time.Hour); err != nil {
+		t.Fatalf("adding a kernel route: %v", err)
+	}
+	if err := routeUnreachable(dst, time.Hour, false); err != nil {
+		t.Fatalf("adding a route of ours: %v", err)
+	}
+	if err := prefixRouteDel(1, dst); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got := routeTypes(t, dst); len(got) != 1 || got[0] != unix.RTN_UNREACHABLE {
+		t.Fatalf("only the kernel's route should be gone, left %v", got)
+	}
+	if err := prefixRouteDel(1, dst); err != nil {
+		t.Fatalf("deleting a route already gone is no error: %v", err)
+	}
+}

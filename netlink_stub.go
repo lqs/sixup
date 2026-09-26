@@ -54,6 +54,9 @@ func routeSet(_ int, dst netip.Prefix, gw netip.Addr, _ uint32, _ time.Duration)
 func routeDel(_ int, dst netip.Prefix, gw netip.Addr, _ uint32) error {
 	return skipOrUnsupported(fmt.Sprintf("route delete %s → %s", dst, gw))
 }
+func prefixRouteDel(_ int, dst netip.Prefix) error {
+	return skipOrUnsupported("prefix route delete " + dst.String())
+}
 func routeUnreachable(dst netip.Prefix, _ time.Duration, _ bool) error {
 	return skipOrUnsupported("unreachable route " + dst.String())
 }

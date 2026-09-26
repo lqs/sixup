@@ -399,6 +399,12 @@ func (m *addrManager) applyPrefixAddrs() {
 			if err := addrDel(m.ifi.Index, a, old); err != nil {
 				warnf("[address %s] failed to delete %s/%d: %v", m.ifname, a, old, err)
 			}
+			// The /64 moves to the other side; the route the old address brought must go with it
+			if old == p.Prefix.Bits() {
+				if err := prefixRouteDel(m.ifi.Index, p.Prefix); err != nil {
+					warnf("[address %s] failed to delete the on-link route of %s: %v", m.ifname, p.Prefix, err)
+				}
+			}
 			had = false
 		}
 		if err := addrSet(m.ifi.Index, a, plen, pref, valid, false, 0); err != nil {
