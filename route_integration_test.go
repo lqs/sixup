@@ -5,6 +5,7 @@ package main
 import (
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
@@ -78,3 +79,29 @@ func TestRouteDeleteAgainstKernel(t *testing.T) {
 	}
 }
 
+// The unreachable route for a delegation is accepted without a device, sits under the more
+// specific LAN route, and goes on delete.
+func TestRouteUnreachableAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	loUp(t)
+	up := netip.MustParsePrefix("2001:db8:100::/56")
+	lan := netip.MustParsePrefix("2001:db8:100::/64")
+	if err := routeUnreachable(up, time.Hour, false); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := routeSet(1, lan, netip.Addr{}, 0, 0); err != nil {
+		t.Fatalf("LAN route: %v", err)
+	}
+	if got := routeTypes(t, up); len(got) != 1 || got[0] != unix.RTN_UNREACHABLE {
+		t.Fatalf("want one unreachable route, got types %v", got)
+	}
+	if err := routeUnreachable(up, 0, true); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got := routeTypes(t, up); len(got) != 0 {
+		t.Fatalf("still there after delete: %v", got)
+	}
+	if len(routeTypes(t, lan)) != 1 {
+		t.Fatal("deleting the unreachable route must leave the LAN route alone")
+	}
+}

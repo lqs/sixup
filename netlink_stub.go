@@ -54,6 +54,9 @@ func routeSet(_ int, dst netip.Prefix, gw netip.Addr, _ uint32, _ time.Duration)
 func routeDel(_ int, dst netip.Prefix, gw netip.Addr, _ uint32) error {
 	return skipOrUnsupported(fmt.Sprintf("route delete %s → %s", dst, gw))
 }
+func routeUnreachable(dst netip.Prefix, _ time.Duration, _ bool) error {
+	return skipOrUnsupported("unreachable route " + dst.String())
+}
 func neighProxySet(_ int, a netip.Addr, _ bool) error {
 	return skipOrUnsupported("proxy neighbor " + a.String())
 }

@@ -163,6 +163,7 @@ func main() {
 		dhcp.link = hub.Subscribe(*wan)
 		dhcp.releaseOn = *dhcpRel
 		go dhcp.run(ctx, mode == clientAuto && *upRA)
+		go holdDelegations(ctx, store.Subscribe())
 	}
 	if *upRA {
 		go (&raClient{ifname: *wan, store: store, dhcp: dhcp, slaac: *wanSLAAC, iid: iids[0], layout: layout, secret: secret}).run(ctx, hub)

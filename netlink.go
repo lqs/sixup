@@ -182,18 +182,31 @@ func addrList(ifi int) ([]ifAddr, error) {
 
 // routeSet adds or replaces a route; an invalid gw means a directly connected route.
 func routeSet(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires time.Duration) error {
-	return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, ifi, dst, gw, metric, expires)
+	return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNICAST, ifi, dst, gw, metric, expires)
 }
 
 func routeDel(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32) error {
-	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, ifi, dst, gw, metric, 0)
+	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, ifi, dst, gw, metric, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return nil
 	}
 	return err
 }
 
-func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires time.Duration) error {
+// routeUnreachable adds, or with del removes, a route that drops traffic for dst with an ICMPv6
+// Destination Unreachable.
+func routeUnreachable(dst netip.Prefix, expires time.Duration, del bool) error {
+	if !del {
+		return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNREACHABLE, 0, dst, netip.Addr{}, 0, expires)
+	}
+	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNREACHABLE, 0, dst, netip.Addr{}, 0, 0)
+	if errors.Is(err, unix.ESRCH) {
+		return nil
+	}
+	return err
+}
+
+func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, rtn uint8, ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires time.Duration) error {
 	if dryRun {
 		debugf("[dry-run] skip route %s -> %s dev %d", dst, gw, ifi)
 		return nil
@@ -213,7 +226,7 @@ func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, ifi int, dst net
 	hdr[4] = unix.RT_TABLE_MAIN
 	hdr[5] = unix.RTPROT_STATIC
 	hdr[6] = unix.RT_SCOPE_UNIVERSE
-	hdr[7] = unix.RTN_UNICAST
+	hdr[7] = rtn
 	// IPv6 routes come from an RA, IPv4 ones are ours; the protocol keeps them apart in the table.
 	// A delete has to name the same protocol, or the kernel finds no IPv6 route to remove.
 	if !v4 {
@@ -221,7 +234,9 @@ func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, ifi int, dst net
 	}
 	ae := netlink.NewAttributeEncoder()
 	ae.Bytes(unix.RTA_DST, addrBytes(dst.Masked().Addr()))
-	ae.Uint32(unix.RTA_OIF, uint32(ifi))
+	if ifi != 0 {
+		ae.Uint32(unix.RTA_OIF, uint32(ifi))
+	}
 	if gw.IsValid() {
 		ae.Bytes(unix.RTA_GATEWAY, addrBytes(gw))
 	}
