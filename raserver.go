@@ -101,7 +101,7 @@ func (r *raServer) serve(ctx context.Context, store *Store, ch <-chan Snapshot) 
 	defer r.conn.Close()
 	// advertise immediately: first RA must go out within 2s of startup
 	r.snap = store.Current()
-	r.burst(ctx)
+	r.burst(ctx, ch)
 	next := time.NewTimer(r.interval())
 	defer next.Stop()
 	for {
@@ -124,7 +124,7 @@ func (r *raServer) serve(ctx context.Context, store *Store, ch <-chan Snapshot) 
 			return
 		case s := <-ch:
 			if r.update(s) {
-				r.burst(ctx)
+				r.burst(ctx, ch)
 				next.Reset(r.interval())
 			}
 		case <-next.C:
@@ -186,16 +186,46 @@ func (r *raServer) interval() time.Duration {
 }
 
 // burst sends 3 RAs at most 3s apart (MAX_INITIAL_RTR_ADVERTISEMENTS).
-func (r *raServer) burst(ctx context.Context) {
-	for i := range 3 {
+//
+// Snapshots keep arriving while it waits, and are taken as they come, so no RA of the burst goes
+// out with state already replaced; one that calls for RAs of its own starts the count again.
+func (r *raServer) burst(ctx context.Context, ch <-chan Snapshot) {
+	for i := 0; i < 3; i++ {
 		r.send(fmt.Sprintf("initial %d/3", i+1))
 		if i == 2 {
 			return
 		}
+		switch r.pause(ctx, ch, time.Duration(rand.Int64N(int64(2*time.Second)))+500*time.Millisecond) {
+		case pauseCancelled:
+			return
+		case pauseRestart:
+			i = -1
+		}
+	}
+}
+
+type pauseEnd int
+
+const (
+	pauseElapsed pauseEnd = iota
+	pauseRestart          // a snapshot called for RAs of its own
+	pauseCancelled
+)
+
+// pause waits between the RAs of a burst while taking the snapshots that arrive.
+func (r *raServer) pause(ctx context.Context, ch <-chan Snapshot, d time.Duration) pauseEnd {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	for {
 		select {
 		case <-ctx.Done():
-			return
-		case <-time.After(time.Duration(rand.Int64N(int64(2*time.Second))) + 500*time.Millisecond):
+			return pauseCancelled
+		case s := <-ch:
+			if r.update(s) {
+				return pauseRestart
+			}
+		case <-t.C:
+			return pauseElapsed
 		}
 	}
 }

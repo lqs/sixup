@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"net/netip"
 	"testing"
@@ -266,5 +267,35 @@ func TestParsePref64(t *testing.T) {
 	}
 	if p, err := parseNAT64Prefix("fd00:64::/96"); err != nil || p.Bits() != 96 {
 		t.Fatalf("a ULA network-specific prefix: %v %v", p, err)
+	}
+}
+
+// Between the RAs of a burst, a snapshot is taken at once so the next RA carries it, and one that
+// calls for RAs of its own restarts the burst.
+func TestRABurstPauseTakesSnapshots(t *testing.T) {
+	r := newTestRA(Snapshot{})
+	ch := make(chan Snapshot, 1)
+
+	renew := lanSnap(time.Now())
+	renew.Change = "renew"
+	ch <- renew
+	if got := r.pause(context.Background(), ch, 50*time.Millisecond); got != pauseElapsed {
+		t.Fatalf("a renewal waits out the pause, got %v", got)
+	}
+	if len(r.snap.LAN["lan0"]) != 1 {
+		t.Fatal("the renewal must be taken all the same, or the next RA of the burst is stale")
+	}
+
+	add := lanSnap(time.Now())
+	add.Change = "add"
+	ch <- add
+	if got := r.pause(context.Background(), ch, time.Hour); got != pauseRestart {
+		t.Fatalf("a new prefix restarts the burst, got %v", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := r.pause(ctx, ch, time.Hour); got != pauseCancelled {
+		t.Fatalf("cancelled: got %v", got)
 	}
 }
