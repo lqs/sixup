@@ -25,7 +25,7 @@ the tunnel endpoints all follow from that one event. No manual step, no restart.
 - Delegates prefixes to downstream routers, so one sixup can sit behind another
 - Keeps unsolicited IPv6 out of the LAN, and lets programs open ports with PCP
 - Builds a DS-Lite, MAP-E or IPIP6 tunnel as needed, and keeps MAP-E source ports inside the assigned port set
-- One static binary under 5 MiB, dependent on no external command and no system service
+- One static binary under 6 MiB, dependent on no external command and no system service
 
 ## Quick start
 

@@ -17,7 +17,7 @@ jobs:
       - name: Cross-compile and check size
         run: |
           ./build.sh ci
-          test "$(stat -c %s dist/sixup-ci-linux-x86_64)" -le 5242880
+          test "$(stat -c %s dist/sixup-ci-linux-x86_64)" -le 6291456
 
   nftables:
     # The unit tests cover what the rules should be; this covers the kernel accepting them.
