@@ -66,11 +66,16 @@ func main() {
 		lans = multiFlag{"lan"}
 	}
 	lanDefs := parseLans(lans)
+	static, err := parseWANPrefix(*wanPrefix)
+	if err != nil {
+		fatalf("-wan-prefix: %v", err)
+	}
 	// A prefix learned from RA is only a /64, which cannot be split across LANs.
 	mode := clientMode(*dhcpMode)
-	pdEnabled := mode != clientOff && *pdLen > 0
-	if len(lanDefs) > 1 && (!pdEnabled || *prefer == "ra") {
-		fatalf("multiple LAN interfaces need a PD prefix; a /64 from RA cannot be split, so enable PD and set -wan-prefer pd")
+	pdEnabled := mode != clientOff && *pdLen > 0 && len(static) == 0
+	splittable := slices.ContainsFunc(static, func(p netip.Prefix) bool { return p.Bits() < 64 })
+	if len(lanDefs) > 1 && !splittable && (!pdEnabled || *prefer == "ra") {
+		fatalf("multiple LAN interfaces need a prefix shorter than /64; a /64 cannot be split, so enable PD and set -wan-prefer pd, or give a shorter -wan-prefix")
 	}
 	srv := serverMode(*srvMode)
 	if srv != serverOff && srv != serverStateless && srv != serverStateful {
@@ -100,6 +105,12 @@ func main() {
 	if *nat64 != "off" && pref64.IsValid() {
 		fatalf("-ra-pref64 %s would announce a prefix nothing here translates while -nat64 %s translates %s; set -nat64-prefix instead", pref64, *nat64, nat64Pfx)
 	}
+	if !*raSLAAC && *srvMode != "stateful" {
+		warnf("-ra-slaac off without -dhcp6s-mode stateful: LAN hosts get no global address")
+	}
+	if *unsolicited != "allow" && *unsolicited != "request" && *unsolicited != "deny" {
+		fatalf("-unsolicited must be allow / request / deny")
+	}
 	// Refused before anything is configured, so a conflict leaves the host as it was
 	if *nat64 == "jool" && !dryRun {
 		if err := checkJoolIPv4(joolLink); err != nil {
@@ -123,8 +134,8 @@ func main() {
 	if *raMin > *raMax || *raMin < 3*time.Second {
 		fatalf("-ra-min must be at least 3 seconds and no larger than -ra-max")
 	}
-	if mode == clientOff && !*upRA {
-		fatalf("at least one of the DHCPv6 client and the upstream RA must be enabled")
+	if mode == clientOff && !*upRA && len(static) == 0 {
+		fatalf("at least one of the DHCPv6 client, the upstream RA and -wan-prefix must be enabled")
 	}
 	iids, err := parseIIDPolicies(*wanIID)
 	if err != nil {
@@ -142,10 +153,13 @@ func main() {
 		fatalf("-lan-ula: %v", err)
 	}
 	grace := *pdGrace
-	if mode == clientOff || *pdLen == 0 {
+	if !pdEnabled {
 		grace = 0
 	}
-	store := newStore(prefixSource(*prefer), lanDefs, *hold, ula, *tunRules, grace, *settle)
+	store := newStore(prefixSource(*prefer), lanDefs, *hold, ula, *tunRules, grace, *settle, filepath.Join(*stateDir, "lan-prefixes.json"))
+	if len(static) > 0 {
+		go keepStatic(ctx, store, static, *wanSLAAC)
+	}
 	if !dryRun {
 		names := []string{*wan}
 		for _, l := range lanDefs {
@@ -168,12 +182,12 @@ func main() {
 	pkts := newPacketHub(ctx, *wan)
 
 	if dryRun {
-		runDry(ctx, store, hub, pkts, dryOpts{wan: *wan, dhcpMode: mode, stateDir: *stateDir, tunDev: *tunDev, upRA: *upRA, wantNA: *wantNA, pdLen: *pdLen, tunMTU: *tunMTU, metric4: uint32(*tunMetric4), iid: iids[0], timeout: *dryTO})
+		runDry(ctx, store, hub, pkts, dryOpts{wan: *wan, dhcpMode: mode, stateDir: *stateDir, tunDev: *tunDev, upRA: *upRA, wantNA: *wantNA, infoOnly: len(static) > 0, pdLen: *pdLen, tunMTU: *tunMTU, metric4: uint32(*tunMetric4), iid: iids[0], timeout: *dryTO})
 		return
 	}
 
 	// DS-Lite hands out a name, not an address; resolving it is what completes the tunnel parameters.
-	go (&aftrResolver{store: store}).run(ctx, store.Subscribe())
+	go (&aftrResolver{store: store, wan: *wan}).run(ctx, store.Subscribe())
 
 	secret := loadSecret(*stateDir)
 	var dhcp *dhcpClient
@@ -181,7 +195,11 @@ func main() {
 		dhcp = newDHCPClient(*wan, store, *stateDir, *pdLen, *wantNA)
 		dhcp.link = hub.Subscribe(*wan)
 		dhcp.releaseOn = *dhcpRel
+		// With the prefix given, the client asks only for DNS and the like, as the AFTR name
+		dhcp.infoOnly = len(static) > 0
 		go dhcp.run(ctx, mode == clientAuto && *upRA)
+	}
+	if pdEnabled || splittable {
 		go holdDelegations(ctx, store.Subscribe())
 	}
 	if *upRA {
@@ -193,6 +211,8 @@ func main() {
 			<-cctx.Done()
 		})
 	}
+	// The PCP server maps IPv4 ports through the tunnel's NAT, when that is sixup's to do
+	var nat *natManager
 	if *tunDev != "" {
 		go (&tunnelManager{dev: *tunDev, wan: *wan, mtu: *tunMTU, metric4: uint32(*tunMetric4), store: store}).run(ctx, store.Subscribe())
 		// A tunnel carries IPv4, which the kernel will not forward on a system that has never been a
@@ -203,7 +223,8 @@ func main() {
 			}
 		}
 		if *tunNAT == "auto" {
-			go (&natManager{dev: *tunDev, mtu: *tunMTU}).run(ctx, store.Subscribe())
+			nat = &natManager{dev: *tunDev, mtu: *tunMTU, mapIn: make(chan []portMapping, 1)}
+			go nat.run(ctx, store.Subscribe())
 		}
 	}
 	if *nat64 == "jool" {
@@ -214,6 +235,20 @@ func main() {
 			}
 		}
 		go (&joolManager{prefix: nat64Pfx, link: joolLink, store: store}).run(ctx)
+	}
+	// The border of RFC 7084 is kept in every mode; allow only lets unsolicited traffic in
+	fw := &firewall{wan: *wan, inbound: *unsolicited != "allow", source: *srcFilter, holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
+	go fw.run(ctx, store.Subscribe())
+	if *unsolicited != "deny" {
+		var names []string
+		for _, l := range lanDefs {
+			names = append(names, l.iface)
+		}
+		p := &pcpServer{lans: names, nat: nat}
+		if *unsolicited == "request" {
+			p.fw = fw // IPv6 mappings are the filter's pinholes
+		}
+		go p.run(ctx, store.Subscribe())
 	}
 	if *tunCap && dhcp != nil {
 		go (&tunnelWatcher{ifname: *wan, store: store, pkts: pkts, maxRun: *tunCapMax}).run(ctx, store.Subscribe())
@@ -240,14 +275,14 @@ func main() {
 	poolStart, poolEnd := parsePool(*poolRange)
 	var pd *pdPool
 	if *srvMode != "off" && *srvPDLen > 0 {
-		pd = newPDPool(*srvPDLen, filepath.Join(*stateDir, "pd-leases.json"))
+		pd = newPDPool(*srvPDLen, filepath.Join(*stateDir, "pd-leases.json"), fw)
 	}
 	for _, l := range lanDefs {
 		iface := l.iface
 		go (&addrManager{ifname: iface, secret: secret, cfg: tcfg, iids: lanIIDs, pick: func(s Snapshot) []Prefix { return s.LAN[iface] }, side: sideLAN, layout: layout}).run(ctx, hub, store, store.Subscribe())
 		go (&raServer{
 			ifname: l.iface, minI: *raMin, maxI: *raMax, lifetime: *raLifetime, mtu: uint32(*raMTU),
-			managed: srv == serverStateful, other: srv != serverOff, routes: rios, dns: dnsOverride, pref64: pref64, pref64Off: pref64Off,
+			managed: srv == serverStateful, other: srv != serverOff, noSLAAC: !*raSLAAC, offLink: !*raOnLink, routes: rios, ula: ula, dns: dnsOverride, pref64: pref64, pref64Off: pref64Off,
 		}).run(ctx, hub, store, store.Subscribe())
 		if *srvMode != "off" {
 			s := &dhcpServer{

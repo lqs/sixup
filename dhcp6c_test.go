@@ -5,6 +5,8 @@ import (
 	"crypto/md5"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -105,7 +107,7 @@ func TestApplyReply(t *testing.T) {
 	old := dryRun
 	dryRun = true // address configuration goes through stubs
 	defer func() { dryRun = old }()
-	store := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0)
+	store := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
 	ch := store.Subscribe()
 	recv(t, ch) // initial empty snapshot
 	c := &dhcpClient{ifi: &net.Interface{Index: 2}, store: store}
@@ -227,5 +229,100 @@ func TestPDHintRetry(t *testing.T) {
 	}
 	if (&dhcpClient{}).retryUnhinted() {
 		t.Fatal("no PD requested, nothing to retry")
+	}
+}
+
+// An IA with T1 past T2, and a lease preferred longer than valid, are invalid, and a message that
+// does not name a server and this client is not for it (IPv6 Ready CE Router 1.1.18, 1.1.19 and
+// 1.2.10).
+func TestClientValidation(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	defer func() { dryRun = old }()
+	store := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	recv(t, store.Subscribe())
+	duid := &dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: net.HardwareAddr{2, 0, 0, 0, 0, 9}}
+	c := &dhcpClient{ifi: &net.Interface{Index: 2}, store: store, duid: duid}
+
+	rep, _ := dhcpv6.NewMessage()
+	rep.MessageType = dhcpv6.MessageTypeReply
+	_, a, _ := net.ParseCIDR("2001:db8:100::/56")
+	_, b, _ := net.ParseCIDR("2001:db8:200::/56")
+	badT := &dhcpv6.OptIAPD{IaId: [4]byte{1}, T1: 3000 * time.Second, T2: 1000 * time.Second}
+	badT.Options.Add(&dhcpv6.OptIAPrefix{Prefix: a, PreferredLifetime: time.Hour, ValidLifetime: 2 * time.Hour})
+	badLife := &dhcpv6.OptIAPD{IaId: [4]byte{2}}
+	badLife.Options.Add(&dhcpv6.OptIAPrefix{Prefix: b, PreferredLifetime: 2 * time.Hour, ValidLifetime: time.Hour})
+	rep.AddOption(badT)
+	rep.AddOption(badLife)
+	if l := c.apply(rep); l != nil {
+		t.Fatalf("nothing valid to bind: %+v", l)
+	}
+
+	if c.forUs(rep) {
+		t.Fatal("no Server ID and no Client ID")
+	}
+	rep.AddOption(dhcpv6.OptServerID(&dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: net.HardwareAddr{2, 0, 0, 0, 0, 1}}))
+	rep.AddOption(dhcpv6.OptClientID(&dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: net.HardwareAddr{2, 0, 0, 0, 0, 8}}))
+	if c.forUs(rep) {
+		t.Fatal("another client's")
+	}
+	rep.UpdateOption(dhcpv6.OptClientID(duid))
+	if !c.forUs(rep) {
+		t.Fatal("this client's")
+	}
+}
+
+// Without a MAC the IAID comes from the name, as in OpenWrt's odhcp6c, so a redial that gives ppp0
+// a new index keeps it (RFC 9096 WPD-10).
+func TestIAIDWithoutMAC(t *testing.T) {
+	a := iaidFor(&net.Interface{Index: 7, Name: "ppp0"})
+	b := iaidFor(&net.Interface{Index: 12, Name: "ppp0"})
+	if a != b || a != [4]byte{0xe9, 0x93, 0xa0, 0x63} {
+		t.Fatalf("got %x and %x", a, b)
+	}
+	if got := iaidFor(&net.Interface{Name: "eth0", HardwareAddr: net.HardwareAddr{2, 0, 0x11, 0x22, 0x33, 0x44}}); got != [4]byte{0x11, 0x22, 0x33, 0x44} {
+		t.Fatalf("with a MAC: %x", got)
+	}
+}
+
+// OPTION_PD_EXCLUDE carries the bits after the delegated prefix, left-aligned (RFC 6603 section 4.2).
+func TestParsePDExclude(t *testing.T) {
+	pd := netip.MustParsePrefix("2001:db8:100::/56")
+	// a /64 with subnet ID 0x12: 8 bits after the /56
+	if got, ok := parsePDExclude(pd, []byte{64, 0x12}); !ok || got != netip.MustParsePrefix("2001:db8:100:12::/64") {
+		t.Fatalf("got %v %v", got, ok)
+	}
+	// a /60 with subnet ID 0xa: 4 bits, left-aligned in one byte
+	if got, ok := parsePDExclude(pd, []byte{60, 0xa0}); !ok || got != netip.MustParsePrefix("2001:db8:100:a0::/60") {
+		t.Fatalf("got %v %v", got, ok)
+	}
+	for _, bad := range [][]byte{{56, 0}, {64}, {129, 0, 0}} {
+		if _, ok := parsePDExclude(pd, bad); ok {
+			t.Errorf("%x must be refused", bad)
+		}
+	}
+}
+
+// The DUID is made once and kept in the state directory, so the ISP knows the router again after a
+// restart (RFC 7084 W-5).
+func TestDUIDPersists(t *testing.T) {
+	old := dryRun
+	dryRun = false
+	defer func() { dryRun = old }()
+	dir := t.TempDir()
+	ifi := &net.Interface{Name: "wan0", HardwareAddr: net.HardwareAddr{2, 0, 0, 0, 0, 7}}
+	a := &dhcpClient{stateDir: dir, ifi: ifi}
+	if err := a.loadDUID(); err != nil {
+		t.Fatal(err)
+	}
+	b := &dhcpClient{stateDir: dir, ifi: ifi}
+	if err := b.loadDUID(); err != nil {
+		t.Fatal(err)
+	}
+	if a.duid == nil || !a.duid.Equal(b.duid) {
+		t.Fatalf("the DUID changed across a restart: %v, %v", a.duid, b.duid)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "duid")); err != nil {
+		t.Fatal(err)
 	}
 }

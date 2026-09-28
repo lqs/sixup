@@ -3,6 +3,7 @@ package main
 import (
 	"net"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -147,7 +148,7 @@ func TestRAClientPassesDHCPv6Flags(t *testing.T) {
 	dryRun = true // routes and sysctls go through stubs
 	defer func() { dryRun = old }()
 	for _, other := range []bool{true, false} {
-		st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, time.Minute, 0)
+		st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, time.Minute, 0, "")
 		ch := st.Subscribe()
 		recv(t, ch)
 		stable, _ := parseIIDPolicy("stable")
@@ -160,5 +161,99 @@ func TestRAClientPassesDHCPv6Flags(t *testing.T) {
 		if s := recv(t, ch); s.PDPending != other {
 			t.Fatalf("O=%v: want pd_pending=%v, got %v", other, other, s.PDPending)
 		}
+	}
+}
+
+// A prefix left out of an RA keeps its lifetimes, and the two-hour rule of RFC 4862 section
+// 5.5.3 e) holds (IPv6 Ready CE Router 1.4.8 and 1.4.10).
+func TestMergePIOs(t *testing.T) {
+	now := time.Now()
+	x, y := netip.MustParsePrefix("2001:db8:1::/64"), netip.MustParsePrefix("2001:db8:2::/64")
+	pio := func(p netip.Prefix, valid time.Duration) Prefix {
+		return Prefix{Prefix: p, Preferred: now.Add(valid), Valid: now.Add(valid), Source: sourceRA}
+	}
+	have := mergePIOs(nil, raInfo{prefixes: []Prefix{pio(x, time.Minute)}}, now)
+	have = mergePIOs(have, raInfo{prefixes: []Prefix{pio(y, time.Minute)}}, now)
+	if len(have) != 2 || !have[0].Valid.Equal(now.Add(time.Minute)) || have[0].Preferred.After(now) {
+		t.Fatalf("x left out of the RA keeps its valid lifetime and is deprecated: %+v", have)
+	}
+	if got := mergePIOs(have, raInfo{prefixes: []Prefix{pio(x, 30*time.Second)}}, now)[0].Valid; !got.Equal(now.Add(time.Minute)) {
+		t.Fatalf("60 s left, 30 s received: kept, got %v", got.Sub(now))
+	}
+	long := []Prefix{pio(x, 150*time.Minute)}
+	if got := mergePIOs(long, raInfo{prefixes: []Prefix{pio(x, 10*time.Second)}}, now)[0].Valid; !got.Equal(now.Add(2 * time.Hour)) {
+		t.Fatalf("2h30 left, 10 s received: two hours, got %v", got.Sub(now))
+	}
+	if got := mergePIOs(long, raInfo{prefixes: []Prefix{pio(x, 3*time.Hour)}}, now)[0].Valid; !got.Equal(now.Add(3 * time.Hour)) {
+		t.Fatalf("longer is taken: %v", got.Sub(now))
+	}
+	w := mergePIOs([]Prefix{pio(x, time.Minute)}, raInfo{revoked: []netip.Prefix{x}}, now)[0]
+	if !w.Valid.Equal(now.Add(time.Minute)) || w.preferredLeft(now.Add(time.Millisecond)) != 0 {
+		t.Fatalf("valid 0 deprecates the prefix and keeps what is left: %+v", w)
+	}
+}
+
+// Each router gets a default route of its own, so one RA does not replace another router's route
+// (IPv6 Ready CE Router 1.3.10 and 1.3.13).
+func TestRouterMetrics(t *testing.T) {
+	a, b := netip.MustParseAddr("fe80::1"), netip.MustParseAddr("fe80::2")
+	c := &raClient{routers: map[netip.Addr]*routerInfo{}}
+	c.routers[a] = &routerInfo{metric: c.metricFor(a, ndp.Medium)}
+	c.routers[b] = &routerInfo{metric: c.metricFor(b, ndp.Medium)}
+	if c.routers[a].metric == c.routers[b].metric {
+		t.Fatalf("both at %d", c.routers[a].metric)
+	}
+	if m := c.metricFor(a, ndp.Medium); m != c.routers[a].metric {
+		t.Fatalf("a router keeps its metric: %d", m)
+	}
+	if m := c.metricFor(b, ndp.High); m >= routerMetric(ndp.Medium) {
+		t.Fatalf("a high preference comes first: %d", m)
+	}
+}
+
+// The link going down takes the default routers away but not their prefixes, so a modem
+// restarting does not renumber a LAN that shares the upstream /64.
+func TestRAClientKeepsPrefixesOverALinkDown(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	defer func() { dryRun = old }()
+	st := newStore("ra", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	ch := st.Subscribe()
+	recv(t, ch)
+	stable, _ := parseIIDPolicy("stable")
+	c := &raClient{ifname: "wan0", ifi: &net.Interface{Index: 2, Name: "wan0", MTU: 1500}, store: st, slaac: true, iid: stable, routers: map[netip.Addr]*routerInfo{}}
+	c.handle(&ndp.RouterAdvertisement{RouterLifetime: 30 * time.Minute,
+		Options: []ndp.Option{pio("2001:db8:0:1::/64", time.Hour, time.Hour, true, true)}}, netip.MustParseAddr("fe80::1"))
+	c.publish()
+	if s := recv(t, ch); len(s.LAN["lan0"]) != 1 || s.NoWANRouter {
+		t.Fatalf("up: %+v", s)
+	}
+	c.linkLost()
+	s := recv(t, ch)
+	if !s.NoWANRouter || len(s.LAN["lan0"]) != 1 || s.LAN["lan0"][0].Stale {
+		t.Fatalf("down: no default router, the prefix kept: %+v", s)
+	}
+}
+
+// The ULA prefixes the upstream advertises, on-link or as routes, reach the store, so that the
+// border lets them cross the WAN (RFC 4193 section 4.3).
+func TestRAClientReportsUpstreamULA(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	defer func() { dryRun = old }()
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	ch := st.Subscribe()
+	recv(t, ch)
+	stable, _ := parseIIDPolicy("stable")
+	c := &raClient{ifname: "wan0", ifi: &net.Interface{Index: 2, Name: "wan0", MTU: 1500}, store: st, slaac: true, iid: stable, routers: map[netip.Addr]*routerInfo{}}
+	c.handle(&ndp.RouterAdvertisement{RouterLifetime: 30 * time.Minute, Options: []ndp.Option{
+		pio("2001:db8:0:1::/64", time.Hour, time.Hour, true, true),
+		pio("fd00:1:2:3::/64", time.Hour, time.Hour, true, true),
+		&ndp.RouteInformation{PrefixLength: 48, RouteLifetime: time.Hour, Prefix: netip.MustParseAddr("fd00:9::")},
+	}}, netip.MustParseAddr("fe80::1"))
+	c.publish()
+	want := []netip.Prefix{netip.MustParsePrefix("fd00:1:2:3::/64"), netip.MustParsePrefix("fd00:9::/48")}
+	if s := recv(t, ch); !slices.Equal(s.UpstreamULA, want) {
+		t.Fatalf("got %v, want %v", s.UpstreamULA, want)
 	}
 }

@@ -383,7 +383,9 @@ func (m *addrManager) applyPrefixAddrs() {
 	now := time.Now()
 	want := map[netip.Addr]Prefix{}
 	for _, p := range m.pick(m.snap) {
-		if p.validLeft(now) == 0 {
+		// no address of the router's own in a prefix being withdrawn from the LAN, which after a
+		// restart would be a new one in a prefix that is gone
+		if p.validLeft(now) == 0 || p.Stale && m.side == sideLAN {
 			continue
 		}
 		for i, iid := range m.iids {
@@ -392,7 +394,7 @@ func (m *addrManager) applyPrefixAddrs() {
 	}
 	for a, p := range want {
 		pref, valid := p.preferredLeft(now), p.validLeft(now)
-		plen := m.plen(p.Prefix)
+		plen := m.plen(p)
 		_, had := m.applied[a]
 		if old, ok := m.plens[a]; ok && old != plen {
 			infof("[address %s] %s changes from /%d to /%d, re-adding it", m.ifname, a, old, plen)
@@ -423,7 +425,7 @@ func (m *addrManager) applyPrefixAddrs() {
 			infof("[address %s] removing %s", m.ifname, a)
 			plen, ok := m.plens[a]
 			if !ok {
-				plen = m.plen(p.Prefix)
+				plen = m.plen(p)
 			}
 			if err := addrDel(m.ifi.Index, a, plen); err != nil {
 				warnf("[address %s] failed to delete %s: %v", m.ifname, a, err)
@@ -511,9 +513,13 @@ outer:
 	return out
 }
 
-// plen picks the address prefix length according to the shared /64 layout.
-func (m *addrManager) plen(p netip.Prefix) int {
-	return m.layout.plen(m.side, m.snap.sharedWith(p))
+// plen picks the address prefix length according to the shared /64 layout. A WAN prefix the RA
+// says is not on-link takes a /128, so that no on-link route comes with it (RFC 5942 section 4).
+func (m *addrManager) plen(p Prefix) int {
+	if m.side == sideWAN && p.OffLink {
+		return 128
+	}
+	return m.layout.plen(m.side, m.snap.sharedWith(p.Prefix))
 }
 
 // activePrefixes returns this interface's prefixes still within their preferred lifetime.
@@ -559,7 +565,7 @@ func (m *addrManager) rotateFor(targets, active []Prefix) bool {
 		} else {
 			flags |= ifaFOptimistic
 		}
-		na := &tempAddr{addr: randomIID(p.Prefix), prefix: p.Prefix, plen: m.plen(p.Prefix), created: now, state: "preferred"}
+		na := &tempAddr{addr: randomIID(p.Prefix), prefix: p.Prefix, plen: m.plen(p), created: now, state: "preferred"}
 		pref := m.cfg.preferredLft
 		if left := p.preferredLeft(now); left < pref {
 			pref = left

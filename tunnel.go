@@ -335,23 +335,40 @@ func walkOptions(b []byte, fn func(code uint16, v []byte) error) error {
 	return nil
 }
 
-// resolveAFTR resolves the AFTR name to AAAA records; a failure is only logged, never fatal.
-func resolveAFTR(ctx context.Context, name string) []netip.Addr {
+// resolveAFTR resolves the AFTR name to AAAA records; a failure is only logged, never fatal. The
+// DNS servers the line hands out are asked first, as RFC 6334 means them to be: the system's
+// resolver may be an IPv4 one, unreachable until this very tunnel is up. The system's is the
+// fallback. A link-local server is reached through wan.
+func resolveAFTR(ctx context.Context, name string, servers []netip.Addr, wan string) []netip.Addr {
 	if name == "" {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip6", name)
-	if err != nil {
-		debugf("[tunnel-options] failed to resolve AFTR %s: %v", name, err)
-		return nil
+	resolvers := []*net.Resolver{}
+	for _, srv := range servers {
+		if srv.IsLinkLocalUnicast() {
+			srv = srv.WithZone(wan)
+		}
+		resolvers = append(resolvers, &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, netip.AddrPortFrom(srv, 53).String())
+		}})
 	}
-	var out []netip.Addr
-	for _, ip := range ips {
-		out = append(out, ip.Unmap())
+	resolvers = append(resolvers, net.DefaultResolver)
+	for _, r := range resolvers {
+		lctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		ips, err := r.LookupNetIP(lctx, "ip6", name)
+		cancel()
+		if err != nil {
+			debugf("[tunnel-options] failed to resolve AFTR %s: %v", name, err)
+			continue
+		}
+		var out []netip.Addr
+		for _, ip := range ips {
+			out = append(out, ip.Unmap())
+		}
+		return out
 	}
-	return out
+	return nil
 }
 
 // aftrResolver turns the DS-Lite AFTR name of DHCPv6 option 64 into addresses and feeds them back
@@ -360,6 +377,8 @@ func resolveAFTR(ctx context.Context, name string) []netip.Addr {
 // the loop so a new name is seen at once; a result of any lookup but the latest is dropped.
 type aftrResolver struct {
 	store  *Store
+	wan    string
+	dns    []netip.Addr // the upstream's DNS servers, asked first
 	retry  time.Duration
 	name   string
 	addrs  []netip.Addr
@@ -387,19 +406,20 @@ func (r *aftrResolver) run(ctx context.Context, ch <-chan Snapshot) {
 		lctx, cancel := context.WithCancel(ctx)
 		r.cancel = cancel
 		r.gen++
-		go func(gen int, name string) {
-			res := aftrResult{gen, name, resolveAFTR(lctx, name)}
+		go func(gen int, name string, dns []netip.Addr) {
+			res := aftrResult{gen, name, resolveAFTR(lctx, name, dns, r.wan)}
 			select {
 			case results <- res:
 			case <-lctx.Done():
 			}
-		}(r.gen, r.name)
+		}(r.gen, r.name, r.dns)
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case snap := <-ch:
+			r.dns = snap.DNS
 			name := ""
 			if snap.Tunnel != nil {
 				name = snap.Tunnel.AFTRName

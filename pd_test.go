@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -210,13 +211,34 @@ func TestServerDelegationDisabledOrEmpty(t *testing.T) {
 
 func TestPDLeaseFileRoundTrip(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "pd-leases.json")
-	p := newPDPool(60, file)
+	p := newPDPool(60, file, nil)
 	l := &PDLease{DUID: "00030001aabbcc000001", IAID: 7, Prefix: netip.MustParsePrefix("2001:db8:100:10::/60"), Iface: "lan0", Peer: peerLL, Expires: time.Now().Add(time.Hour).Round(time.Second)}
 	p.leases[leaseKey(l.DUID, l.IAID)] = l
 	p.save()
-	got := newPDPool(60, file).leases[leaseKey(l.DUID, l.IAID)]
+	got := newPDPool(60, file, nil).leases[leaseKey(l.DUID, l.IAID)]
 	if got == nil || got.Prefix != l.Prefix || got.Peer != l.Peer || !got.Expires.Equal(l.Expires) {
 		t.Fatalf("round trip lost the lease: %+v", got)
+	}
+}
+
+// The firewall learns the live delegations, on startup and on every change.
+func TestPDTellsTheFirewall(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "pd-leases.json")
+	fw := &firewall{delegIn: make(chan []netip.Prefix, 1)}
+	p := newPDPool(60, file, fw)
+	if ps := <-fw.delegIn; len(ps) != 0 {
+		t.Fatalf("no delegations yet, got %v", ps)
+	}
+	live := netip.MustParsePrefix("2001:db8:100:10::/60")
+	p.leases["a"] = &PDLease{Prefix: live, Expires: time.Now().Add(time.Hour)}
+	p.leases["b"] = &PDLease{Prefix: netip.MustParsePrefix("2001:db8:100:20::/60"), Expires: time.Now().Add(-time.Second)}
+	p.save()
+	if ps := <-fw.delegIn; !slices.Equal(ps, []netip.Prefix{live}) {
+		t.Fatalf("want only the live delegation, got %v", ps)
+	}
+	newPDPool(60, file, fw)
+	if ps := <-fw.delegIn; !slices.Equal(ps, []netip.Prefix{live}) {
+		t.Fatalf("reloaded: want %v, got %v", live, ps)
 	}
 }
 
@@ -230,7 +252,7 @@ func TestSixupBehindSixup(t *testing.T) {
 	defer func() { dryRun = old }()
 	up := newPDServer(false, pdSnap("2001:db8:100::/56"))
 
-	store := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, time.Second, nil, false, 0, 0)
+	store := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, time.Second, nil, false, 0, 0, "")
 	ch := store.Subscribe()
 	recv(t, ch)
 	down := &dhcpClient{ifi: &net.Interface{Index: 2}, store: store, pdLen: 56, duid: cliDUID, iaid: [4]byte{0, 0, 0, 7}}
@@ -273,5 +295,32 @@ func TestPDFree(t *testing.T) {
 	want := map[netip.Prefix]bool{netip.MustParsePrefix("2001:db8:100:1::/64"): true, netip.MustParsePrefix("2001:db8:100:2::/64"): true}
 	if len(got) != len(want) || !got[netip.MustParsePrefix("2001:db8:100:1::/64")] || !got[netip.MustParsePrefix("2001:db8:100:2::/64")] {
 		t.Fatalf("want %v, got %v", want, got)
+	}
+}
+
+// A router that accepts Reconfigure gets a key with its delegation, the same one as for its
+// addresses, so it can be told to renew when the delegation goes (RFC 9096 section 3.5).
+func TestDelegationCarriesTheReconfigureKey(t *testing.T) {
+	s := newPDServer(true, pdSnap("2001:db8:100::/56"))
+	accept := &dhcpv6.OptionGeneric{OptionCode: optionReconfAccept}
+	reply := s.handle(cliMsg(dhcpv6.MessageTypeRequest, dhcpv6.OptServerID(srvDUID), iana1(), iapd(hint(56)), accept), peerLL)
+	if reply.Options.GetOne(dhcpv6.OptionAuth) == nil {
+		t.Fatal("no Reconfigure key in the Reply")
+	}
+	var na, pd string
+	for _, l := range s.leases {
+		na = l.ReconfKey
+	}
+	for _, l := range s.pd.leases {
+		pd = l.ReconfKey
+	}
+	if na == "" || na != pd {
+		t.Fatalf("one key for addresses and delegations: %q %q", na, pd)
+	}
+
+	st := newPDServer(false, pdSnap("2001:db8:100::/56"))
+	reply = st.handle(cliMsg(dhcpv6.MessageTypeRequest, dhcpv6.OptServerID(srvDUID), iapd(hint(56)), accept), peerLL)
+	if reply.Options.GetOne(dhcpv6.OptionAuth) == nil {
+		t.Fatal("a stateless server gives a delegating router its key too")
 	}
 }

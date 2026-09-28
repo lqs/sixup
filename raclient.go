@@ -4,7 +4,10 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mdlayher/ndp"
@@ -25,6 +28,7 @@ type raClient struct {
 	secret []byte // RFC 7217 secret
 
 	routers     map[netip.Addr]*routerInfo
+	ppp         bool // the default route points at the point-to-point device, with no RA
 	started     bool
 	lastSet     map[netip.Prefix]bool // RA prefix set from the last publish, for change detection
 	lastOpenErr string
@@ -40,7 +44,33 @@ type routerInfo struct {
 	mtu      int
 	routes   map[netip.Prefix]time.Time
 	seen     time.Time
-	dhcp     bool // M or O set: the router says DHCPv6 is available
+	dhcp     bool   // M or O set: the router says DHCPv6 is available
+	gone     bool   // timed out as a default router; kept until its prefixes expire
+	metric   uint32 // of its default route, 0 while it has none
+}
+
+// metricFor gives each router a default route of its own: the metric of its preference, plus the
+// first offset no other router holds. With one metric for all, each RA would replace the last
+// router's route; this way they coexist, the kernel takes the lowest, and when that router's
+// lifetime ends the next one is already in place.
+func (c *raClient) metricFor(from netip.Addr, p ndp.Preference) uint32 {
+	for m := routerMetric(p); ; m++ {
+		taken := false
+		for a, r := range c.routers {
+			taken = taken || a != from && r.metric == m
+		}
+		if !taken {
+			return m
+		}
+	}
+}
+
+// dropDefault removes the router's default route, if it has one.
+func (c *raClient) dropDefault(addr netip.Addr, r *routerInfo) {
+	if r.metric != 0 {
+		routeDel(c.ifi.Index, netip.MustParsePrefix("::/0"), addr, r.metric)
+		r.metric = 0
+	}
 }
 
 func routerMetric(p ndp.Preference) uint32 {
@@ -59,13 +89,19 @@ func (c *raClient) run(ctx context.Context, hub *linkHub) {
 
 // serve runs on one interface instance; ctx is cancelled when the interface goes down or is recreated, and supervise reruns it.
 func (c *raClient) serve(ctx context.Context, ifi *net.Interface) {
+	old := c.ifi
 	c.ifi = ifi
 	// take over RA handling from the kernel so two implementations do not both configure the interface
 	sysctlSet(c.ifname, "accept_ra", "0")
 	sysctlSet(c.ifname, "autoconf", "0")
-	// a recreated interface has lost its routes and addresses; reset and tell downstream to revoke
-	c.routers = map[netip.Addr]*routerInfo{}
-	c.store.Set("ra", SourceUpdate{})
+	c.ppp = false
+	if old == nil || old.Index != ifi.Index {
+		// a recreated interface has lost its routes and addresses; reset and tell downstream to revoke
+		c.routers = map[netip.Addr]*routerInfo{}
+		c.store.Set("ra", SourceUpdate{NoRouter: true})
+	} else {
+		c.linkLost() // back up: the prefixes stay until their lifetimes end, the routers must speak again
+	}
 	conn, _, err := ndp.Listen(c.ifi, ndp.LinkLocal)
 	if err != nil {
 		// supervise retries every second; report each distinct error once
@@ -87,7 +123,7 @@ func (c *raClient) serve(ctx context.Context, ifi *net.Interface) {
 	msgs := make(chan raMsg, 8)
 	go func() {
 		for {
-			m, cm, from, err := conn.ReadFrom()
+			m, cm, from, err := readND(conn)
 			if err != nil {
 				return
 			}
@@ -106,14 +142,21 @@ func (c *raClient) serve(ctx context.Context, ifi *net.Interface) {
 	for {
 		select {
 		case <-ctx.Done():
+			// The link went down or away, taking the default route with it; the LAN is told now
+			// rather than when the link returns. On exit it is still up, and nothing is said.
+			if ifi, err := ifaceByName(c.ifname); err != nil || ifi.Flags&net.FlagUp == 0 {
+				c.linkLost()
+			}
 			return
 		case <-rsTimer.C:
-			if rsLeft == 0 && len(c.routers) == 0 {
+			if rsLeft == 0 && !c.hasRouter() {
 				// No RA after all RS: a point-to-point link like PPP needs no gateway address, so
-				// point the default route at the device. Ethernet has no such option and must wait
-				pppDefaultRoute(c.ifi)
+				// the default route points at the device. Ethernet has no such option and must wait,
+				// unless a default route is set up otherwise, which publish looks for
+				c.ppp = pppDefaultRoute(c.ifi)
+				c.publish()
 			}
-			if rsLeft > 0 && len(c.routers) == 0 {
+			if rsLeft > 0 && !c.hasRouter() {
 				rsLeft--
 				rs := &ndp.RouterSolicitation{Options: []ndp.Option{&ndp.LinkLayerAddress{Direction: ndp.Source, Addr: c.ifi.HardwareAddr}}}
 				if err := conn.WriteTo(rs, ifCM(c.ifi), allRouters2.WithZone(c.ifi.Name)); err != nil {
@@ -136,18 +179,54 @@ func (c *raClient) serve(ctx context.Context, ifi *net.Interface) {
 	}
 }
 
+// hasRouter reports whether a router has advertised itself since the link came up; the routers
+// kept from before only for their prefixes do not count, so the RS still go out.
+func (c *raClient) hasRouter() bool {
+	for _, r := range c.routers {
+		if !r.gone {
+			return true
+		}
+	}
+	return false
+}
+
+// linkLost handles the link going down: the default routes went with it, so no router is a default
+// router any more, but the prefixes they advertised keep their lifetimes (RFC 4862 section 5.5.3),
+// and a modem restarting does not renumber the LAN.
+func (c *raClient) linkLost() {
+	c.ppp = false
+	for _, r := range c.routers {
+		r.lifetime, r.metric, r.gone = time.Time{}, 0, true
+		deprecate(r.prefixes)
+	}
+	c.publish()
+}
+
+// deprecate keeps the prefixes of a router that went, but no longer prefers them: nothing should
+// start from them until it is back, which RAs then say.
+func deprecate(ps []Prefix) {
+	now := time.Now()
+	for i := range ps {
+		if ps[i].Preferred.After(now) {
+			ps[i].Preferred = now
+		}
+	}
+}
+
 // pppDefaultRoute adds a gateway-less default route on a point-to-point interface with a metric
-// above any RA route, so a later RA still wins. Only PPP-style single-peer links allow this.
-func pppDefaultRoute(ifi *net.Interface) {
+// above any RA route, so a later RA still wins. Only PPP-style single-peer links allow this, and
+// it reports whether the route is in place.
+func pppDefaultRoute(ifi *net.Interface) bool {
 	if ifi == nil || ifi.Flags&net.FlagPointToPoint == 0 {
-		return
+		return false
 	}
 	if err := routeSet(ifi.Index, netip.MustParsePrefix("::/0"), netip.Addr{}, 4096, 0); err != nil {
 		warnf("[ra-client] failed to set device default route on %s: %v", ifi.Name, err)
-		return
+		return false
 	}
 	infof("[ra-client] %s is point-to-point with no RA; default route points at the device (metric 4096, an RA takes over when it arrives)", ifi.Name)
 	statInc("ppp_default_route")
+	return true
 }
 
 type raMsg struct {
@@ -214,6 +293,9 @@ func parseRA(ra *ndp.RouterAdvertisement, now time.Time, ifMTU int, slaac, wanOn
 				info.revoked = append(info.revoked, pf)
 				continue
 			}
+			if opt.PreferredLifetime > opt.ValidLifetime {
+				continue // RFC 4862 section 5.5.3 c)
+			}
 			// A router with lifetime 0 is not a default router; RFC 4861 still allows its
 			// PIOs, but in practice that is a router shutting down, so do not adopt them.
 			if ra.RouterLifetime == 0 {
@@ -221,6 +303,7 @@ func parseRA(ra *ndp.RouterAdvertisement, now time.Time, ifMTU int, slaac, wanOn
 			}
 			p := Prefix{Prefix: pf, Preferred: now.Add(opt.PreferredLifetime), Valid: now.Add(opt.ValidLifetime), Source: "ra"}
 			p.SLAAC = opt.AutonomousAddressConfiguration && opt.PrefixLength == 64 && slaac
+			p.OffLink = !opt.OnLink
 			info.prefixes = append(info.prefixes, p)
 			if opt.OnLink && (opt.PrefixLength != 64 || wanOnLink) {
 				info.onLink[pf] = opt.ValidLifetime
@@ -252,6 +335,49 @@ func parseRA(ra *ndp.RouterAdvertisement, now time.Time, ifMTU int, slaac, wanOn
 	return info
 }
 
+// mergePIOs updates the prefixes a router advertises with one RA. A known prefix takes a shorter
+// valid lifetime only down to two hours, or not at all when less is left (RFC 4862 section 5.5.3
+// e), so that a forged RA cannot take it away. A prefix an RA with others leaves out keeps its
+// valid lifetime but is deprecated: an ISP that renumbers seldom withdraws the old prefix, and the
+// LAN sharing it would go on starting connections from addresses that no longer work.
+func mergePIOs(have []Prefix, info raInfo, now time.Time) []Prefix {
+	if len(info.prefixes) > 0 {
+		for i, h := range have {
+			if !slices.ContainsFunc(info.prefixes, func(p Prefix) bool { return p.Prefix == h.Prefix }) && h.Preferred.After(now) {
+				have[i].Preferred = now
+			}
+		}
+	}
+	valid := func(old time.Time, vl time.Duration) time.Time {
+		switch {
+		case vl > 2*time.Hour || now.Add(vl).After(old):
+			return now.Add(vl)
+		case old.Sub(now) <= 2*time.Hour:
+			return old
+		}
+		return now.Add(2 * time.Hour)
+	}
+	for _, p := range info.prefixes {
+		i := slices.IndexFunc(have, func(h Prefix) bool { return h.Prefix == p.Prefix })
+		if i < 0 {
+			have = append(have, p)
+			continue
+		}
+		p.Valid = valid(have[i].Valid, p.Valid.Sub(now))
+		if p.Preferred.After(p.Valid) {
+			p.Preferred = p.Valid
+		}
+		have[i] = p
+	}
+	for _, pf := range info.revoked {
+		if i := slices.IndexFunc(have, func(h Prefix) bool { return h.Prefix == pf }); i >= 0 {
+			have[i].Valid = valid(have[i].Valid, 0)
+			have[i].Preferred = now
+		}
+	}
+	return have
+}
+
 func (c *raClient) handle(ra *ndp.RouterAdvertisement, from netip.Addr) {
 	now := time.Now()
 	statInc("ra_recv")
@@ -263,11 +389,16 @@ func (c *raClient) handle(ra *ndp.RouterAdvertisement, from netip.Addr) {
 		infof("[ra-client] discovered router %s", from)
 	}
 	r.seen = now
+	r.gone = false
 	r.pref = ra.RouterSelectionPreference
 	r.dhcp = ra.ManagedConfiguration || ra.OtherConfiguration
 	if ra.RouterLifetime > 0 {
 		r.lifetime = now.Add(ra.RouterLifetime)
-		if err := routeSet(c.ifi.Index, netip.MustParsePrefix("::/0"), from, routerMetric(r.pref), ra.RouterLifetime); err != nil {
+		if m := c.metricFor(from, r.pref); m != r.metric {
+			c.dropDefault(from, r)
+			r.metric = m
+		}
+		if err := routeSet(c.ifi.Index, netip.MustParsePrefix("::/0"), from, r.metric, ra.RouterLifetime); err != nil {
 			errorf("[ra-client] failed to set default route: %v", err)
 		}
 	} else {
@@ -275,7 +406,7 @@ func (c *raClient) handle(ra *ndp.RouterAdvertisement, from netip.Addr) {
 			warnf("[ra-client] router %s lifetime went to zero, withdrawing default route and prefixes", from)
 		}
 		r.lifetime = time.Time{}
-		routeDel(c.ifi.Index, netip.MustParsePrefix("::/0"), from, routerMetric(r.pref))
+		c.dropDefault(from, r)
 		r.prefixes = nil
 	}
 	// The first RA wakes the DHCPv6 client; it decides what to do from the M/O bits.
@@ -320,25 +451,51 @@ func (c *raClient) handle(ra *ndp.RouterAdvertisement, from netip.Addr) {
 		}
 	}
 	if ra.RouterLifetime > 0 {
-		r.prefixes = info.prefixes
+		r.prefixes = mergePIOs(r.prefixes, info, now)
 	}
 	if ra.CurrentHopLimit > 0 {
 		sysctlSet(c.ifname, "hop_limit", strconv.Itoa(int(ra.CurrentHopLimit)))
+	}
+	// With accept_ra off the kernel leaves these to us (RFC 4861 section 6.3.4)
+	for key, v := range map[string]time.Duration{"base_reachable_time_ms": ra.ReachableTime, "retrans_time_ms": ra.RetransmitTimer} {
+		if v > 0 {
+			if err := sysctlWrite(filepath.Join("/proc/sys/net/ipv6/neigh", strings.ReplaceAll(c.ifname, ".", "/"), key), strconv.FormatInt(v.Milliseconds(), 10)); err != nil {
+				debugf("[ra-client] setting %s: %v", key, err)
+			}
+		}
 	}
 }
 
 // publish merges all routers' state, picking options from the highest preference, and writes it to the Store.
 func (c *raClient) publish() {
 	now := time.Now()
-	var upd SourceUpdate
+	upd := SourceUpdate{NoRouter: !c.ppp}
 	best := ndp.Preference(-10)
 	seen := map[netip.Prefix]bool{}
 	for addr, r := range c.routers {
 		if !r.lifetime.IsZero() && now.After(r.lifetime) {
 			warnf("[ra-client] router %s timed out", addr)
-			routeDel(c.ifi.Index, netip.MustParsePrefix("::/0"), addr, routerMetric(r.pref))
-			delete(c.routers, addr)
+			c.dropDefault(addr, r)
+			r.lifetime, r.gone = time.Time{}, true
+			deprecate(r.prefixes)
+		}
+		// A router's prefixes outlive its role as default router (RFC 4862 section 5.5.3)
+		r.prefixes = slices.DeleteFunc(r.prefixes, func(p Prefix) bool { return now.After(p.Valid) })
+		if r.gone {
+			if len(r.prefixes) == 0 {
+				delete(c.routers, addr)
+				continue
+			}
+			for _, p := range r.prefixes {
+				if !seen[p.Prefix] {
+					seen[p.Prefix] = true
+					upd.Prefixes = append(upd.Prefixes, p)
+				}
+			}
 			continue
+		}
+		if !r.lifetime.IsZero() {
+			upd.NoRouter = false
 		}
 		for _, p := range r.prefixes {
 			if now.After(p.Valid) || seen[p.Prefix] {
@@ -353,6 +510,25 @@ func (c *raClient) publish() {
 			upd.DNS, upd.DNSSL, upd.PREF64 = r.dns, r.dnssl, r.pref64
 			upd.MTU = r.mtu
 		}
+	}
+	ula := netip.MustParsePrefix("fc00::/7")
+	for _, r := range c.routers {
+		for _, p := range r.prefixes {
+			if ula.Overlaps(p.Prefix) && now.Before(p.Valid) {
+				upd.ULA = append(upd.ULA, p.Prefix)
+			}
+		}
+		for pf, until := range r.routes {
+			if ula.Overlaps(pf) && now.Before(until) {
+				upd.ULA = append(upd.ULA, pf)
+			}
+		}
+	}
+	upd.ULA = disjoint(upd.ULA)
+	// no RA router, but a default route set up otherwise, by hand where the upstream sends no RA:
+	// that is a default router too (RFC 7084 G-4 asks for none on the WAN)
+	if upd.NoRouter && c.ifi != nil && defaultRouteVia(c.ifi.Index) {
+		upd.NoRouter = false
 	}
 	// without an MTU option the WAN path MTU is the interface MTU (ppp0 under PPPoE is usually 1492)
 	if upd.MTU == 0 && c.ifi != nil {

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"net"
 	"net/netip"
 	"testing"
 	"time"
@@ -130,4 +131,33 @@ func TestRoutePrefixDeleteAgainstKernel(t *testing.T) {
 	if err := prefixRouteDel(1, dst); err != nil {
 		t.Fatalf("deleting a route already gone is no error: %v", err)
 	}
+}
+
+// A default route through the WAN counts as a default router, whoever set it up, so a line without
+// RA and with a route configured by hand keeps the LAN's default router (RFC 7084 G-4).
+func TestRouteDefaultVia(t *testing.T) {
+	enterNetNS(t)
+	openTun(t, "wan-test0", netip.MustParsePrefix("2001:db8:f::/48"))
+	ifi := mustIface(t, "wan-test0")
+	if defaultRouteVia(ifi) {
+		t.Fatal("no default route yet")
+	}
+	if err := routeSet(ifi, netip.MustParsePrefix("::/0"), netip.Addr{}, 1024, 0); err != nil {
+		t.Fatal(err)
+	}
+	if !defaultRouteVia(ifi) {
+		t.Fatal("the default route through the WAN is seen")
+	}
+	if defaultRouteVia(ifi + 100) {
+		t.Fatal("not through another interface")
+	}
+}
+
+func mustIface(t *testing.T, name string) int {
+	t.Helper()
+	ifi, err := net.InterfaceByName(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ifi.Index
 }

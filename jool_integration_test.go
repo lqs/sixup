@@ -87,7 +87,7 @@ func TestJoolNamespaceAgainstKernel(t *testing.T) {
 	}
 	srv.Close()
 	cli.Close()
-	st := newStore("pd", nil, time.Second, nil, false, 0, 0)
+	st := newStore("pd", nil, time.Second, nil, false, 0, 0, "")
 	ch := st.Subscribe()
 	recv(t, ch)
 	again := &joolManager{prefix: nat64WKP, link: link, store: st}

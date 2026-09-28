@@ -5,7 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/md5"
 	crand "crypto/rand"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"math/rand/v2"
@@ -13,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,7 +27,7 @@ var (
 	renParams = retransParams{irt: 10 * time.Second, mrt: 600 * time.Second}
 	rebParams = retransParams{irt: 10 * time.Second, mrt: 600 * time.Second}
 	infParams = retransParams{irt: time.Second, mrt: 3600 * time.Second}
-	relParams = retransParams{irt: time.Second, mrc: 4}
+	relParams = retransParams{irt: time.Second, mrc: 5}
 )
 
 // clientMode is what -dhcp6c-mode selects: auto follows the M and O bits of the upstream RA.
@@ -310,14 +310,17 @@ func padMAC(hw net.HardwareAddr) []byte {
 	return b
 }
 
-// iaidFor uses the last 4 MAC bytes as IAID; interfaces without MAC (ppp) use the index.
+// iaidFor uses the last 4 MAC bytes as IAID. An interface without a MAC, such as ppp0, takes the
+// first 4 bytes of the MD5 of its name, as OpenWrt's odhcp6c does: the index would change with
+// every redial, and with it the prefix (RFC 9096 WPD-10).
 func iaidFor(ifi *net.Interface) [4]byte {
 	var id [4]byte
 	if len(ifi.HardwareAddr) >= 4 {
 		copy(id[:], padMAC(ifi.HardwareAddr))
 		return id
 	}
-	binary.BigEndian.PutUint32(id[:], uint32(ifi.Index))
+	sum := md5.Sum([]byte(ifi.Name))
+	copy(id[:], sum[:4])
 	return id
 }
 
@@ -349,6 +352,36 @@ func (c *dhcpClient) waitLinkUp(ctx context.Context) {
 			return
 		case <-time.After(2 * time.Second):
 		}
+	}
+}
+
+// rejoinParams are Confirm's, which RFC 8415 section 18.2.12 gives the Rebind after a link change.
+var rejoinParams = retransParams{irt: time.Second, mrt: 4 * time.Second}
+
+// rejoin keeps the binding while the link is down, and confirms it with a Rebind once the link is
+// back (RFC 8415 section 18.2.12), so that a modem restarting does not renumber the LAN. Without a
+// Reply within 10 s the binding is kept as it was. It returns the binding, or nil once it is gone:
+// it expired while the link was down, the server took it back, or ctx ended.
+func (c *dhcpClient) rejoin(ctx context.Context, l *lease) *lease {
+	for {
+		infof("[dhcpv6-client] link down, keeping the binding until %s", l.valid.Format(time.TimeOnly))
+		wctx, cancel := context.WithDeadline(ctx, l.valid)
+		c.waitLinkUp(wctx)
+		cancel()
+		if !c.linkUp || ctx.Err() != nil {
+			return nil
+		}
+		reply, err := c.renewOrRebind(ctx, dhcpv6.MessageTypeRebind, rejoinParams, 10*time.Second, l)
+		switch {
+		case err == nil:
+			return c.apply(reply)
+		case errors.Is(err, errLinkDown):
+			continue
+		case errors.Is(err, errTimeout):
+			infof("[dhcpv6-client] link back, no server answered the Rebind, keeping the binding")
+			return l
+		}
+		return nil
 	}
 }
 
@@ -422,8 +455,13 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 			}
 			return
 		case "down":
-			c.clearLease()
-			return
+			if lease = c.rejoin(ctx, lease); lease == nil {
+				if ctx.Err() == nil {
+					c.clearLease()
+				}
+				return
+			}
+			continue
 		}
 		mrd := time.Until(lease.t2)
 		if mrd < time.Second {
@@ -443,9 +481,17 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 			c.clearLease()
 			return
 		}
-		if errors.Is(err, errLinkDown) || ctx.Err() != nil {
-			c.clearLease()
+		if ctx.Err() != nil {
 			return
+		}
+		if errors.Is(err, errLinkDown) {
+			if lease = c.rejoin(ctx, lease); lease == nil {
+				if ctx.Err() == nil {
+					c.clearLease()
+				}
+				return
+			}
+			continue
 		}
 		mrd = time.Until(lease.valid)
 		if mrd < time.Second {
@@ -598,7 +644,8 @@ func (c *dhcpClient) baseOptions(elapsed time.Duration) []dhcpv6.Modifier {
 		dhcpv6.WithRequestedOptions(
 			dhcpv6.OptionDNSRecursiveNameServer, dhcpv6.OptionDomainSearchList,
 			dhcpv6.OptionAFTRName, dhcpv6.OptionS46ContMapE, dhcpv6.OptionS46ContMapT, dhcpv6.OptionS46ContLW,
-			dhcpv6.OptionSolMaxRT, dhcpv6.OptionInfMaxRT,
+			dhcpv6.OptionSolMaxRT, dhcpv6.OptionInfMaxRT, dhcpv6.OptionInformationRefreshTime,
+			dhcpv6.OptionNTPServer, dhcpv6.OptionSNTPServerList, dhcpv6.OptionPDExclude,
 		),
 	}
 	return mods
@@ -646,7 +693,7 @@ func (c *dhcpClient) solicit(ctx context.Context) (*dhcpv6.Message, error) {
 		m.TransactionID = tid
 		return m
 	}, func(m *dhcpv6.Message) (bool, bool) {
-		if m.MessageType != dhcpv6.MessageTypeAdvertise {
+		if m.MessageType != dhcpv6.MessageTypeAdvertise || !c.forUs(m) {
 			return false, false
 		}
 		if st := m.Options.Status(); st != nil && st.StatusCode != iana.StatusSuccess {
@@ -754,13 +801,19 @@ func (c *dhcpClient) request(ctx context.Context, adv *dhcpv6.Message) (*dhcpv6.
 		}
 		return m
 	}, func(m *dhcpv6.Message) (bool, bool) {
-		if m.MessageType != dhcpv6.MessageTypeReply {
+		if m.MessageType != dhcpv6.MessageTypeReply || !c.forUs(m) || !m.Options.ServerID().Equal(c.serverID) {
 			return false, false
 		}
 		reply = m
 		return true, true
 	})
 	return reply, err
+}
+
+// forUs reports whether a server's message names a server and this client, as RFC 8415 section
+// 16.3 and 16.10 require of an Advertise and a Reply.
+func (c *dhcpClient) forUs(m *dhcpv6.Message) bool {
+	return m.Options.ServerID() != nil && m.Options.ClientID() != nil && m.Options.ClientID().Equal(c.duid)
 }
 
 func (c *dhcpClient) renewOrRebind(ctx context.Context, mt dhcpv6.MessageType, p retransParams, mrd time.Duration, l *lease) (*dhcpv6.Message, error) {
@@ -777,10 +830,10 @@ func (c *dhcpClient) renewOrRebind(ctx context.Context, mt dhcpv6.MessageType, p
 		m.TransactionID = tid
 		return m
 	}, func(m *dhcpv6.Message) (bool, bool) {
-		if m.MessageType != dhcpv6.MessageTypeReply {
+		if m.MessageType != dhcpv6.MessageTypeReply || !c.forUs(m) {
 			return false, false
 		}
-		if mt == dhcpv6.MessageTypeRenew && (m.Options.ServerID() == nil || !m.Options.ServerID().Equal(c.serverID)) {
+		if mt == dhcpv6.MessageTypeRenew && !m.Options.ServerID().Equal(c.serverID) {
 			return false, false
 		}
 		if st := m.Options.Status(); st != nil && st.StatusCode != iana.StatusSuccess {
@@ -855,7 +908,8 @@ func (c *dhcpClient) exchange(ctx context.Context, mt dhcpv6.MessageType, p retr
 		if p.mrc > 0 && count >= p.mrc {
 			return errTimeout
 		}
-		elapsed := time.Since(begin)
+		// the option counts hundredths of a second in 16 bits and stays at 0xffff past that (RFC 8415 section 21.9)
+		elapsed := min(time.Since(begin), 0xffff*10*time.Millisecond)
 		if count == 0 {
 			elapsed = 0
 		}
@@ -897,7 +951,8 @@ func (c *dhcpClient) exchange(ctx context.Context, mt dhcpv6.MessageType, p retr
 					continue
 				}
 				matched = true
-				if done {
+				// past the first RT, the first Advertise is taken at once (RFC 8415 section 18.2.1)
+				if done || mt == dhcpv6.MessageTypeSolicit && count > 0 {
 					timer.Stop()
 					return nil
 				}
@@ -951,6 +1006,11 @@ func (c *dhcpClient) parseCommon(reply *dhcpv6.Message) SourceUpdate {
 	if dl := reply.Options.DomainSearchList(); dl != nil {
 		upd.DNSSL = dl.Labels
 	}
+	for _, ip := range append(reply.Options.NTPServers(), reply.Options.SNTP()...) {
+		if a, ok := netip.AddrFromSlice(ip); ok && !slices.Contains(upd.NTP, a.Unmap()) {
+			upd.NTP = append(upd.NTP, a.Unmap())
+		}
+	}
 	if o := reply.Options.GetOne(dhcpv6.OptionSolMaxRT); o != nil {
 		if b := o.ToBytes(); len(b) == 4 {
 			v := time.Duration(uint32(b[0])<<24|uint32(b[1])<<16|uint32(b[2])<<8|uint32(b[3])) * time.Second
@@ -977,6 +1037,26 @@ func (c *dhcpClient) parseCommon(reply *dhcpv6.Message) SourceUpdate {
 	return upd
 }
 
+// parsePDExclude reads OPTION_PD_EXCLUDE (RFC 6603 section 4.2): the length of the excluded prefix,
+// then the bits of it that follow the delegated prefix, left-aligned.
+func parsePDExclude(pd netip.Prefix, b []byte) (netip.Prefix, bool) {
+	if len(b) < 2 {
+		return netip.Prefix{}, false
+	}
+	plen, n := int(b[0]), int(b[0])-pd.Bits()
+	if n <= 0 || plen > 128 || len(b)-1 < (n+7)/8 {
+		return netip.Prefix{}, false
+	}
+	a := pd.Masked().Addr().As16()
+	for i := range n {
+		if b[1+i/8]&(0x80>>(i%8)) != 0 {
+			bit := pd.Bits() + i
+			a[bit/8] |= 0x80 >> (bit % 8)
+		}
+	}
+	return netip.PrefixFrom(netip.AddrFrom16(a), plen), true
+}
+
 // apply handles a REPLY: extracts prefixes and addresses, configures the WAN address, publishes to the Store.
 // Returns nil when there is no usable binding and a new SOLICIT is needed.
 func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
@@ -993,9 +1073,16 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 		}
 		return cur
 	}
+	// An IA whose T1 is past its T2, and a lease preferred longer than it is valid, are invalid
+	// (RFC 8415 sections 18.2.10.1, 21.6 and 21.22)
+	badT := func(t1, t2 time.Duration) bool { return t1 > 0 && t2 > 0 && t1 > t2 }
 	for _, ia := range reply.Options.IAPD() {
 		if st := ia.Options.Status(); st != nil && st.StatusCode != iana.StatusSuccess {
 			warnf("[dhcpv6-client] IA_PD status %s: %s", st.StatusCode, st.StatusMessage)
+			continue
+		}
+		if badT(ia.T1, ia.T2) {
+			warnf("[dhcpv6-client] IA_PD with T1 %s past T2 %s ignored", ia.T1, ia.T2)
 			continue
 		}
 		t1, t2 = pickT(t1, ia.T1), pickT(t2, ia.T2)
@@ -1004,13 +1091,24 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 				infof("[dhcpv6-client] prefix %v lifetime=0, withdrawn", p.Prefix)
 				continue
 			}
+			if p.PreferredLifetime > p.ValidLifetime {
+				warnf("[dhcpv6-client] prefix %v preferred longer than valid, ignored", p.Prefix)
+				continue
+			}
 			addr, ok := netip.AddrFromSlice(p.Prefix.IP)
 			if !ok {
 				continue
 			}
 			ones, _ := p.Prefix.Mask.Size()
 			pf := netip.PrefixFrom(addr.Unmap(), ones).Masked()
-			l.prefixes = append(l.prefixes, Prefix{Prefix: pf, Preferred: now.Add(p.PreferredLifetime), Valid: now.Add(p.ValidLifetime), Source: "pd"})
+			np := Prefix{Prefix: pf, Preferred: now.Add(p.PreferredLifetime), Valid: now.Add(p.ValidLifetime), Source: "pd"}
+			if o := p.Options.GetOne(dhcpv6.OptionPDExclude); o != nil {
+				if ex, ok := parsePDExclude(pf, o.ToBytes()); ok {
+					np.Exclude = ex
+					infof("[dhcpv6-client] %s is kept for the WAN link (RFC 6603 Prefix Exclude)", ex)
+				}
+			}
+			l.prefixes = append(l.prefixes, np)
 			minPref = pickT(minPref, p.PreferredLifetime)
 			if p.ValidLifetime > maxValid {
 				maxValid = p.ValidLifetime
@@ -1022,10 +1120,14 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 			warnf("[dhcpv6-client] IA_NA status %s: %s", st.StatusCode, st.StatusMessage)
 			continue
 		}
+		if badT(ia.T1, ia.T2) {
+			warnf("[dhcpv6-client] IA_NA with T1 %s past T2 %s ignored", ia.T1, ia.T2)
+			continue
+		}
 		t1, t2 = pickT(t1, ia.T1), pickT(t2, ia.T2)
 		for _, a := range ia.Options.Addresses() {
 			addr, ok := netip.AddrFromSlice(a.IPv6Addr)
-			if !ok || a.ValidLifetime == 0 {
+			if !ok || a.ValidLifetime == 0 || a.PreferredLifetime > a.ValidLifetime {
 				continue
 			}
 			addr = addr.Unmap()

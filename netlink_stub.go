@@ -71,7 +71,9 @@ func sysctlWrite(path, val string) error {
 	return skipOrUnsupported(fmt.Sprintf("sysctl %s=%s", path, val))
 }
 func sysctlGet(string, string) (string, error)                            { return "", errUnsupported }
+func localListeners(byte, netip.Addr) (map[uint16]bool, error)            { return nil, errUnsupported }
 func sockDiagInUse(netip.Addr) (int, error)                               { return 0, errUnsupported }
+func defaultRouteVia(int) bool                                            { return false }
 func conntrackInUse(netip.Addr) (int, error)                              { return 0, errConntrackUnavailable }
 func ifaceByName(name string) (*net.Interface, error)                     { return net.InterfaceByName(name) }
 func setAllMulti(name string) error                                       { return skipOrUnsupported("allmulti " + name) }

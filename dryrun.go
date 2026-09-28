@@ -17,6 +17,7 @@ type dryOpts struct {
 	wan, stateDir, tunDev string
 	dhcpMode              clientMode
 	upRA, wantNA          bool
+	infoOnly              bool // -wan-prefix: the client asks only for DNS and the like
 	pdLen, tunMTU         int
 	metric4               uint32
 	iid                   iidPolicy
@@ -34,6 +35,7 @@ func runDry(ctx context.Context, store *Store, hub *linkHub, pkts *packetHub, o 
 	if o.dhcpMode != clientOff {
 		dhcp = newDHCPClient(o.wan, store, o.stateDir, o.pdLen, o.wantNA)
 		dhcp.link = hub.Subscribe(o.wan)
+		dhcp.infoOnly = o.infoOnly
 		go dhcp.run(ctx, o.dhcpMode == clientAuto && o.upRA)
 	}
 	if o.upRA {
@@ -43,7 +45,7 @@ func runDry(ctx context.Context, store *Store, hub *linkHub, pkts *packetHub, o 
 	// Capture tunnel traffic as usual: when DHCPv6 sends no tunnel option this is the only way to learn the BR, the local address and the IPv4.
 	go (&tunnelWatcher{ifname: o.wan, store: store, pkts: pkts, maxRun: 2 * time.Minute}).run(ctx, store.Subscribe())
 	// Name resolution changes nothing on the system, and without it a DS-Lite report has no remote endpoint.
-	go (&aftrResolver{store: store}).run(ctx, store.Subscribe())
+	go (&aftrResolver{store: store, wan: o.wan}).run(ctx, store.Subscribe())
 	var deadline <-chan time.Time
 	if o.timeout > 0 {
 		deadline = time.After(o.timeout)

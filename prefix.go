@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"cmp"
+	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"net/netip"
 	"os"
@@ -22,7 +26,14 @@ const (
 	sourcePD  prefixSource = "pd"  // DHCPv6 prefix delegation
 	sourceRA  prefixSource = "ra"  // an on-link prefix from the upstream Router Advertisement
 	sourceULA prefixSource = "ula" // generated here, never routed by the ISP
+	// -wan-prefix, for an upstream whose prefix neither RA nor DHCPv6-PD tells. Its prefixes take
+	// the source they stand for: a /64 that of an RA, shared with the LAN; a shorter one that of a
+	// delegation
+	sourceStatic prefixSource = "static"
 )
+
+// staticLifetime is what the prefixes of -wan-prefix are given, renewed well before it runs out.
+const staticLifetime = 7 * 24 * time.Hour
 
 // changeKind is the strongest thing that happened to the prefix set, which decides whether
 // consumers redo their work now or wait for the settle period.
@@ -42,6 +53,14 @@ type Prefix struct {
 	Source     prefixSource `json:"source"`
 	Deprecated bool         `json:"deprecated,omitempty"`
 	SLAAC      bool         `json:"slaac,omitempty"` // upstream RA had the A bit set; SLAAC is possible on the WAN
+	// Stale marks a withdrawn prefix, advertised with lifetimes 0 until Valid so that hosts drop
+	// its addresses (RFC 9096 section 3.5).
+	Stale bool `json:"stale,omitempty"`
+	// OffLink marks an upstream RA prefix with the L flag clear: addresses in it are not on-link.
+	OffLink bool `json:"off_link,omitempty"`
+	// Exclude is the part of a delegation the ISP keeps for the WAN link (RFC 6603), which goes
+	// neither to a LAN nor to a downstream router.
+	Exclude netip.Prefix `json:"exclude,omitzero"`
 }
 
 func (p Prefix) preferredLeft(now time.Time) time.Duration {
@@ -63,11 +82,14 @@ type SourceUpdate struct {
 	Prefixes []Prefix
 	DNS      []netip.Addr
 	DNSSL    []string
-	PREF64   netip.Prefix  // NAT64 prefix from the upstream RA (RFC 8781); zero when absent
-	MTU      int           // WAN path MTU: the RA MTU option, else the WAN interface MTU
-	WANAddr  netip.Addr    // WAN address from IA_NA or SLAAC
-	Tunnel   *TunnelParams // set only by the pd source
-	DHCPv6   bool          // ra source only: a router set M or O, so a DHCPv6 answer is worth waiting for
+	NTP      []netip.Addr   // NTP and SNTP servers from DHCPv6, passed on to the LAN (RFC 7084 L-12)
+	PREF64   netip.Prefix   // NAT64 prefix from the upstream RA (RFC 8781); zero when absent
+	MTU      int            // WAN path MTU: the RA MTU option, else the WAN interface MTU
+	WANAddr  netip.Addr     // WAN address from IA_NA or SLAAC
+	Tunnel   *TunnelParams  // set only by the pd source
+	DHCPv6   bool           // ra source only: a router set M or O, so a DHCPv6 answer is worth waiting for
+	NoRouter bool           // ra source only: the WAN has no default router
+	ULA      []netip.Prefix // ra source only: ULA prefixes the upstream advertises, on-link or as routes
 }
 
 // Snapshot is the consistent view handed to every consumer.
@@ -80,6 +102,7 @@ type Snapshot struct {
 	LAN     map[string][]Prefix `json:"lan_prefixes"`
 	DNS     []netip.Addr        `json:"dns"`
 	DNSSL   []string            `json:"dnssl"`
+	NTP     []netip.Addr        `json:"ntp,omitempty"`
 	PREF64  netip.Prefix        `json:"pref64,omitempty"`
 	WANMTU  int                 `json:"wan_mtu,omitempty"` // drives both the downstream RA MTU option and the tunnel MTU
 	WANAddr netip.Addr          `json:"wan_addr"`
@@ -89,6 +112,12 @@ type Snapshot struct {
 	// one made now might need another prefix length a moment later.
 	PDPending bool         `json:"pd_pending,omitempty"`
 	NAT64     netip.Prefix `json:"nat64,omitzero"` // the prefix this router's Jool translates, while it does
+	// The WAN has lost its default router, or never had one, so the LAN must not use this router
+	// as its default (RFC 7084 G-4 and G-5).
+	NoWANRouter bool `json:"no_wan_router,omitempty"`
+	// ULA prefixes the upstream RA advertises, which make the WAN link part of the same site: they
+	// may cross the WAN (RFC 4193 section 4.3)
+	UpstreamULA []netip.Prefix `json:"upstream_ula,omitempty"`
 }
 
 // wanSLAAC returns the SLAAC-capable /64s from the upstream RA, including deprecated ones so addresses can be retired.
@@ -139,12 +168,29 @@ type Store struct {
 	subs      []chan Snapshot
 	// Settle period: at startup RA, PD, Information-Request and capture results arrive one by one;
 	// publishing each would burst RAs repeatedly. Revocations skip the wait.
-	settle    time.Duration
-	pending   changeKind // strongest change type accumulated during the settle period
-	pubTimer  <-chan time.Time
-	shortWarn string                      // last reported set of LAN segments left without a prefix
-	revoked   map[netip.Prefix]revokedLAN // LAN prefixes in their deprecate period
-	revokedW  map[netip.Prefix]Prefix
+	settle      time.Duration
+	pending     changeKind // strongest change type accumulated during the settle period
+	pubTimer    <-chan time.Time
+	shortWarn   string                      // last reported set of LAN segments left without a prefix
+	excludeWarn string                      // likewise for segments on the part the ISP excludes
+	revoked     map[netip.Prefix]revokedLAN // LAN prefixes in their deprecate period
+	revokedW    map[netip.Prefix]Prefix
+	// The LAN prefixes are recorded here, so that those gone after a restart are still withdrawn
+	// (RFC 9096 section 3.5).
+	file     string
+	saved    []byte
+	previous []advertisedPrefix // recorded before the restart, until the line hands out prefixes
+}
+
+// wanRevokeHold is how long a WAN prefix that went stays in the snapshot, deprecated, for the WAN
+// addresses in it to be retired.
+const wanRevokeHold = 10 * time.Minute
+
+// advertisedPrefix is one LAN prefix as recorded in the file.
+type advertisedPrefix struct {
+	Iface  string       `json:"iface"`
+	Prefix netip.Prefix `json:"prefix"`
+	Valid  time.Time    `json:"valid_until"`
 }
 
 type revokedLAN struct {
@@ -157,7 +203,7 @@ type lanDef struct {
 	index int // subnet number used when carving a /64 out of the PD
 }
 
-func newStore(prefer prefixSource, lans []lanDef, hold time.Duration, ula []netip.Prefix, mapeRule bool, pdGrace, settle time.Duration) *Store {
+func newStore(prefer prefixSource, lans []lanDef, hold time.Duration, ula []netip.Prefix, mapeRule bool, pdGrace, settle time.Duration, file string) *Store {
 	s := &Store{
 		ula:       ula,
 		mapeRule:  mapeRule,
@@ -176,11 +222,13 @@ func newStore(prefer prefixSource, lans []lanDef, hold time.Duration, ula []neti
 		sources:   map[prefixSource]SourceUpdate{},
 		revoked:   map[netip.Prefix]revokedLAN{},
 		revokedW:  map[netip.Prefix]Prefix{},
+		file:      file,
 	}
 	s.cur.LAN = map[string][]Prefix{}
 	if pdGrace > 0 && prefer == "pd" {
 		s.pdGrace = time.Now().Add(pdGrace)
 	}
+	s.loadAdvertised()
 	if len(ula) > 0 {
 		// ULA needs no source, so compute it now so the first snapshot carries it
 		s.recompute(time.Now())
@@ -301,9 +349,9 @@ func (s *Store) nextExpiry() <-chan time.Time {
 }
 
 func (s *Store) pickSource() (prefixSource, SourceUpdate) {
-	order := []prefixSource{sourcePD, sourceRA}
+	order := []prefixSource{sourceStatic, sourcePD, sourceRA}
 	if s.prefer == "ra" {
-		order = []prefixSource{sourceRA, sourcePD}
+		order = []prefixSource{sourceStatic, sourceRA, sourcePD}
 	}
 	_, pdConcluded := s.sources[sourcePD]
 	for _, name := range order {
@@ -334,10 +382,14 @@ func (s *Store) recompute(now time.Time) {
 		LAN:     map[string][]Prefix{},
 		DNS:     u.DNS,
 		DNSSL:   u.DNSSL,
+		NTP:     u.NTP,
 		PREF64:  u.PREF64,
 		NAT64:   s.nat64,
 		WANMTU:  u.MTU,
 		WANAddr: u.WANAddr,
+		// no RA source means the RA is not listened to, and the default route is not its to decide
+		NoWANRouter: s.sources[sourceRA].NoRouter,
+		UpstreamULA: s.sources[sourceRA].ULA,
 	}
 	// Prefixes and DNS often come from different sources (RA gives the /64, Information-Request gives DNS), so fill gaps from the other one
 	for _, name := range []prefixSource{sourcePD, sourceRA} {
@@ -350,6 +402,9 @@ func (s *Store) recompute(now time.Time) {
 			}
 			if len(next.DNSSL) == 0 {
 				next.DNSSL = o.DNSSL
+			}
+			if len(next.NTP) == 0 {
+				next.NTP = o.NTP
 			}
 			if !next.PREF64.IsValid() {
 				next.PREF64 = o.PREF64
@@ -431,6 +486,7 @@ func (s *Store) recompute(now time.Time) {
 	active := map[netip.Prefix]bool{}
 	activeW := map[netip.Prefix]bool{}
 	var short []shortPrefix
+	var excluded []string
 	addWAN := func(p Prefix) (Prefix, bool) {
 		if p.validLeft(now) == 0 {
 			return p, false
@@ -454,6 +510,17 @@ func (s *Store) recompute(now time.Time) {
 				short = append(short, shortPrefix{p.Prefix, l})
 				continue
 			}
+			if p.Exclude.IsValid() && p.Exclude.Overlaps(sub) {
+				// The ISP keeps this subnet for the WAN link (RFC 6603); rather than leave the
+				// segment without a prefix, it takes the highest one no other segment names
+				alt, ok := s.spareSubnet(p)
+				if !ok {
+					excluded = append(excluded, fmt.Sprintf("%s(subnet %d, %s, none left to take)", l.iface, l.index, sub))
+					continue
+				}
+				excluded = append(excluded, fmt.Sprintf("%s(subnet %d, %s, using %s instead)", l.iface, l.index, sub, alt))
+				sub = alt
+			}
 			lp := p
 			lp.Prefix = sub
 			next.LAN[l.iface] = append(next.LAN[l.iface], lp)
@@ -466,7 +533,10 @@ func (s *Store) recompute(now time.Time) {
 	// the WAN SLAAC address and show whether a delegated /64 is the on-link one.
 	if src != sourceRA || len(u.Prefixes) == 0 {
 		for _, p := range s.sources[sourceRA].Prefixes {
-			addWAN(p)
+			// a /64 of -wan-prefix stands for this same RA prefix; one delegated is another thing
+			if !slices.ContainsFunc(next.WAN, func(w Prefix) bool { return w.Prefix == p.Prefix && w.Source == p.Source }) {
+				addWAN(p)
+			}
 		}
 	}
 
@@ -484,9 +554,35 @@ func (s *Store) recompute(now time.Time) {
 	}
 
 	s.warnShort(short)
+	if key := strings.Join(excluded, " "); key != s.excludeWarn {
+		s.excludeWarn = key
+		if key != "" {
+			warnf("[prefix-store] the ISP keeps that part of the delegation for the WAN link (RFC 6603), so these segments take another subnet: %s. Give them a subnet number of their own to choose it", key)
+		}
+	}
 
 	// diff against the previous snapshot; revoked prefixes enter the deprecate period
 	change := changeNone
+	// After a restart, the prefixes advertised before it that the line did not hand out again are
+	// withdrawn, as soon as it hands out any; withdrawn earlier, a prefix that comes back would
+	// have been taken from the hosts for nothing.
+	if s.previous != nil && len(u.Prefixes) > 0 {
+		for _, a := range s.previous {
+			if active[a.Prefix] || !slices.ContainsFunc(s.lans, func(l lanDef) bool { return l.iface == a.Iface }) {
+				continue
+			}
+			until := now.Add(s.hold)
+			if a.Valid.Before(until) {
+				until = a.Valid
+			}
+			if until.After(now) {
+				change = changeRevoke
+				s.revoked[a.Prefix] = revokedLAN{a.Iface, Prefix{Prefix: a.Prefix, Preferred: now, Valid: until, Source: sourcePD, Deprecated: true, Stale: true}}
+				infof("[prefix-store] %s on %s was advertised before the restart, advertising lifetimes 0 until %s", a.Prefix, a.Iface, until.Format(time.TimeOnly))
+			}
+		}
+		s.previous = nil
+	}
 	for iface, olds := range s.cur.LAN {
 		for _, op := range olds {
 			if active[op.Prefix] || op.Deprecated {
@@ -497,19 +593,20 @@ func (s *Store) recompute(now time.Time) {
 			if op.Valid.Before(hold) {
 				hold = op.Valid
 			}
-			s.revoked[op.Prefix] = revokedLAN{iface, Prefix{Prefix: op.Prefix, Preferred: now, Valid: hold, Source: op.Source, Deprecated: true}}
-			infof("[prefix-store] %s on %s revoked, advertising preferred=0 until %s", iface, op.Prefix, hold.Format(time.TimeOnly))
+			s.revoked[op.Prefix] = revokedLAN{iface, Prefix{Prefix: op.Prefix, Preferred: now, Valid: hold, Source: op.Source, Deprecated: true, Stale: true}}
+			infof("[prefix-store] %s on %s revoked, advertising lifetimes 0 until %s", op.Prefix, iface, hold.Format(time.TimeOnly))
 		}
 	}
 	for _, op := range s.cur.WAN {
 		if activeW[op.Prefix] || op.Deprecated {
 			continue
 		}
-		hold := now.Add(s.hold)
+		hold := now.Add(wanRevokeHold)
 		if op.Valid.Before(hold) {
 			hold = op.Valid
 		}
-		s.revokedW[op.Prefix] = Prefix{Prefix: op.Prefix, Preferred: now, Valid: hold, Source: op.Source, Deprecated: true}
+		// SLAAC and OffLink stay, so the WAN address in it is retired over the hold, not removed
+		s.revokedW[op.Prefix] = Prefix{Prefix: op.Prefix, Preferred: now, Valid: hold, Source: op.Source, Deprecated: true, Stale: true, SLAAC: op.SLAAC, OffLink: op.OffLink}
 	}
 	for k, r := range s.revoked {
 		if !now.Before(r.p.Valid) {
@@ -580,13 +677,18 @@ func (s *Store) recompute(now time.Time) {
 		if change == changeNone && !slices.Equal(s.cur.DNS, next.DNS) {
 			change = changeRenew
 		}
-		if change == changeNone && !slices.Equal(s.cur.DNSSL, next.DNSSL) {
+		if change == changeNone && (!slices.Equal(s.cur.DNSSL, next.DNSSL) || !slices.Equal(s.cur.NTP, next.NTP)) {
 			change = changeRenew
 		}
 		if change == changeNone && (s.cur.PREF64 != next.PREF64 || s.cur.NAT64 != next.NAT64 || s.cur.WANMTU != next.WANMTU) {
 			change = changeRenew
 		}
+		if change == changeNone && (s.cur.NoWANRouter != next.NoWANRouter || !slices.Equal(s.cur.UpstreamULA, next.UpstreamULA)) {
+			change = changeRenew
+		}
 	}
+	// The LAN learns at once that the default router went, or came back (RFC 7084 G-5)
+	routerChanged := s.cur.NoWANRouter != next.NoWANRouter
 	next.Change = change
 	s.cur = next
 	if change == changeNone {
@@ -596,7 +698,7 @@ func (s *Store) recompute(now time.Time) {
 	if changeRank(change) > changeRank(s.pending) {
 		s.pending = change
 	}
-	if s.settle == 0 || change == changeRevoke {
+	if s.settle == 0 || change == changeRevoke || routerChanged {
 		s.publish()
 		return
 	}
@@ -612,6 +714,7 @@ func (s *Store) publish() {
 		s.cur.Change = s.pending
 	}
 	s.pending = ""
+	s.saveAdvertised()
 	for _, ch := range s.subs {
 		select {
 		case <-ch:
@@ -619,6 +722,55 @@ func (s *Store) publish() {
 		}
 		ch <- s.cur
 	}
+}
+
+// loadAdvertised reads the LAN prefixes recorded before a restart.
+func (s *Store) loadAdvertised() {
+	if s.file == "" {
+		return
+	}
+	b, err := os.ReadFile(s.file)
+	if err != nil {
+		return
+	}
+	if err := json.Unmarshal(b, &s.previous); err != nil {
+		warnf("[prefix-store] %s is corrupt, ignoring: %v", s.file, err)
+		return
+	}
+	s.saved = b
+}
+
+// saveAdvertised records the LAN prefixes other than the ULA, when they changed. The record from
+// before a restart is kept until it has been compared with what the line hands out.
+func (s *Store) saveAdvertised() {
+	if s.file == "" || s.previous != nil {
+		return
+	}
+	list := []advertisedPrefix{}
+	for iface, ps := range s.cur.LAN {
+		for _, p := range ps {
+			if p.Source != sourceULA {
+				list = append(list, advertisedPrefix{iface, p.Prefix, p.Valid})
+			}
+		}
+	}
+	slices.SortFunc(list, func(a, b advertisedPrefix) int {
+		return cmp.Or(strings.Compare(a.Iface, b.Iface), a.Prefix.Addr().Compare(b.Prefix.Addr()))
+	})
+	b, _ := json.MarshalIndent(list, "", "  ")
+	if bytes.Equal(b, s.saved) {
+		return
+	}
+	tmp := s.file + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		warnf("[prefix-store] cannot record the LAN prefixes: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, s.file); err != nil {
+		warnf("[prefix-store] cannot record the LAN prefixes: %v", err)
+		return
+	}
+	s.saved = b
 }
 
 func changeRank(c changeKind) int {
@@ -664,6 +816,22 @@ func (s *Store) warnShort(short []shortPrefix) {
 }
 
 // splitLAN carves the index-th /64 out of a PD prefix; a /64 only allows index 0.
+// spareSubnet returns the highest /64 of p that no LAN segment names and the ISP does not exclude.
+func (s *Store) spareSubnet(p Prefix) (netip.Prefix, bool) {
+	if p.Prefix.Bits() > 64 {
+		return netip.Prefix{}, false
+	}
+	for i := (1 << min(64-p.Prefix.Bits(), 16)) - 1; i >= 0; i-- {
+		if slices.ContainsFunc(s.lans, func(l lanDef) bool { return l.index == i }) {
+			continue
+		}
+		if sub, ok := splitLAN(p.Prefix, i); ok && !p.Exclude.Overlaps(sub) {
+			return sub, true
+		}
+	}
+	return netip.Prefix{}, false
+}
+
 func splitLAN(p netip.Prefix, index int) (netip.Prefix, bool) {
 	bits := p.Bits()
 	if bits > 64 || index < 0 {
@@ -819,6 +987,46 @@ func loadULA(stateDir, spec string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
+// parseWANPrefix reads -wan-prefix: comma-separated global prefixes of /64 or shorter.
+func parseWANPrefix(spec string) ([]netip.Prefix, error) {
+	var out []netip.Prefix
+	for f := range strings.SplitSeq(spec, ",") {
+		if f = strings.TrimSpace(f); f == "" {
+			continue
+		}
+		pf, err := netip.ParsePrefix(f)
+		if err != nil || !pf.Addr().Is6() || pf.Addr().Is4In6() || pf.Bits() > 64 || !pf.Addr().IsGlobalUnicast() || netip.MustParsePrefix("fc00::/7").Contains(pf.Addr()) {
+			return nil, fmt.Errorf("%q is not a global IPv6 prefix of /64 or shorter", f)
+		}
+		out = append(out, pf.Masked())
+	}
+	return out, nil
+}
+
+// keepStatic hands the store the prefixes of -wan-prefix, again every day so that they never run
+// out: a /64 as an RA's on-link prefix, which the LAN shares (RFC 7278), with SLAAC on the WAN
+// as slaac says; a shorter one as a delegation.
+func keepStatic(ctx context.Context, store *Store, ps []netip.Prefix, slaac bool) {
+	for {
+		now := time.Now()
+		var upd SourceUpdate
+		for _, p := range ps {
+			src := sourcePD
+			if p.Bits() == 64 {
+				src = sourceRA
+			}
+			upd.Prefixes = append(upd.Prefixes, Prefix{Prefix: p, Preferred: now.Add(staticLifetime), Valid: now.Add(staticLifetime),
+				Source: src, SLAAC: slaac && src == sourceRA})
+		}
+		store.Set(sourceStatic, upd)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(24 * time.Hour):
+		}
+	}
+}
+
 // describe compresses the snapshot into one log line: prefixes with remaining lifetimes, LAN split, WAN address, DNS, tunnel source.
 func (s Snapshot) describe(now time.Time) string {
 	var parts []string
@@ -902,6 +1110,20 @@ func routableDNS(in []netip.Addr) []netip.Addr {
 	for _, a := range in {
 		if !a.IsLinkLocalUnicast() {
 			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// disjoint sorts the prefixes and drops those inside another, which an interval set refuses.
+func disjoint(ps []netip.Prefix) []netip.Prefix {
+	slices.SortFunc(ps, func(a, b netip.Prefix) int {
+		return cmp.Or(a.Masked().Addr().Compare(b.Masked().Addr()), a.Bits()-b.Bits())
+	})
+	var out []netip.Prefix
+	for _, p := range ps {
+		if len(out) == 0 || !out[len(out)-1].Contains(p.Addr()) {
+			out = append(out, p.Masked())
 		}
 	}
 	return out

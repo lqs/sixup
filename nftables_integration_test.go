@@ -10,11 +10,13 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+	"github.com/google/nftables/userdata"
 	"golang.org/x/sys/unix"
 )
 
@@ -84,6 +86,7 @@ func TestNATAgainstKernel(t *testing.T) {
 	if n := len(rulesIn(t, c, "forward")); n != 2 {
 		t.Fatalf("the MSS clamp should be one rule per direction, got %d", n)
 	}
+	countedAndCommented(t, append(post, rulesIn(t, c, "forward")...))
 
 	// A renumbering rewrites the set; the old ranges must not survive it
 	m.apply(mapeSnapshot(0x57))
@@ -222,8 +225,13 @@ func openTun(t *testing.T, name string, dst netip.Prefix) *os.File {
 	return f
 }
 
-// syn builds an IPv4 TCP SYN from src to dst, with an MSS option unless mss is 0.
+// syn builds an IPv4 TCP SYN from src port 40000 to dst port 80, with an MSS option unless mss is 0.
 func syn(src, dst netip.Addr, mss uint16) []byte {
+	return synPorts(netip.AddrPortFrom(src, 40000), netip.AddrPortFrom(dst, 80), mss)
+}
+
+func synPorts(from, to netip.AddrPort, mss uint16) []byte {
+	src, dst := from.Addr(), to.Addr()
 	opts := 0
 	if mss > 0 {
 		opts = 4
@@ -243,19 +251,36 @@ func syn(src, dst netip.Addr, mss uint16) []byte {
 	}
 	binary.BigEndian.PutUint16(p[10:], ^uint16(sum))
 	tcp := p[20:]
-	binary.BigEndian.PutUint16(tcp[0:], 40000)
-	binary.BigEndian.PutUint16(tcp[2:], 80)
+	binary.BigEndian.PutUint16(tcp[0:], from.Port())
+	binary.BigEndian.PutUint16(tcp[2:], to.Port())
 	tcp[12], tcp[13] = byte((20+opts)/4)<<4, 0x02
 	if mss > 0 {
 		tcp[20], tcp[21] = 2, 4
 		binary.BigEndian.PutUint16(tcp[22:], mss)
 	}
+	// conntrack marks a segment with a bad checksum invalid, and NAT leaves it alone
+	pseudo := append(append(append([]byte{}, s4[:]...), d4[:]...), 0, unix.IPPROTO_TCP, 0, byte(len(tcp)))
+	binary.BigEndian.PutUint16(tcp[16:], ^checksum(append(pseudo, tcp...)))
 	return p
 }
 
-// forwardedMSS sends a SYN in through in and returns the MSS option of what comes out of out, or
-// 0 when the SYN carries none.
-func forwardedMSS(t *testing.T, in, out *os.File, pkt []byte) uint16 {
+// checksum is the ones' complement sum of b in 16-bit words, not yet inverted.
+func checksum(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(b[i:]))
+	}
+	if len(b)%2 == 1 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum > 0xffff {
+		sum = sum>>16 + sum&0xffff
+	}
+	return uint16(sum)
+}
+
+// forward sends a TCP packet in through in and returns what comes out of out.
+func forward(t *testing.T, in, out *os.File, pkt []byte) []byte {
 	t.Helper()
 	if _, err := in.Write(pkt); err != nil {
 		t.Fatalf("inject: %v", err)
@@ -265,18 +290,31 @@ func forwardedMSS(t *testing.T, in, out *os.File, pkt []byte) uint16 {
 	for {
 		n, err := out.Read(buf)
 		if err != nil {
-			t.Fatalf("the SYN was not forwarded: %v", err)
+			t.Fatalf("the packet was not forwarded: %v", err)
 		}
-		p := buf[:n]
-		if n < 40 || p[0]>>4 != 4 || p[9] != unix.IPPROTO_TCP {
-			continue // the kernel's own traffic on the device
+		if p := buf[:n]; n >= 40 && p[0]>>4 == 4 && p[9] == unix.IPPROTO_TCP {
+			return p
 		}
-		tcp := p[20:]
-		if tcp[12]>>4 == 5 {
-			return 0
-		}
-		return binary.BigEndian.Uint16(tcp[22:])
+		// otherwise the kernel's own traffic on the device
 	}
+}
+
+// forwardedMSS sends a SYN in through in and returns the MSS option of what comes out of out, or
+// 0 when the SYN carries none.
+func forwardedMSS(t *testing.T, in, out *os.File, pkt []byte) uint16 {
+	t.Helper()
+	tcp := forward(t, in, out, pkt)[20:]
+	if tcp[12]>>4 == 5 {
+		return 0
+	}
+	return binary.BigEndian.Uint16(tcp[22:])
+}
+
+// endpoints reads the source and destination of a forwarded IPv4 TCP packet.
+func endpoints(p []byte) (src, dst netip.AddrPort) {
+	s, _ := netip.AddrFromSlice(p[12:16])
+	d, _ := netip.AddrFromSlice(p[16:20])
+	return netip.AddrPortFrom(s, binary.BigEndian.Uint16(p[20:])), netip.AddrPortFrom(d, binary.BigEndian.Uint16(p[22:]))
 }
 
 // The clamp lowers the MSS of a SYN leaving through the tunnel and of one arriving from it. The
@@ -308,6 +346,79 @@ func TestMSSClampAgainstKernel(t *testing.T) {
 	for _, c := range cases {
 		if got := forwardedMSS(t, c.in, c.out, syn(c.src, c.dst, c.mss)); got != c.want {
 			t.Errorf("%s: MSS %d came out as %d, want %d", c.name, c.mss, got, c.want)
+		}
+	}
+}
+
+// A PCP mapping forwards new flows arriving through the tunnel for its external port to the LAN
+// host, and sends the host's flows from the mapped port out through the external one.
+func TestPCPMappingAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	host, far := netip.MustParseAddr("192.0.2.10"), netip.MustParseAddr("198.51.100.20")
+	lanDev := openTun(t, "lan-test0", netip.MustParsePrefix("192.0.2.0/24"))
+	tunDev := openTun(t, "sixup-test0", netip.MustParsePrefix("198.51.100.0/24"))
+	ipv4 := netip.MustParseAddr("203.0.113.9")
+	m := &natManager{dev: "sixup-test0", mtu: 1460, warned: true, mapIn: make(chan []portMapping, 1)}
+	t.Cleanup(m.remove)
+	m.mappings = []portMapping{{proto: unix.IPPROTO_TCP, internal: netip.AddrPortFrom(host, 8080), external: 9090}}
+	m.apply(Snapshot{Tunnel: &TunnelParams{
+		Kind: "4in6", Local: netip.MustParseAddr("2001:db8::1"), Remote: netip.MustParseAddr("2001:db8::2"), IPv4: ipv4,
+	}})
+
+	src, dst := endpoints(forward(t, tunDev, lanDev, synPorts(netip.AddrPortFrom(far, 40000), netip.AddrPortFrom(ipv4, 9090), 0)))
+	if src != netip.AddrPortFrom(far, 40000) {
+		t.Fatalf("a flow from outside keeps its source, got %s", src)
+	}
+	if dst != netip.AddrPortFrom(host, 8080) {
+		t.Fatalf("inbound to %s:9090 should reach %s:8080, went to %s", ipv4, host, dst)
+	}
+	src, _ = endpoints(forward(t, lanDev, tunDev, synPorts(netip.AddrPortFrom(host, 8080), netip.AddrPortFrom(far, 443), 0)))
+	if src != netip.AddrPortFrom(ipv4, 9090) {
+		t.Fatalf("the host's own flow from 8080 should leave as %s:9090, left as %s", ipv4, src)
+	}
+	src, _ = endpoints(forward(t, lanDev, tunDev, synPorts(netip.AddrPortFrom(host, 8081), netip.AddrPortFrom(far, 443), 0)))
+	if src.Addr() != ipv4 || src.Port() == 9090 {
+		t.Fatalf("an unmapped port is translated as before, left as %s", src)
+	}
+	// A neighbour on the LAN reaching the host by the public address: translated to the host, and
+	// masqueraded so the host answers through the router, which masquerade needs an address for
+	if err := addr4Set("lan-test0", netip.MustParsePrefix("192.0.2.1/32")); err != nil {
+		t.Fatal(err)
+	}
+	neighbour := netip.AddrPortFrom(netip.MustParseAddr("192.0.2.20"), 5555)
+	src, dst = endpoints(forward(t, lanDev, lanDev, synPorts(neighbour, netip.AddrPortFrom(ipv4, 9090), 0)))
+	if dst != netip.AddrPortFrom(host, 8080) || src.Addr() != netip.MustParseAddr("192.0.2.1") {
+		t.Fatalf("hairpin: want %s:8080 from the router, got %s from %s", host, dst, src)
+	}
+	// The neighbour going to the host's own address was never translated and keeps its source
+	src, _ = endpoints(forward(t, lanDev, lanDev, synPorts(netip.AddrPortFrom(neighbour.Addr(), 5556), netip.AddrPortFrom(host, 8080), 0)))
+	if src != netip.AddrPortFrom(neighbour.Addr(), 5556) {
+		t.Fatalf("a flow to the host itself must keep its source, got %s", src)
+	}
+
+	c, err := nftables.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pre := rulesIn(t, c, "prerouting")
+	countedAndCommented(t, pre)
+	for _, e := range pre[0].Exprs {
+		if ctr, ok := e.(*expr.Counter); ok && ctr.Packets != 2 {
+			t.Fatalf("the DNAT rule took the SYN from outside and the hairpinned one, its counter says %d", ctr.Packets)
+		}
+	}
+}
+
+// countedAndCommented checks that every rule read back from the kernel counts its packets and
+// says what it is for, which is what makes nft list ruleset readable.
+func countedAndCommented(t *testing.T, rules []*nftables.Rule) {
+	t.Helper()
+	for i, r := range rules {
+		if _, ok := firstOf[*expr.Counter](r); !ok {
+			t.Errorf("rule %d has no counter", i)
+		}
+		if c, ok := userdata.GetString(r.UserData, userdata.TypeComment); !ok || !strings.HasPrefix(c, "sixup: ") {
+			t.Errorf("rule %d has no comment: %q", i, c)
 		}
 	}
 }

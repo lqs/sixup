@@ -68,10 +68,14 @@ type dhcpServer struct {
 	dns       lanDNS
 	pd        *pdPool // downstream prefix delegation; nil when disabled
 
-	mu     sync.Mutex
-	snap   Snapshot
-	leases map[string]*Lease
+	mu       sync.Mutex
+	snap     Snapshot
+	leases   map[string]*Lease
+	declined map[netip.Addr]time.Time // addresses a client found in use, kept out of the pool until then
 }
+
+// declineHold is how long a declined address stays out of the pool (RFC 8415 section 18.3.8).
+const declineHold = time.Hour
 
 func leaseKey(duid string, iaid uint32) string { return fmt.Sprintf("%s/%d", duid, iaid) }
 
@@ -100,7 +104,7 @@ func (s *dhcpServer) serve(ctx context.Context, ch <-chan Snapshot) {
 		errorf("[dhcpv6-server %s] join ff02::1:2 failed: %v", s.ifname, err)
 		return
 	}
-	pc.SetControlMessage(ipv6.FlagInterface, true)
+	pc.SetControlMessage(ipv6.FlagInterface|ipv6.FlagDst, true)
 	s.mu.Lock()
 	s.pc = pc
 	s.mu.Unlock()
@@ -149,7 +153,13 @@ func (s *dhcpServer) reader(pc *ipv6.PacketConn) {
 			continue
 		}
 		peer, _ := netip.AddrFromSlice(udp.IP)
-		if resp := s.handle(msg, peer.Unmap()); resp != nil {
+		var resp *dhcpv6.Message
+		if cm.Dst != nil && !cm.Dst.IsMulticast() {
+			resp = s.unicast(msg) // told to use multicast, and nothing done for it
+		} else {
+			resp = s.handle(msg, peer.Unmap())
+		}
+		if resp != nil {
 			if _, err := pc.WriteTo(resp.ToBytes(), &ipv6.ControlMessage{IfIndex: s.ifi.Index}, udp); err != nil {
 				debugf("[dhcpv6-server %s] send failed: %v", s.ifname, err)
 			}
@@ -179,21 +189,47 @@ func (s *dhcpServer) activePrefix() (Prefix, bool) {
 	return Prefix{}, false
 }
 
+// unicast answers a message sent to this server's unicast address, which it never offers with the
+// Server Unicast option. Those that go to every server are dropped; the others are told to use
+// multicast (RFC 8415 sections 16 and 18.4).
+func (s *dhcpServer) unicast(msg *dhcpv6.Message) *dhcpv6.Message {
+	switch msg.MessageType {
+	case dhcpv6.MessageTypeRequest, dhcpv6.MessageTypeRenew, dhcpv6.MessageTypeRelease, dhcpv6.MessageTypeDecline:
+	default:
+		return nil
+	}
+	cid, sid := msg.Options.ClientID(), msg.Options.ServerID()
+	if cid == nil || sid == nil || !sid.Equal(s.duid) {
+		return nil
+	}
+	resp, _ := dhcpv6.NewMessage()
+	resp.MessageType = dhcpv6.MessageTypeReply
+	resp.TransactionID = msg.TransactionID
+	resp.AddOption(dhcpv6.OptServerID(s.duid))
+	resp.AddOption(dhcpv6.OptClientID(cid))
+	resp.AddOption(&dhcpv6.OptStatusCode{StatusCode: iana.StatusUseMulticast, StatusMessage: "use multicast"})
+	return resp
+}
+
 func (s *dhcpServer) handle(msg *dhcpv6.Message, peer netip.Addr) *dhcpv6.Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cid := msg.Options.ClientID()
-	if cid == nil {
-		return nil
-	}
 	sid := msg.Options.ServerID()
+	// The validation of RFC 8415 section 16: a Client ID in all but an Information-Request, no
+	// Server ID in what goes to every server, this server's in what goes to one, and no IA in an
+	// Information-Request
 	switch msg.MessageType {
-	case dhcpv6.MessageTypeSolicit, dhcpv6.MessageTypeRebind, dhcpv6.MessageTypeConfirm, dhcpv6.MessageTypeInformationRequest:
-		if sid != nil && !sid.Equal(s.duid) {
+	case dhcpv6.MessageTypeInformationRequest:
+		if sid != nil && !sid.Equal(s.duid) || len(msg.Options.IANA()) > 0 || len(msg.Options.IAPD()) > 0 {
+			return nil
+		}
+	case dhcpv6.MessageTypeSolicit, dhcpv6.MessageTypeRebind, dhcpv6.MessageTypeConfirm:
+		if cid == nil || sid != nil {
 			return nil
 		}
 	default:
-		if sid == nil || !sid.Equal(s.duid) {
+		if cid == nil || sid == nil || !sid.Equal(s.duid) {
 			return nil
 		}
 	}
@@ -201,8 +237,13 @@ func (s *dhcpServer) handle(msg *dhcpv6.Message, peer netip.Addr) *dhcpv6.Messag
 	resp.MessageType = dhcpv6.MessageTypeReply
 	resp.TransactionID = msg.TransactionID
 	resp.AddOption(dhcpv6.OptServerID(s.duid))
-	resp.AddOption(dhcpv6.OptClientID(cid))
+	if cid != nil {
+		resp.AddOption(dhcpv6.OptClientID(cid))
+	}
 	s.addInfo(resp)
+	if cid == nil {
+		return resp // an anonymous Information-Request
+	}
 	duidHex := hex.EncodeToString(cid.ToBytes())
 	wantsReconf := msg.Options.GetOne(optionReconfAccept) != nil
 
@@ -211,7 +252,10 @@ func (s *dhcpServer) handle(msg *dhcpv6.Message, peer netip.Addr) *dhcpv6.Messag
 		return resp
 	case dhcpv6.MessageTypeSolicit:
 		if len(msg.Options.IANA()) == 0 && len(msg.Options.IAPD()) == 0 {
-			return nil
+			// nothing to assign, but the client still learns the options (RFC 8415 section 18.3.9)
+			resp.MessageType = dhcpv6.MessageTypeAdvertise
+			resp.AddOption(&dhcpv6.OptStatusCode{StatusCode: iana.StatusNoAddrsAvail, StatusMessage: "no IA requested"})
+			return resp
 		}
 		// Stateless mode commits nothing for addresses, so it answers with an ADVERTISE
 		rapid := s.stateful && msg.Options.GetOne(dhcpv6.OptionRapidCommit) != nil
@@ -226,9 +270,10 @@ func (s *dhcpServer) handle(msg *dhcpv6.Message, peer netip.Addr) *dhcpv6.Messag
 		s.addIAs(resp, msg, duidHex, cid, peer, true, wantsReconf)
 		return resp
 	case dhcpv6.MessageTypeConfirm:
-		onlink := true
+		onlink, seen := true, false
 		for _, ia := range msg.Options.IANA() {
 			for _, a := range ia.Options.Addresses() {
+				seen = true
 				addr, ok := netip.AddrFromSlice(a.IPv6Addr)
 				if !ok {
 					continue
@@ -238,6 +283,9 @@ func (s *dhcpServer) handle(msg *dhcpv6.Message, peer netip.Addr) *dhcpv6.Messag
 				}
 			}
 		}
+		if !seen {
+			return nil // nothing to confirm, and no Reply (RFC 8415 section 18.3.3)
+		}
 		st := &dhcpv6.OptStatusCode{StatusCode: iana.StatusSuccess, StatusMessage: "all addresses on link"}
 		if !onlink {
 			st = &dhcpv6.OptStatusCode{StatusCode: iana.StatusNotOnLink, StatusMessage: "prefix changed"}
@@ -245,11 +293,33 @@ func (s *dhcpServer) handle(msg *dhcpv6.Message, peer netip.Addr) *dhcpv6.Messag
 		resp.AddOption(st)
 		return resp
 	case dhcpv6.MessageTypeRelease, dhcpv6.MessageTypeDecline:
+		// an IA this server holds nothing for is answered with NoBinding (RFC 8415 section 18.3.7)
 		for _, ia := range msg.Options.IANA() {
-			delete(s.leases, leaseKey(duidHex, binary.BigEndian.Uint32(ia.IaId[:])))
+			key := leaseKey(duidHex, binary.BigEndian.Uint32(ia.IaId[:]))
+			// only the client's own address is kept out, so no client can lock others away
+			if l := s.leases[key]; l != nil && msg.MessageType == dhcpv6.MessageTypeDecline {
+				for _, a := range ia.Options.Addresses() {
+					if addr, ok := netip.AddrFromSlice(a.IPv6Addr); ok && addr.Unmap() == l.Addr {
+						if s.declined == nil {
+							s.declined = map[netip.Addr]time.Time{}
+						}
+						s.declined[l.Addr] = time.Now().Add(declineHold)
+					}
+				}
+			}
+			if _, ok := s.leases[key]; !ok {
+				resp.AddOption(s.iaStatus(ia.IaId, iana.StatusNoBinding, "no binding"))
+			}
+			delete(s.leases, key)
 		}
 		for _, ia := range msg.Options.IAPD() {
-			s.undelegate(leaseKey(duidHex, binary.BigEndian.Uint32(ia.IaId[:])))
+			key := leaseKey(duidHex, binary.BigEndian.Uint32(ia.IaId[:]))
+			if s.pd == nil || !s.pd.has(key) {
+				pd := &dhcpv6.OptIAPD{IaId: ia.IaId}
+				pd.Options.Add(&dhcpv6.OptStatusCode{StatusCode: iana.StatusNoBinding, StatusMessage: "no binding"})
+				resp.AddOption(pd)
+			}
+			s.undelegate(key)
 		}
 		resp.AddOption(&dhcpv6.OptStatusCode{StatusCode: iana.StatusSuccess, StatusMessage: "released"})
 		s.saveLeases()
@@ -268,12 +338,12 @@ func (s *dhcpServer) addIAs(resp, msg *dhcpv6.Message, duidHex string, cid dhcpv
 		resp.AddOption(s.assign(duidHex, ia, cid, peer, msg, commit, wantsReconf))
 	}
 	for _, ia := range msg.Options.IAPD() {
-		resp.AddOption(s.delegate(duidHex, ia, peer, commit))
+		resp.AddOption(s.delegate(duidHex, ia, peer, commit, wantsReconf))
+	}
+	if commit && wantsReconf {
+		s.addReconfKey(resp, duidHex)
 	}
 	if commit && s.stateful {
-		if wantsReconf {
-			s.addReconfKey(resp, duidHex)
-		}
 		s.saveLeases()
 	}
 }
@@ -296,6 +366,18 @@ func (s *dhcpServer) addInfo(resp *dhcpv6.Message) {
 	}
 	if len(s.snap.DNSSL) > 0 {
 		resp.AddOption(dhcpv6.OptDomainSearchList(labelsFrom(s.snap.DNSSL)))
+	}
+	// the upstream's time servers, as the NTP option and the older SNTP one (RFC 5908, RFC 4075)
+	if len(s.snap.NTP) > 0 {
+		ntp := &dhcpv6.OptNTPServer{}
+		var ips []net.IP
+		for _, a := range s.snap.NTP {
+			srv := dhcpv6.NTPSuboptionSrvAddr(a.AsSlice())
+			ntp.Suboptions.Add(&srv)
+			ips = append(ips, a.AsSlice())
+		}
+		resp.AddOption(ntp)
+		resp.AddOption(dhcpv6.OptSNTP(ips...))
 	}
 }
 
@@ -344,9 +426,7 @@ func (s *dhcpServer) assign(duidHex string, ia *dhcpv6.OptIANA, cid dhcpv6.DUID,
 			l.Hostname = fq.DomainName.Labels[0]
 		}
 		if wantsReconf && l.ReconfKey == "" {
-			k := make([]byte, 16)
-			rand.Read(k)
-			l.ReconfKey = hex.EncodeToString(k)
+			l.ReconfKey = s.reconfKey(duidHex, false)
 		}
 		s.leases[key] = l
 	}
@@ -362,7 +442,7 @@ func (s *dhcpServer) lifetimes(p Prefix, now time.Time) (pref, valid time.Durati
 
 // delegate answers one IA_PD out of the downstream pool; prefixes the router holds that it no
 // longer gets are returned with lifetime 0, as RFC 9096 L-13 asks stale ones to be signalled.
-func (s *dhcpServer) delegate(duidHex string, ia *dhcpv6.OptIAPD, peer netip.Addr, commit bool) *dhcpv6.OptIAPD {
+func (s *dhcpServer) delegate(duidHex string, ia *dhcpv6.OptIAPD, peer netip.Addr, commit, wantsReconf bool) *dhcpv6.OptIAPD {
 	out := &dhcpv6.OptIAPD{IaId: ia.IaId}
 	if s.pd == nil {
 		out.Options.Add(&dhcpv6.OptStatusCode{StatusCode: iana.StatusNoPrefixAvail, StatusMessage: "downstream PD disabled"})
@@ -404,6 +484,9 @@ func (s *dhcpServer) delegate(duidHex string, ia *dhcpv6.OptIAPD, peer netip.Add
 	}
 	l := &PDLease{DUID: duidHex, IAID: binary.BigEndian.Uint32(ia.IaId[:]), Prefix: pf, Iface: s.ifname, Peer: peer, Expires: now.Add(valid)}
 	old := s.pd.leases[key]
+	if wantsReconf {
+		l.ReconfKey = s.reconfKey(duidHex, true)
+	}
 	if old == nil || old.Prefix != pf {
 		infof("[dhcpv6-server %s] delegated %s to %s", s.ifname, pf, peer)
 	}
@@ -476,22 +559,57 @@ func (s *dhcpServer) dropDelegations(match func(*PDLease) bool) {
 	defer s.pd.mu.Unlock()
 	for _, l := range s.pd.drop(s.ifname, match) {
 		s.pdRoute(l, true)
+		// the router is told to renew now, and learns the prefix is gone (RFC 9096 section 3.5)
+		if l.ReconfKey != "" && l.Peer.IsValid() && s.pc != nil {
+			s.sendReconfigure(&Lease{DUID: l.DUID, Peer: l.Peer, ReconfKey: l.ReconfKey})
+		}
 	}
 }
 
-func (s *dhcpServer) addReconfKey(resp *dhcpv6.Message, duidHex string) {
+// knownKey returns the client's Reconfigure key, one for its addresses and delegations alike
+// (RFC 8415 section 20.4.1), or "" while it has none. pdLocked says the caller holds s.pd.mu.
+func (s *dhcpServer) knownKey(duidHex string, pdLocked bool) string {
 	for _, l := range s.leases {
-		if l.DUID != duidHex || l.ReconfKey == "" {
-			continue
+		if l.DUID == duidHex && l.ReconfKey != "" {
+			return l.ReconfKey
 		}
-		k, _ := hex.DecodeString(l.ReconfKey)
-		a := make([]byte, 28)
-		a[0], a[1], a[2] = 3, 1, 0
-		a[11] = 1
-		copy(a[12:], k)
-		resp.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionAuth, OptionData: a})
+	}
+	if s.pd != nil {
+		if !pdLocked {
+			s.pd.mu.Lock()
+			defer s.pd.mu.Unlock()
+		}
+		for _, l := range s.pd.leases {
+			if l.DUID == duidHex && l.ReconfKey != "" {
+				return l.ReconfKey
+			}
+		}
+	}
+	return ""
+}
+
+// reconfKey returns the client's Reconfigure key, made when it has none yet.
+func (s *dhcpServer) reconfKey(duidHex string, pdLocked bool) string {
+	if k := s.knownKey(duidHex, pdLocked); k != "" {
+		return k
+	}
+	k := make([]byte, 16)
+	rand.Read(k)
+	return hex.EncodeToString(k)
+}
+
+// addReconfKey hands the client its Reconfigure key, when it has one.
+func (s *dhcpServer) addReconfKey(resp *dhcpv6.Message, duidHex string) {
+	key := s.knownKey(duidHex, false)
+	if key == "" {
 		return
 	}
+	k, _ := hex.DecodeString(key)
+	a := make([]byte, 28)
+	a[0], a[1], a[2] = 3, 1, 0
+	a[11] = 1
+	copy(a[12:], k)
+	resp.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionAuth, OptionData: a})
 }
 
 // allocate checks static bindings first, then hashes DUID+IAID into the pool with linear probing on collision.
@@ -513,6 +631,14 @@ func (s *dhcpServer) allocate(prefix netip.Prefix, duidHex string, iaid uint32, 
 	}
 	for _, st := range s.statics {
 		used[st.addr] = true
+	}
+	now := time.Now()
+	for a, until := range s.declined {
+		if now.Before(until) {
+			used[a] = true
+		} else {
+			delete(s.declined, a)
+		}
 	}
 	size := s.poolEnd - s.poolStart + 1
 	h := fnv.New64a()

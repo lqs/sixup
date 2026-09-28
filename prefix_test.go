@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"log"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -54,7 +57,7 @@ func recv(t *testing.T, ch <-chan Snapshot) Snapshot {
 }
 
 func TestStoreLifecycle(t *testing.T) {
-	st := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, 300*time.Millisecond, nil, false, 0, 0)
+	st := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, 300*time.Millisecond, nil, false, 0, 0, "")
 	ch := st.Subscribe()
 	recv(t, ch) // initial empty snapshot
 	now := time.Now()
@@ -93,7 +96,7 @@ func TestStoreLifecycle(t *testing.T) {
 }
 
 func TestStorePreferRA(t *testing.T) {
-	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0)
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
 	ch := st.Subscribe()
 	recv(t, ch)
 	now := time.Now()
@@ -209,7 +212,7 @@ func TestShared64Layout(t *testing.T) {
 
 func TestStoreULA(t *testing.T) {
 	ula := netip.MustParsePrefix("fd00:1234:5678::/48")
-	st := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, time.Second, []netip.Prefix{ula}, false, 0, 0)
+	st := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, time.Second, []netip.Prefix{ula}, false, 0, 0, "")
 	ch := st.Subscribe()
 	s := recv(t, ch)
 	// ULA must be present even without a GUA.
@@ -240,7 +243,7 @@ func TestStoreULA(t *testing.T) {
 }
 
 func TestStoreMAPERules(t *testing.T) {
-	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, true, 0, 0)
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, true, 0, 0, "")
 	ch := st.Subscribe()
 	recv(t, ch)
 	now := time.Now()
@@ -267,7 +270,7 @@ func TestStoreMAPERules(t *testing.T) {
 }
 
 func TestStorePDGrace(t *testing.T) {
-	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 300*time.Millisecond, 0)
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 300*time.Millisecond, 0, "")
 	ch := st.Subscribe()
 	recv(t, ch)
 	now := time.Now()
@@ -285,7 +288,7 @@ func TestStorePDGrace(t *testing.T) {
 	}
 
 	// Fall back to RA when grace expires without a PD result.
-	st2 := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 200*time.Millisecond, 0)
+	st2 := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 200*time.Millisecond, 0, "")
 	ch2 := st2.Subscribe()
 	recv(t, ch2)
 	st2.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}})
@@ -346,7 +349,7 @@ func TestStoreRAPrefixesUnderPD(t *testing.T) {
 		{"different", netip.MustParsePrefix("2001:db8:0:2::/64"), false},
 		{"same", onLink, true},
 	} {
-		st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0)
+		st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
 		ch := st.Subscribe()
 		recv(t, ch)
 		st.Set("pd", SourceUpdate{Prefixes: []Prefix{{Prefix: c.pd, Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: "pd"}}})
@@ -365,10 +368,79 @@ func TestStoreRAPrefixesUnderPD(t *testing.T) {
 	}
 }
 
+// Losing the WAN default router is published at once, not after the settle period (RFC 7084 G-5).
+func TestStoreWANRouterLossSkipsSettle(t *testing.T) {
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 300*time.Millisecond, "")
+	ch := st.Subscribe()
+	recv(t, ch)
+	now := time.Now()
+	ra := SourceUpdate{Prefixes: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8:1::/64"), Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: "ra"}}}
+	st.Set("ra", ra)
+	recv(t, ch)
+	ra.NoRouter = true
+	st.Set("ra", ra)
+	select {
+	case s := <-ch:
+		if !s.NoWANRouter {
+			t.Fatalf("want NoWANRouter: %+v", s)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("the loss waited for the settle period")
+	}
+}
+
+// The LAN prefixes are recorded, and after a restart those the line does not hand out again are
+// withdrawn once it hands out any (RFC 9096 section 3.5).
+func TestStoreWithdrawsPrefixesFromBeforeRestart(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "lan-prefixes.json")
+	now := time.Now()
+	pd := func(p string) SourceUpdate {
+		return SourceUpdate{Prefixes: []Prefix{{Prefix: netip.MustParsePrefix(p), Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: "pd"}}}
+	}
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Minute, nil, false, 0, 0, file)
+	ch := st.Subscribe()
+	recv(t, ch)
+	st.Set("pd", pd("2001:db8:a::/56"))
+	recv(t, ch)
+
+	st = newStore("pd", []lanDef{{"lan0", 0}}, time.Minute, nil, false, 0, 0, file)
+	ch = st.Subscribe()
+	if s := recv(t, ch); len(s.LAN["lan0"]) != 0 {
+		t.Fatalf("nothing is withdrawn before the line answers: %+v", s.LAN)
+	}
+	st.Set("pd", pd("2001:db8:b::/56"))
+	s := recv(t, ch)
+	var stale, live []netip.Prefix
+	for _, p := range s.LAN["lan0"] {
+		if p.Stale {
+			stale = append(stale, p.Prefix)
+			if left := p.validLeft(time.Now()); left > time.Minute || left == 0 {
+				t.Fatalf("withdrawn for the hold: %v", left)
+			}
+		} else {
+			live = append(live, p.Prefix)
+		}
+	}
+	if !slices.Equal(stale, []netip.Prefix{netip.MustParsePrefix("2001:db8:a::/64")}) || !slices.Equal(live, []netip.Prefix{netip.MustParsePrefix("2001:db8:b::/64")}) {
+		t.Fatalf("stale %v, live %v", stale, live)
+	}
+
+	// A prefix that comes back is not withdrawn
+	st = newStore("pd", []lanDef{{"lan0", 0}}, time.Minute, nil, false, 0, 0, file)
+	ch = st.Subscribe()
+	recv(t, ch)
+	st.Set("pd", pd("2001:db8:b::/56"))
+	for _, p := range recv(t, ch).LAN["lan0"] {
+		if p.Prefix == netip.MustParsePrefix("2001:db8:b::/64") && p.Stale {
+			t.Fatal("a prefix handed out again must not be withdrawn")
+		}
+	}
+}
+
 // The settle window must open on a real change only: a no-op update at startup used to consume it,
 // pushing whatever arrived a moment later into the next batch.
 func TestStoreSettleBatching(t *testing.T) {
-	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 300*time.Millisecond)
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 300*time.Millisecond, "")
 	ch := st.Subscribe()
 	recv(t, ch) // initial empty snapshot, delivered on subscribe
 
@@ -393,7 +465,7 @@ func TestStoreSettleBatching(t *testing.T) {
 // DNS-only updates carry information the RA server and the DHCPv6 server need, so they must be
 // classified as a change rather than swallowed as "none".
 func TestStoreDNSOnlyChange(t *testing.T) {
-	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0)
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
 	ch := st.Subscribe()
 	recv(t, ch)
 	now := time.Now()
@@ -438,7 +510,7 @@ func TestSingle64WithSeveralLANs(t *testing.T) {
 	log.SetOutput(&logged)
 	defer log.SetOutput(os.Stderr)
 
-	st := newStore("pd", []lanDef{{iface: "eth1", index: 0}, {iface: "eth2", index: 1}}, time.Minute, nil, false, 0, 0)
+	st := newStore("pd", []lanDef{{iface: "eth1", index: 0}, {iface: "eth2", index: 1}}, time.Minute, nil, false, 0, 0, "")
 	ch := st.Subscribe()
 	recv(t, ch)
 	pd := netip.MustParsePrefix("2001:db8:1:2::/64")
@@ -502,7 +574,7 @@ func TestStorePDPending(t *testing.T) {
 	now := time.Now()
 	ra := Prefix{Prefix: netip.MustParsePrefix("2001:db8:0:1::/64"), Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: "ra", SLAAC: true}
 
-	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, time.Minute, 0)
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, time.Minute, 0, "")
 	ch := st.Subscribe()
 	recv(t, ch)
 	st.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}, DHCPv6: true})
@@ -516,7 +588,7 @@ func TestStorePDPending(t *testing.T) {
 		t.Fatalf("once PD is refused the WAN address comes, already knowing the /64 is shared: %+v", s)
 	}
 
-	st = newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, time.Minute, 0)
+	st = newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, time.Minute, 0, "")
 	ch = st.Subscribe()
 	recv(t, ch)
 	st.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}})
@@ -524,7 +596,7 @@ func TestStorePDPending(t *testing.T) {
 		t.Fatalf("RA without M/O: nothing to wait for: %+v", s)
 	}
 
-	st = newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 200*time.Millisecond, 0)
+	st = newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 200*time.Millisecond, 0, "")
 	ch = st.Subscribe()
 	recv(t, ch)
 	st.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}, DHCPv6: true})
@@ -536,7 +608,7 @@ func TestStorePDPending(t *testing.T) {
 
 // Jool starting or stopping changes what the RA announces, so it has to be published.
 func TestStoreNAT64(t *testing.T) {
-	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0)
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
 	ch := st.Subscribe()
 	recv(t, ch)
 	st.SetNAT64(nat64WKP)
@@ -546,5 +618,71 @@ func TestStoreNAT64(t *testing.T) {
 	st.SetNAT64(netip.Prefix{})
 	if s := recv(t, ch); s.NAT64.IsValid() {
 		t.Fatal("NAT64 off is not published")
+	}
+}
+
+// The part of a delegation the ISP keeps for the WAN link goes to no LAN (RFC 6603); a segment on
+// it takes the highest subnet no other segment names instead.
+func TestStoreSkipsTheExcludedSubnet(t *testing.T) {
+	st := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, time.Second, nil, false, 0, 0, "")
+	ch := st.Subscribe()
+	recv(t, ch)
+	now := time.Now()
+	st.Set("pd", SourceUpdate{Prefixes: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8:100::/56"), Exclude: netip.MustParsePrefix("2001:db8:100::/64"),
+		Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: "pd"}}})
+	s := recv(t, ch)
+	if len(s.LAN["lan0"]) != 1 || s.LAN["lan0"][0].Prefix != netip.MustParsePrefix("2001:db8:100:ff::/64") ||
+		len(s.LAN["lan1"]) != 1 || s.LAN["lan1"][0].Prefix != netip.MustParsePrefix("2001:db8:100:1::/64") {
+		t.Fatalf("subnet 0 is excluded and lan0 takes subnet ff, subnet 1 is not: %+v", s.LAN)
+	}
+	p := &pdPool{plen: 60, leases: map[string]*PDLease{}}
+	if p.free(s, netip.MustParsePrefix("2001:db8:100::/60"), "k") {
+		t.Fatal("a delegation over the excluded part is not free")
+	}
+}
+
+func TestParseWANPrefix(t *testing.T) {
+	got, err := parseWANPrefix("2001:db8:1:2::/64, 2001:db8:100::/56")
+	if err != nil || !slices.Equal(got, []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2::/64"), netip.MustParsePrefix("2001:db8:100::/56")}) {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	for _, bad := range []string{"2001:db8::/96", "fd00::/48", "fe80::/64", "192.0.2.0/24", "nonsense"} {
+		if _, err := parseWANPrefix(bad); err == nil {
+			t.Errorf("%q must be refused", bad)
+		}
+	}
+}
+
+// A /64 given with -wan-prefix is the WAN link's, shared with the LAN (RFC 7278); a shorter one is
+// split across the LANs as a delegation; and either stands before what DHCPv6-PD says.
+func TestStoreStaticPrefix(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	ch := st.Subscribe()
+	recv(t, ch)
+	vps := netip.MustParsePrefix("2001:db8:1:2::/64")
+	go keepStatic(ctx, st, []netip.Prefix{vps}, true)
+	s := recv(t, ch)
+	if len(s.LAN["lan0"]) != 1 || s.LAN["lan0"][0].Prefix != vps || !s.sharedWith(vps) || len(s.wanSLAAC()) != 1 {
+		t.Fatalf("a /64 is the WAN link's, shared with the LAN: %+v", s)
+	}
+	now := time.Now()
+	st.Set("pd", SourceUpdate{Prefixes: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8:9::/56"), Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: sourcePD}}})
+	select {
+	case s := <-ch:
+		if s.LAN["lan0"][0].Prefix != vps {
+			t.Fatalf("-wan-prefix stands before DHCPv6-PD: %+v", s.LAN)
+		}
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	st2 := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, time.Second, nil, false, 0, 0, "")
+	ch2 := st2.Subscribe()
+	recv(t, ch2)
+	go keepStatic(ctx, st2, []netip.Prefix{netip.MustParsePrefix("2001:db8:100::/56")}, true)
+	s = recv(t, ch2)
+	if len(s.LAN["lan1"]) != 1 || s.LAN["lan1"][0].Prefix != netip.MustParsePrefix("2001:db8:100:1::/64") || s.WAN[0].Source != sourcePD {
+		t.Fatalf("a /56 is split as a delegation: %+v", s)
 	}
 }

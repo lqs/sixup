@@ -25,3 +25,17 @@ func TestStrayAddrs(t *testing.T) {
 		t.Fatalf("only the stray address should be picked, got %+v", got)
 	}
 }
+
+// A WAN prefix with the L flag clear takes a /128, so no on-link route comes with the address
+// (RFC 5942 section 4, IPv6 Ready CE Router 1.6.2).
+func TestWANAddressOffLink(t *testing.T) {
+	m := &addrManager{side: sideWAN, layout: "lan"}
+	p := Prefix{Prefix: netip.MustParsePrefix("2001:db8::/64"), Source: sourceRA}
+	if got := m.plen(p); got != 64 {
+		t.Fatalf("on-link: /%d", got)
+	}
+	p.OffLink = true
+	if got := m.plen(p); got != 128 {
+		t.Fatalf("off-link: /%d", got)
+	}
+}

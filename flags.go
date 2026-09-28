@@ -24,15 +24,18 @@ var (
 	wanIID      = flag.String("wan-iid", "", "comma-separated suffixes of the static SLAAC addresses on the WAN interface, one address each: empty or stable for an RFC 7217 stable address, eui64 to derive it from the MAC, or a fixed suffix such as ::1 or ::1111:2222:3333:4444; the first one is reported as the WAN address")
 	wanTemp     = flag.Bool("wan-tempaddr", false, "besides the static SLAAC address, also rotate temporary addresses on the WAN interface according to -tempaddr-regen and friends")
 	prefer      = flag.String("wan-prefer", "pd", "which prefix source wins when both are available: pd / ra")
+	wanPrefix   = flag.String("wan-prefix", "", "comma-separated prefixes the upstream routes to this router when neither RA nor DHCPv6-PD tells it, such as a static prefix routed to the line by contract, or the /64 of a VPS; the DHCPv6 client then asks only for DNS and the like. A /64 is taken as the WAN link's on-link prefix and shared with the LAN as RFC 7278 describes; a shorter one as a delegation")
 	shared64    = flag.String("wan-shared64", "lan", "layout when upstream hands out only one /64: lan(RFC 7278 /64 sharing: /64 on the LAN, /128 routes for same-subnet hosts on the WAN side, default) / wan(/64 on the WAN, one /128 route per LAN host) / split(/128 on both sides, the router itself cannot reach hosts it has not learned); all /128 routes are added automatically once the NDP proxy probes them")
 	lanIIDSpec  = flag.String("lan-iid", "", "comma-separated suffixes of this host's static addresses on each LAN prefix, one address each, same syntax as -wan-iid; empty means an RFC 7217 stable address")
-	hold        = flag.Duration("lan-deprecate-hold", 600*time.Second, "how long a revoked prefix keeps being advertised with preferred=0 (one RA cycle)")
+	hold        = flag.Duration("lan-deprecate-hold", ndValidLimit, "how long a prefix the line took away, or one advertised before a restart that the line did not hand out again, is advertised with lifetimes 0 so that hosts drop it (RFC 9096). Hosts hold a prefix for at most the 90 minutes its advertised valid lifetime is capped at, so a shorter hold may leave some behind")
 	settle      = flag.Duration("settle", time.Second, "how long parameters must stay unchanged before they are pushed to the components (revocation does not wait); merges the RA, PD, DNS and capture results that arrive in batches at startup")
 	dhcpRel     = flag.Bool("dhcp6c-release", false, "send RELEASE to the server on exit to give back the prefix and addresses. Off by default: a persisted DUID renews the same range after a restart and avoids prefix churn; dry-run always releases")
 	pdGrace     = flag.Duration("dhcp6c-pd-grace", 10*time.Second, "longest wait after startup for a PD result, which ends as soon as PD succeeds or is refused; meanwhile RA prefixes are not handed to the LAN, so no wrong prefix has to be revoked later, and when the RA sets M or O the WAN takes no address in them yet, since its prefix length depends on the result")
 	raMin       = flag.Duration("ra-min", 200*time.Second, "MinRtrAdvInterval")
 	raMax       = flag.Duration("ra-max", 600*time.Second, "MaxRtrAdvInterval")
-	raLifetime  = flag.Duration("ra-lifetime", 1800*time.Second, "router lifetime of the RA")
+	raSLAAC     = flag.Bool("ra-slaac", true, "set the A flag in the RA's prefixes, so hosts form addresses by SLAAC; off with -dhcp6s-mode stateful hands out addresses by DHCPv6 only")
+	raOnLink    = flag.Bool("ra-onlink", true, "set the L flag in the RA's prefixes, so hosts reach each other directly; off sends all their traffic through this router")
+	raLifetime  = flag.Duration("ra-lifetime", ndPreferredLimit, "router lifetime of the RA, 45 minutes by default as RFC 9096 recommends; it is 0 while the WAN has no default router")
 	raMTU       = flag.Uint("ra-mtu", 0, "MTU advertised in the RA; 0 means automatic: advertised when the WAN path MTU (the MTU option of the upstream RA or the WAN interface MTU) is smaller than the LAN interface, so PPPoE 1492 and similar no longer depend on PMTU discovery")
 	raDNS       = flag.String("ra-dns", "upstream", "DNS servers announced on the LAN: off, or a comma-separated list, in order, of upstream (the servers the upstream hands out), self (this router's address on that LAN, in the ULA when there is one) and IPv6 addresses")
 	raPref64    = flag.String("ra-pref64", "auto", "PREF64 advertised in the RA (RFC 8781): auto advertises this router's NAT64 prefix while it translates and otherwise passes on the upstream RA's; off advertises none; a prefix advertises that one, for a NAT64 elsewhere, and cannot be combined with -nat64")
@@ -64,6 +67,8 @@ var (
 	nat64       = flag.String("nat64", "off", "which NAT64 implementation to configure: jool uses the Jool kernel module (https://jool.mx, 4.1 or later, modprobe jool), run in a network namespace of its own behind the veth sixup-nat64, translating -nat64-prefix for the LAN and this router alike. The namespace exists, and the prefix is advertised in the RA unless -ra-pref64 is off, only while the module is loaded, which is checked every minute. The IPv4 output leaves by this host's IPv4 route, through the tunnel's source NAT or any other, so a MAP-E line's ports have one allocator. A firewall has to let traffic through sixup-nat64: the LAN's, forwarded, and the answers to this router's own, arriving on it. off configures none. DNS64 is not part of this and is left to a resolver of your choosing")
 	nat64Prefix = flag.String("nat64-prefix", nat64WKP.String(), "prefix the NAT64 translates (RFC 6052), advertised in the RA while it does (see -ra-pref64). Reaching private IPv4 addresses needs a network-specific prefix such as fd00:64::/96, and one carved from the delegated prefix would change with it")
 	joolIPv4    = flag.String("jool-ipv4", "192.168.255.254/31", "the IPv4 /31 between this namespace and Jool's: the lower address is the gateway on this side, the upper one Jool's pool4. It must not overlap any address or route of this host")
+	unsolicited = flag.String("unsolicited", "request", "unsolicited IPv6 from the WAN to the LAN (RFC 6092): request lets in only what the LAN started, endpoints that recently sent out, ports opened with PCP (UDP 5351), and the ICMPv6 and IPsec that must pass; deny does the same without PCP; allow lets it all in. PCP, and NAT-PMP for programs that know only it, also forward ports of the tunnel's IPv4 while sixup does its NAT. The RFC 7084 border for ULA and LAN prefixes holds in every mode")
+	srcFilter   = flag.Bool("source-filter", true, "let the LAN send to the WAN only from its own and the delegated prefixes, answering others with ICMPv6 code 5 (BCP 38), and the WAN reach only those; turn it off when another prefix is routed into the LAN")
 	tunNAT      = flag.String("tunnel-nat", "auto", "maintain the nftables table sixup for traffic leaving the tunnel device: auto configures the port-restricted source NAT a MAP-E customer edge is required to have (RFC 7597), an ordinary source NAT on a line with its own public IPv4, none on DS-Lite where the AFTR translates, and in every case an MSS clamp to the tunnel MTU; off writes no rules. Nothing outside that table is read or changed, and it is removed on exit")
 
 	logLevelName = flag.String("log-level", "info", "minimum level printed: debug / info / warn / error")
@@ -167,13 +172,14 @@ var usageGroups = []struct {
 }{
 	{"Interfaces and prefixes", []string{"wan", "lan", "lan-ula", "lan-iid", "lan-deprecate-hold"}},
 	{"WAN side: DHCPv6 client", []string{"dhcp6c-mode", "dhcp6c-pd-len", "dhcp6c-ia-na", "dhcp6c-pd-grace", "dhcp6c-release"}},
-	{"WAN side: upstream RA and addresses", []string{"wan-ra", "wan-slaac", "wan-iid", "wan-tempaddr", "wan-prefer", "wan-shared64"}},
-	{"LAN side: RA advertisement", []string{"ra-min", "ra-max", "ra-lifetime", "ra-mtu", "ra-dns", "ra-pref64", "ra-route"}},
+	{"WAN side: upstream RA and addresses", []string{"wan-ra", "wan-slaac", "wan-iid", "wan-tempaddr", "wan-prefer", "wan-prefix", "wan-shared64"}},
+	{"LAN side: RA advertisement", []string{"ra-min", "ra-max", "ra-lifetime", "ra-slaac", "ra-onlink", "ra-mtu", "ra-dns", "ra-pref64", "ra-route"}},
 	{"LAN side: DHCPv6 server", []string{"dhcp6s-mode", "dhcp6s-pool", "dhcp6s-static", "dhcp6s-lease-preferred", "dhcp6s-lease-valid", "dhcp6s-pd-len"}},
 	{"NDP proxy", []string{"ndproxy-mode", "ndproxy-static", "ndproxy-exclude", "ndproxy-ttl"}},
 	{"Local address rotation", []string{"tempaddr-mode", "tempaddr-regen", "tempaddr-preferred", "tempaddr-valid", "tempaddr-max", "tempaddr-desync", "tempaddr-skip-dad", "tempaddr-drain-grace"}},
 	{"Tunnel", []string{"tunnel-dev", "tunnel-mtu", "tunnel-route4-metric", "tunnel-nat", "tunnel-mape-rules", "tunnel-capture", "tunnel-capture-max"}},
 	{"NAT64", []string{"nat64", "nat64-prefix", "jool-ipv4"}},
+	{"Unsolicited traffic", []string{"unsolicited", "source-filter"}},
 	{"Runtime", []string{"state-dir", "no-sysctl", "settle", "dry-run", "dry-run-timeout", "log-level", "v", "version", "license"}},
 }
 

@@ -185,6 +185,44 @@ func routeSet(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires t
 	return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNICAST, 0, ifi, dst, gw, metric, expires)
 }
 
+// defaultRouteVia reports whether the main table has an IPv6 default route through ifi, such as one
+// configured by hand where the upstream sends no RA. One whose interface the route itself does not
+// name, as with several next hops, counts too: better a default router too many than none.
+func defaultRouteVia(ifi int) bool {
+	c, err := rtDial()
+	if err != nil {
+		return false
+	}
+	defer c.Close()
+	msgs, err := c.Execute(netlink.Message{Header: netlink.Header{Type: unix.RTM_GETROUTE, Flags: netlink.Request | netlink.Dump}, Data: []byte{unix.AF_INET6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}})
+	if err != nil {
+		return false
+	}
+	for _, m := range msgs {
+		// rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type, flags
+		if len(m.Data) < 12 || m.Data[1] != 0 || m.Data[7] != unix.RTN_UNICAST {
+			continue
+		}
+		table, oif := uint32(m.Data[4]), 0
+		ad, err := netlink.NewAttributeDecoder(m.Data[12:])
+		if err != nil {
+			continue
+		}
+		for ad.Next() {
+			switch ad.Type() {
+			case unix.RTA_TABLE:
+				table = ad.Uint32()
+			case unix.RTA_OIF:
+				oif = int(ad.Uint32())
+			}
+		}
+		if table == unix.RT_TABLE_MAIN && (oif == ifi || oif == 0) {
+			return true
+		}
+	}
+	return false
+}
+
 func routeDel(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32) error {
 	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, 0, ifi, dst, gw, metric, 0)
 	if errors.Is(err, unix.ESRCH) {
@@ -378,6 +416,53 @@ func sysctlGet(iface, key string) (string, error) {
 	p := filepath.Join("/proc/sys/net/ipv6/conf", strings.ReplaceAll(iface, ".", "/"), key)
 	b, err := os.ReadFile(p)
 	return strings.TrimSpace(string(b)), err
+}
+
+// localListeners returns the ports this host takes new traffic on for proto at addr: TCP sockets
+// in LISTEN and UDP sockets connected to no peer, bound to addr or to a wildcard. An IPv6 wildcard
+// counts too, since unless it is v6-only it takes IPv4 as well.
+func localListeners(proto byte, addr netip.Addr) (map[uint16]bool, error) {
+	c, err := netlink.Dial(unix.NETLINK_SOCK_DIAG, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	state := uint32(1) << unix.BPF_TCP_CLOSE // an unconnected UDP socket
+	if proto == unix.IPPROTO_TCP {
+		state = 1 << unix.BPF_TCP_LISTEN
+	}
+	v4 := addr.As4()
+	out := map[uint16]bool{}
+	for _, family := range []uint8{unix.AF_INET, unix.AF_INET6} {
+		// inet_diag_req_v2: family, protocol, ext, pad, states(4), id(48)
+		req := make([]byte, 56)
+		req[0], req[1] = family, proto
+		nativeEndian.PutUint32(req[4:8], state)
+		msgs, err := c.Execute(netlink.Message{
+			Header: netlink.Header{Type: unix.SOCK_DIAG_BY_FAMILY, Flags: netlink.Request | netlink.Dump},
+			Data:   req,
+		})
+		if err != nil {
+			return out, err
+		}
+		for _, m := range msgs {
+			// inet_diag_msg: family, state, timer, retrans, then id: sport(2), dport(2), src(16)...
+			if len(m.Data) < 24 {
+				continue
+			}
+			src := m.Data[8:24]
+			wildcard := [16]byte{}
+			switch {
+			case family == unix.AF_INET && ([4]byte(src[:4]) == [4]byte{} || [4]byte(src[:4]) == v4):
+			case family == unix.AF_INET6 && [16]byte(src) == wildcard:
+			case family == unix.AF_INET6 && [16]byte(src) == addr.As16(): // IPv4-mapped
+			default:
+				continue
+			}
+			out[binary.BigEndian.Uint16(m.Data[4:6])] = true
+		}
+	}
+	return out, nil
 }
 
 // sockDiagInUse counts TCP/UDP sockets whose local address matches addr exactly,

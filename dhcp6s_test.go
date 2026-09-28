@@ -90,8 +90,47 @@ func TestServerStatelessRefusesAddresses(t *testing.T) {
 	if st == nil || st.StatusCode != iana.StatusNoAddrsAvail {
 		t.Fatalf("want NoAddrsAvail, got %v", st)
 	}
-	if s.handle(cliMsg(dhcpv6.MessageTypeSolicit), peerLL) != nil {
-		t.Fatal("a SOLICIT without IA_NA gets no answer in stateless mode")
+	adv := s.handle(cliMsg(dhcpv6.MessageTypeSolicit), peerLL)
+	if adv == nil || adv.MessageType != dhcpv6.MessageTypeAdvertise || adv.Options.Status().StatusCode != iana.StatusNoAddrsAvail {
+		t.Fatalf("a SOLICIT without IA gets an ADVERTISE with NoAddrsAvail, got %v", adv)
+	}
+}
+
+// The validation of RFC 8415 section 16 and the answers of section 18.3 (IPv6 Ready CE Router 2.1
+// and 2.2).
+func TestServerValidation(t *testing.T) {
+	s := newTestServer(true)
+	withSID := func(mt dhcpv6.MessageType, sid dhcpv6.DUID, opts ...dhcpv6.Option) *dhcpv6.Message {
+		m := cliMsg(mt, opts...)
+		m.AddOption(dhcpv6.OptServerID(sid))
+		return m
+	}
+	for _, mt := range []dhcpv6.MessageType{dhcpv6.MessageTypeSolicit, dhcpv6.MessageTypeConfirm, dhcpv6.MessageTypeRebind} {
+		if s.handle(withSID(mt, s.duid, iana1()), peerLL) != nil {
+			t.Errorf("%s with a Server ID, even this server's, is dropped", mt)
+		}
+	}
+	if s.handle(cliMsg(dhcpv6.MessageTypeInformationRequest, iana1()), peerLL) != nil {
+		t.Error("an Information-Request with an IA is dropped")
+	}
+	anon, _ := dhcpv6.NewMessage()
+	anon.MessageType = dhcpv6.MessageTypeInformationRequest
+	if s.handle(anon, peerLL) == nil {
+		t.Error("an Information-Request without a Client ID is answered")
+	}
+	if s.handle(cliMsg(dhcpv6.MessageTypeConfirm, iana1()), peerLL) != nil {
+		t.Error("a Confirm with no address gets no Reply")
+	}
+	rel := s.handle(withSID(dhcpv6.MessageTypeRelease, s.duid, iana1()), peerLL)
+	if rel == nil || len(rel.Options.IANA()) != 1 || rel.Options.IANA()[0].Options.Status().StatusCode != iana.StatusNoBinding {
+		t.Errorf("releasing an unknown IA answers NoBinding for it: %v", rel)
+	}
+	if s.unicast(withSID(dhcpv6.MessageTypeSolicit, s.duid)) != nil {
+		t.Error("a unicast Solicit is dropped")
+	}
+	req := s.unicast(withSID(dhcpv6.MessageTypeRequest, s.duid, iana1()))
+	if req == nil || req.Options.Status().StatusCode != iana.StatusUseMulticast || len(req.Options.IANA()) != 0 {
+		t.Errorf("a unicast Request is told UseMulticast and nothing else: %v", req)
 	}
 }
 
@@ -282,5 +321,46 @@ func TestReconfigureRoundTrip(t *testing.T) {
 	}
 	if _, ok := buildReconfigure(srvDUID, &Lease{DUID: l.DUID}, time.Now()); ok {
 		t.Fatal("no key: nothing to sign")
+	}
+}
+
+// A declined address stays out of the pool (RFC 8415 section 18.3.8, IPv6 Ready CE Router 2.1.15).
+func TestServerKeepsDeclinedAddressOut(t *testing.T) {
+	s := newTestServer(true)
+	req := cliMsg(dhcpv6.MessageTypeRequest, iana1())
+	req.AddOption(dhcpv6.OptServerID(srvDUID))
+	first, _ := firstAddr(t, s.handle(req, peerLL))
+	na := iana1()
+	na.Options.Add(&dhcpv6.OptIAAddress{IPv6Addr: first.AsSlice(), PreferredLifetime: time.Hour, ValidLifetime: 2 * time.Hour})
+	// another client declining it locks nothing away
+	other, _ := dhcpv6.NewMessage()
+	other.MessageType = dhcpv6.MessageTypeDecline
+	other.AddOption(dhcpv6.OptClientID(&dhcpv6.DUIDLL{HWType: 1, LinkLayerAddr: net.HardwareAddr{2, 9, 9, 9, 9, 9}}))
+	other.AddOption(dhcpv6.OptServerID(srvDUID))
+	other.AddOption(na)
+	s.handle(other, peerLL)
+	if len(s.declined) != 0 {
+		t.Fatalf("another client's Decline kept %v out", s.declined)
+	}
+	dec := cliMsg(dhcpv6.MessageTypeDecline, na)
+	dec.AddOption(dhcpv6.OptServerID(srvDUID))
+	if s.handle(dec, peerLL) == nil {
+		t.Fatal("a Decline is answered")
+	}
+	if again, _ := firstAddr(t, s.handle(req, peerLL)); again == first {
+		t.Fatalf("%s was declined and handed out again", first)
+	}
+}
+
+// The upstream's time servers are passed on to the LAN (RFC 7084 L-12).
+func TestServerPassesNTPOn(t *testing.T) {
+	s := newTestServer(false)
+	s.snap.NTP = []netip.Addr{netip.MustParseAddr("2001:db8::123")}
+	resp := s.handle(cliMsg(dhcpv6.MessageTypeInformationRequest), peerLL)
+	if got := resp.Options.NTPServers(); len(got) != 1 || !got[0].Equal(net.ParseIP("2001:db8::123")) {
+		t.Fatalf("NTP: %v", got)
+	}
+	if got := resp.Options.SNTP(); len(got) != 1 {
+		t.Fatalf("SNTP: %v", got)
 	}
 }

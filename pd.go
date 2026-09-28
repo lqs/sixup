@@ -20,6 +20,8 @@ type PDLease struct {
 	Iface   string       `json:"iface"`
 	Peer    netip.Addr   `json:"peer"` // the router's link-local, next hop of the route to Prefix
 	Expires time.Time    `json:"expires"`
+	// ReconfKey lets the router be told to renew when the delegation goes (RFC 9096 section 3.5)
+	ReconfKey string `json:"reconf_key,omitempty"`
 }
 
 // pdPool delegates prefixes to downstream routers out of the upstream delegation. One pool serves
@@ -28,6 +30,7 @@ type PDLease struct {
 type pdPool struct {
 	plen   int // the shortest prefix length delegated, -dhcp6s-pd-len
 	file   string
+	fw     *firewall // told of the delegations, which it leaves to the downstream routers; may be nil
 	mu     sync.Mutex
 	leases map[string]*PDLease
 }
@@ -35,16 +38,22 @@ type pdPool struct {
 // maxProbes bounds the search for a free block of one length; a pool that full takes a longer one.
 const maxProbes = 4096
 
-func newPDPool(plen int, file string) *pdPool {
-	p := &pdPool{plen: plen, file: file, leases: map[string]*PDLease{}}
-	b, err := os.ReadFile(file)
+func newPDPool(plen int, file string, fw *firewall) *pdPool {
+	p := &pdPool{plen: plen, file: file, fw: fw, leases: map[string]*PDLease{}}
+	p.load()
+	p.publish()
+	return p
+}
+
+func (p *pdPool) load() {
+	b, err := os.ReadFile(p.file)
 	if err != nil {
-		return p
+		return
 	}
 	var list []*PDLease
 	if err := json.Unmarshal(b, &list); err != nil {
 		warnf("[dhcpv6-server] delegation file corrupt, ignoring: %v", err)
-		return p
+		return
 	}
 	now := time.Now()
 	for _, l := range list {
@@ -53,11 +62,11 @@ func newPDPool(plen int, file string) *pdPool {
 		}
 	}
 	infof("[dhcpv6-server] loaded %d delegations", len(p.leases))
-	return p
 }
 
-// save writes the delegations to disk; the caller holds mu.
+// save writes the delegations to disk and hands them to the firewall; the caller holds mu.
 func (p *pdPool) save() {
+	p.publish()
 	if p.file == "" {
 		return
 	}
@@ -73,6 +82,22 @@ func (p *pdPool) save() {
 		return
 	}
 	os.Rename(tmp, p.file)
+}
+
+// publish hands the firewall the live delegations. One that expires stays until the next change,
+// which does no harm: its route expires with it, so nothing is forwarded there.
+func (p *pdPool) publish() {
+	if p.fw == nil {
+		return
+	}
+	var ps []netip.Prefix
+	now := time.Now()
+	for _, l := range p.leases {
+		if now.Before(l.Expires) {
+			ps = append(ps, l.Prefix)
+		}
+	}
+	p.fw.setDelegations(ps)
 }
 
 // delegable returns the upstream delegations a downstream prefix can be carved from.
@@ -142,7 +167,8 @@ func (p *pdPool) block(s Snapshot, up netip.Prefix, n int, key string) (netip.Pr
 	return netip.Prefix{}, false
 }
 
-// free reports whether pf overlaps no LAN prefix, no on-link prefix of the WAN link and no live
+// free reports whether pf overlaps no LAN prefix, no on-link prefix of the WAN link, no part the ISP
+// excludes (RFC 6603) and no live
 // delegation other than key's. An expired one no longer counts, even on an interface that is gone.
 func (p *pdPool) free(s Snapshot, pf netip.Prefix, key string) bool {
 	for _, ps := range s.LAN {
@@ -153,7 +179,7 @@ func (p *pdPool) free(s Snapshot, pf netip.Prefix, key string) bool {
 		}
 	}
 	for _, w := range s.WAN {
-		if w.Source == sourceRA && w.Prefix.Overlaps(pf) {
+		if w.Source == sourceRA && w.Prefix.Overlaps(pf) || w.Exclude.IsValid() && w.Exclude.Overlaps(pf) {
 			return false
 		}
 	}
@@ -164,6 +190,14 @@ func (p *pdPool) free(s Snapshot, pf netip.Prefix, key string) bool {
 		}
 	}
 	return true
+}
+
+// has reports whether key holds a delegation.
+func (p *pdPool) has(key string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.leases[key]
+	return ok
 }
 
 // drop removes and returns the delegations on iface that match; the caller holds mu.

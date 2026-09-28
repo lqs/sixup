@@ -2,3 +2,4 @@
 /sixup-*
 /testdata/fuzz/
 /dist/
+.idea/
