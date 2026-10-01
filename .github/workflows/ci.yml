@@ -4,7 +4,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with: { go-version-file: go.mod }
       - name: Check formatting
@@ -23,7 +23,7 @@ jobs:
     # The unit tests cover what the rules should be; this covers the kernel accepting them.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with: { go-version-file: go.mod }
       - run: sudo -E env "PATH=$PATH" go test -tags integration -run 'TestNAT|TestRoute|TestMSS|TestAddress|TestJool|TestPCP|TestFirewall|TestAFTR|TestDHCPv6|TestRAServer' ./...
@@ -31,7 +31,7 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with: { go-version-file: go.mod }
       # Built from source with the repo's Go toolchain: the prebuilt binaries lag
@@ -44,7 +44,7 @@ jobs:
     # The release workflow builds the image only on a tag; this keeps the Dockerfile honest.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: docker/build-push-action@v6
         with:
@@ -65,7 +65,7 @@ jobs:
       group: dev-release
       cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { fetch-depth: 0 }
       - uses: actions/setup-go@v7
         with: { go-version-file: go.mod }
