@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"net/netip"
@@ -435,6 +436,73 @@ func icmp6(from, to netip.Addr, typ, code byte, field [4]byte, body []byte) []by
 // The ICMPv6 of RFC 4890 section 4.3 from the WAN to the LAN under -unsolicited request, and the
 // state of RFC 6092: errors about a flow the LAN started pass and others do not (REC-10, REC-18,
 // REC-36), a TCP endpoint that sent out is reachable (REC-33), and a simultaneous open works
+// An unsolicited SYN is told it is prohibited, though only after 6 seconds; one the LAN host
+// answers with a SYN of its own in that time, a TCP simultaneous open, is not (RFC 6092 REC-34).
+func TestFirewallRejectsSYNAgainstKernel(t *testing.T) {
+	if !ownNetns(t) { // the goroutines of rejectSYNs too
+		return
+	}
+	loUp(t)
+	host := netip.MustParseAddr("2001:db8:1::10")
+	far := netip.MustParseAddr("2001:db8:f::1")
+	wanDev := openTun(t, "wan-test0", netip.MustParsePrefix("2001:db8:f::/48"))
+	lanDev := openTun(t, "lan-test0", netip.MustParsePrefix("2001:db8:1::/56"))
+	if err := sysctlWrite("/proc/sys/net/ipv6/conf/all/forwarding", "1"); err != nil {
+		t.Fatal(err)
+	}
+	// the router's own address, the source of its ICMPv6 errors
+	if err := addrSet(mustIface(t, "wan-test0"), netip.MustParseAddr("2001:db8:e::1"), 128, time.Hour, time.Hour, false, ifaFNodad); err != nil {
+		t.Fatal(err)
+	}
+	f := &firewall{wan: "wan-test0", lans: []string{"lan-test0"}, inbound: true, source: true}
+	if err := f.install(); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	t.Cleanup(f.remove)
+	f.lan = []netip.Prefix{netip.MustParsePrefix("2001:db8:1::/64")}
+	f.applyOurs()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go f.rejectSYNs(ctx)
+	time.Sleep(200 * time.Millisecond) // bound to the NFLOG group
+
+	alone, answered := netip.AddrPortFrom(far, 40010), netip.AddrPortFrom(far, 40011)
+	start := time.Now()
+	for _, from := range []netip.AddrPort{alone, answered} {
+		if passes(t, wanDev, lanDev, syn6(from, netip.AddrPortFrom(host, 8090))) {
+			t.Fatal("an unsolicited SYN must be dropped")
+		}
+	}
+	time.Sleep(time.Second)
+	if !passes(t, lanDev, wanDev, syn6(netip.AddrPortFrom(host, 8090), answered)) {
+		t.Fatal("the LAN host's own SYN goes out")
+	}
+
+	var got []uint16 // the source ports of the SYNs reported
+	buf := make([]byte, 2048)
+	for time.Since(start) < synWait+2*time.Second {
+		wanDev.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		n, err := wanDev.Read(buf)
+		if err != nil {
+			continue
+		}
+		p := buf[:n]
+		if n < 48+60 || p[6] != unix.IPPROTO_ICMPV6 || p[40] != 1 || netip.AddrFrom16([16]byte(p[24:40])) != far {
+			continue
+		}
+		if p[41] != 1 {
+			t.Fatalf("ICMPv6 destination unreachable with code %d, not 1", p[41])
+		}
+		if e := time.Since(start); e < synWait-100*time.Millisecond {
+			t.Fatalf("reported after %s, before the 6 s", e)
+		}
+		got = append(got, binary.BigEndian.Uint16(p[48+40:]))
+	}
+	if len(got) != 1 || got[0] != alone.Port() {
+		t.Fatalf("SYNs reported from ports %v, want only %d", got, alone.Port())
+	}
+}
+
 // (REC-31).
 func TestFirewallICMPv6AgainstKernel(t *testing.T) {
 	enterNetNS(t)

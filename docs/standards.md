@@ -370,12 +370,12 @@ The IPv6 filter a home router applies to traffic from the Internet. It is the de
 | REC-31 | All valid TCP sequences, simultaneous open included (MUST) | 🟢 Done | `TestFirewallICMPv6AgainstKernel` |
 | REC-32 | The TCP window not enforced when the window scale was not seen (MUST NOT) | 🐧 Kernel. conntrack is liberal with a flow it picked up midway | None |
 | REC-33 | Endpoint independent filtering for TCP by default (SHOULD) | 🟢 Done | `TestFirewallICMPv6AgainstKernel` |
-| REC-34 | Answer an unsolicited SYN with ICMPv6 code 1 after 6 seconds (MUST) | 🙅 Not done on purpose. The SYN is dropped, since an early answer would abort a simultaneous open at the far end, and a drop lets it retry | None |
+| REC-34 | Answer an unsolicited SYN with ICMPv6 code 1 after 6 seconds (MUST) | 🟢 Done. The firewall hands the SYNs it drops to sixup through NFLOG, at most 50 a second; after 6 seconds sixup answers, unless conntrack shows the LAN host opened the connection meanwhile, a simultaneous open the answer would abort | `TestFirewallRejectsSYNAgainstKernel` |
 | REC-35 | TCP state kept at least 2 h 4 min when established, 4 min when transitory (MUST NOT) | 🟡 Partly. Kernel defaults: 5 days established, but some transitory states such as SYN_SENT last 2 minutes | None |
 | REC-36 | ICMPv6 errors for a forwarded TCP flow forwarded too (MUST) | 🟢 Done, as related traffic | `TestFirewallICMPv6AgainstKernel` |
 | REC-37 | No ICMPv6 message ends TCP state (MUST NOT) | 🐧 Kernel | None |
 | REC-38 | All valid SCTP sequences, simultaneous open included (MUST) | 🐧 Kernel, through conntrack; not tested here | None |
-| REC-39 | Answer an unsolicited SCTP INIT with ICMPv6 code 1 after 6 seconds (MUST) | 🙅 Not done on purpose, for the reason of REC-34 | None |
+| REC-39 | Answer an unsolicited SCTP INIT with ICMPv6 code 1 after 6 seconds (MUST) | ⌛ Not yet. The INIT is dropped; the answer of REC-34 covers TCP only | None |
 | REC-40 | SCTP state kept at least 2 h 4 min when established (MUST NOT) | 🐧 Kernel, through conntrack; not tested here | None |
 | REC-41 | ICMPv6 errors for a forwarded SCTP association forwarded too (MUST) | 🐧 Kernel, through conntrack; not tested here | None |
 | REC-42 | No ICMPv6 message ends SCTP state (MUST NOT) | 🐧 Kernel | None |

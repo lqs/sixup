@@ -63,8 +63,8 @@ const ipprotoHIP = 139
 // endpoint-independent filtering REC-17 and REC-33 make the default, which is what lets
 // peer-to-peer programs meet), or when PCP opened a pinhole for it. Traffic for a prefix
 // delegated to a downstream router is that router's to filter. Anything else from the WAN is
-// dropped. Only forwarded traffic is looked at; the router's own services and traffic are the
-// operator's.
+// dropped, and the sender of a TCP SYN told so after 6 seconds (REC-34). Only forwarded traffic
+// is looked at; the router's own services and traffic are the operator's.
 type firewall struct {
 	wan     string
 	lans    []string            // the interfaces sixup serves
@@ -91,6 +91,7 @@ func (f *firewall) run(ctx context.Context, ch <-chan Snapshot) {
 	}
 	defer f.remove()
 	if f.inbound {
+		go f.rejectSYNs(ctx)
 		infof("[firewall] IPv6 from %s to the LAN is let through only when the LAN asked for it", f.wan)
 	}
 	for {
@@ -327,12 +328,20 @@ func (f *firewall) install() error {
 		&expr.Payload{DestRegister: 13, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
 		&expr.Lookup{SourceRegister: 1, SetName: f.holes.Name},
 	), &expr.Verdict{Kind: expr.VerdictAccept}))
-	// Dropped rather than rejected at once as RFC 6092 REC-34 would have after a 6 second wait: an
-	// early unreachable aborts the remote end of a TCP simultaneous open, which a drop lets retry.
 	c.AddRule(newRule(tbl, in, "leave a downstream router's delegation to its own firewall", append(nfIPv6(),
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 24, Len: 16},
 		&expr.Lookup{SourceRegister: 1, SetName: f.deleg.Name},
 	), &expr.Verdict{Kind: expr.VerdictAccept}))
+	// A SYN is handed to sixup as it is dropped, which tells the sender after 6 seconds unless the
+	// LAN opened the connection meanwhile (RFC 6092 REC-34); rejected at once, it would abort the
+	// remote end of a TCP simultaneous open. Past the rate, SYNs are dropped without a word.
+	c.AddRule(newRule(tbl, in, "drop an unsolicited SYN, and have sixup report it after 6 s (RFC 6092 REC-34)", append(l4(unix.IPPROTO_TCP),
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: tcpFlagsOffset, Len: 1},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 1, Mask: []byte{tcpFlagSYN | tcpFlagACK}, Xor: []byte{0}},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{tcpFlagSYN}},
+		&expr.Limit{Type: expr.LimitTypePkts, Rate: 50, Unit: expr.LimitTimeSecond, Burst: 100},
+		&expr.Log{Key: 1<<unix.NFTA_LOG_GROUP | 1<<unix.NFTA_LOG_SNAPLEN, Group: synLogGroup, Snaplen: synSnaplen}),
+		&expr.Verdict{Kind: expr.VerdictDrop}))
 	c.AddRule(newRule(tbl, in, "drop unsolicited inbound", nil, &expr.Verdict{Kind: expr.VerdictDrop}))
 	return c.Flush()
 }
