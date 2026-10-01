@@ -1,5 +1,7 @@
 # Migrating to sixup
 
+<strong>English</strong> | <a href="migrating.zh.md" lang="zh-Hans">简体中文</a> | <a href="migrating.ja.md" lang="ja">日本語</a>
+
 On many Linux routers, several programs and scripts set up IPv6. sixup does all of this in one
 program. This page shows how to move an existing router to sixup, step by step.
 
