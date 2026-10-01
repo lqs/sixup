@@ -29,6 +29,7 @@ var (
 	rebParams = retransParams{irt: 10 * time.Second, mrt: 600 * time.Second}
 	infParams = retransParams{irt: time.Second, mrt: 3600 * time.Second}
 	relParams = retransParams{irt: time.Second, mrc: 5}
+	decParams = retransParams{irt: time.Second, mrc: 5}
 )
 
 // clientMode is what -dhcp6c-mode selects: auto follows the M and O bits of the upstream RA.
@@ -98,6 +99,8 @@ type dhcpClient struct {
 	reconfig  chan dhcpv6.MessageType
 
 	naAddrs []netip.Addr // IA_NA addresses configured on the WAN interface
+	fresh   []netip.Addr // those the last Reply added, whose DAD is still to be seen
+	pub     SourceUpdate // what was last published to the Store
 
 	// Backoff after an explicit NoPrefixAvail: starts at 5 min, doubles, capped at 1 h, reset on binding
 	refuseBackoff time.Duration
@@ -373,10 +376,11 @@ func (c *dhcpClient) waitLinkUp(ctx context.Context) {
 // rejoinParams are Confirm's, which RFC 8415 section 18.2.12 gives the Rebind after a link change.
 var rejoinParams = retransParams{irt: time.Second, mrt: 4 * time.Second}
 
-// rejoin keeps the binding while the link is down, and confirms it with a Rebind once the link is
-// back (RFC 8415 section 18.2.12), so that a modem restarting does not renumber the LAN. Without a
-// Reply within 10 s the binding is kept as it was. It returns the binding, or nil once it is gone:
-// it expired while the link was down, the server took it back, or ctx ended.
+// rejoin keeps the binding while the link is down, and confirms it once the link is back (RFC 8415
+// section 18.2.12), so that a modem restarting does not renumber the LAN: with a Rebind while
+// there is a delegation, else with a Confirm of the addresses. Without a Reply within 10 s the
+// binding is kept as it was. It returns the binding, or nil once it is gone: it expired while the
+// link was down, the server took it back or said the addresses are not on this link, or ctx ended.
 func (c *dhcpClient) rejoin(ctx context.Context, l *lease) *lease {
 	for {
 		infof("[dhcpv6-client] link down, keeping the binding until %s", l.valid.Format(time.TimeOnly))
@@ -386,14 +390,31 @@ func (c *dhcpClient) rejoin(ctx context.Context, l *lease) *lease {
 		if !c.linkUp || ctx.Err() != nil {
 			return nil
 		}
-		reply, err := c.renewOrRebind(ctx, dhcpv6.MessageTypeRebind, rejoinParams, 10*time.Second, l)
+		mt := dhcpv6.MessageTypeRebind
+		if len(l.prefixes) == 0 {
+			mt = dhcpv6.MessageTypeConfirm
+		}
+		var reply *dhcpv6.Message
+		var err error
+		if mt == dhcpv6.MessageTypeConfirm {
+			reply, err = c.confirm(ctx, l)
+		} else {
+			reply, err = c.renewOrRebind(ctx, mt, rejoinParams, 10*time.Second, l)
+		}
 		switch {
+		case err == nil && mt == dhcpv6.MessageTypeConfirm:
+			if st := reply.Options.Status(); st != nil && st.StatusCode == iana.StatusNotOnLink {
+				infof("[dhcpv6-client] link back, the server says the addresses are not on this link, back to SOLICIT")
+				return nil
+			}
+			infof("[dhcpv6-client] link back, the server confirmed the addresses")
+			return l
 		case err == nil:
-			return c.apply(reply)
+			return c.bind(ctx, reply)
 		case errors.Is(err, errLinkDown):
 			continue
 		case errors.Is(err, errTimeout):
-			infof("[dhcpv6-client] link back, no server answered the Rebind, keeping the binding")
+			infof("[dhcpv6-client] link back, no server answered the %s, keeping the binding", mt)
 			return l
 		}
 		return nil
@@ -437,7 +458,7 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 		c.onExchangeErr(err)
 		return
 	}
-	lease := c.apply(reply)
+	lease := c.bind(ctx, reply)
 	if lease == nil {
 		if refusesEverything(reply) {
 			if c.retryUnhinted() {
@@ -489,7 +510,7 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 			reply, err = c.renewOrRebind(ctx, dhcpv6.MessageTypeRenew, renParams, mrd, lease)
 		}
 		if err == nil {
-			if l := c.apply(reply); l != nil {
+			if l := c.bind(ctx, reply); l != nil {
 				lease = l
 				continue
 			}
@@ -518,7 +539,7 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 		}
 		reply, err = c.renewOrRebind(ctx, dhcpv6.MessageTypeRebind, rebParams, mrd, lease)
 		if err == nil {
-			if l := c.apply(reply); l != nil {
+			if l := c.bind(ctx, reply); l != nil {
 				lease = l
 				continue
 			}
@@ -864,6 +885,31 @@ func (c *dhcpClient) renewOrRebind(ctx context.Context, mt dhcpv6.MessageType, p
 	return reply, err
 }
 
+// confirm asks whether the addresses of l are still on this link (RFC 8415 section 18.2.3). Any
+// server may answer, so the message names none, and the lifetimes are left at 0.
+func (c *dhcpClient) confirm(ctx context.Context, l *lease) (*dhcpv6.Message, error) {
+	p := rejoinParams
+	p.mrd = 10 * time.Second
+	var reply *dhcpv6.Message
+	err := c.exchange(ctx, dhcpv6.MessageTypeConfirm, p, func(el time.Duration, tid dhcpv6.TransactionID) *dhcpv6.Message {
+		na := &dhcpv6.OptIANA{IaId: c.iaid}
+		for _, a := range l.addrs {
+			na.Options.Add(&dhcpv6.OptIAAddress{IPv6Addr: a.AsSlice()})
+		}
+		m, _ := dhcpv6.NewMessage(dhcpv6.WithClientID(c.duid), dhcpv6.WithOption(dhcpv6.OptElapsedTime(el)), dhcpv6.WithOption(na))
+		m.MessageType = dhcpv6.MessageTypeConfirm
+		m.TransactionID = tid
+		return m
+	}, func(m *dhcpv6.Message) (bool, bool) {
+		if m.MessageType != dhcpv6.MessageTypeReply || !c.forUs(m) {
+			return false, false
+		}
+		reply = m
+		return true, true
+	})
+	return reply, err
+}
+
 // infoCycle sends only Information-Request, for upstream RA with only the O bit.
 func (c *dhcpClient) infoCycle(ctx context.Context) {
 	var reply *dhcpv6.Message
@@ -909,8 +955,8 @@ func (c *dhcpClient) exchange(ctx context.Context, mt dhcpv6.MessageType, p retr
 	if p.mrd > 0 {
 		deadline = begin.Add(p.mrd)
 	}
-	// Random delay 0..SOL_MAX_DELAY before the first SOLICIT
-	if mt == dhcpv6.MessageTypeSolicit || mt == dhcpv6.MessageTypeInformationRequest {
+	// Random delay 0..SOL_MAX_DELAY, INF_MAX_DELAY or CNF_MAX_DELAY before the first message
+	if mt == dhcpv6.MessageTypeSolicit || mt == dhcpv6.MessageTypeInformationRequest || mt == dhcpv6.MessageTypeConfirm {
 		select {
 		case <-time.After(time.Duration(rand.Int64N(int64(time.Second)))):
 		case <-ctx.Done():
@@ -1161,6 +1207,12 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 			}
 		}
 	}
+	c.fresh = c.fresh[:0]
+	for _, a := range l.addrs {
+		if !slices.Contains(c.naAddrs, a) {
+			c.fresh = append(c.fresh, a)
+		}
+	}
 	// Remove IA_NA addresses no longer assigned
 	for _, old := range c.naAddrs {
 		keep := false
@@ -1176,6 +1228,7 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 		upd.WANAddr = l.addrs[0]
 	}
 	upd.Prefixes = l.prefixes
+	c.pub = upd
 	c.store.Set("pd", upd)
 	if len(l.prefixes) == 0 && len(l.addrs) == 0 {
 		return nil
@@ -1192,6 +1245,97 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 	l.t1, l.t2, l.valid = now.Add(t1), now.Add(t2), now.Add(maxValid)
 	infof("[dhcpv6-client] bound %d prefixes %d addresses, T1=%s T2=%s", len(l.prefixes), len(l.addrs), t1, t2)
 	return l
+}
+
+// bind applies a Reply, then waits for the kernel's DAD on the addresses it added and declines
+// those another node already uses (RFC 8415 sections 18.2.8 and 18.2.10.1). It returns nil when
+// nothing is left of the binding, so that a new Solicit asks for other addresses.
+func (c *dhcpClient) bind(ctx context.Context, reply *dhcpv6.Message) *lease {
+	l := c.apply(reply)
+	if l == nil || len(c.fresh) == 0 || dryRun {
+		return l
+	}
+	dup := c.awaitDAD(ctx, c.fresh)
+	if len(dup) == 0 {
+		return l
+	}
+	for _, a := range dup {
+		warnf("[dhcpv6-client] WAN address %s failed DAD: another node on the link uses it, declining it", a)
+		addrDel(c.ifi.Index, a, 128)
+	}
+	l.addrs = slices.DeleteFunc(l.addrs, func(a netip.Addr) bool { return slices.Contains(dup, a) })
+	c.naAddrs = l.addrs
+	c.pub.WANAddr = netip.Addr{}
+	if len(l.addrs) > 0 {
+		c.pub.WANAddr = l.addrs[0]
+	}
+	c.store.Set("pd", c.pub)
+	c.decline(ctx, dup)
+	if len(l.prefixes) == 0 && len(l.addrs) == 0 {
+		return nil
+	}
+	return l
+}
+
+// awaitDAD polls the WAN interface until none of addrs is tentative, and returns those that failed.
+// The kernel marks a failed address only when it has no lifetime; one with a lifetime, as these
+// have, it deletes, so an address gone from the interface failed too. It gives up after 10 s,
+// enough for DupAddrDetectTransmits well above the default of 1.
+func (c *dhcpClient) awaitDAD(ctx context.Context, addrs []netip.Addr) []netip.Addr {
+	t := time.NewTicker(200 * time.Millisecond)
+	defer t.Stop()
+	limit := time.After(10 * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-limit:
+			return nil
+		case <-t.C:
+		}
+		list, err := addrList(c.ifi.Index)
+		if err != nil {
+			continue
+		}
+		var failed []netip.Addr
+		pending := false
+		for _, a := range addrs {
+			i := slices.IndexFunc(list, func(ia ifAddr) bool { return ia.Addr == a })
+			switch {
+			case i < 0 || list[i].Flags&ifaFDadFailed != 0:
+				failed = append(failed, a)
+			case list[i].Flags&ifaFTentative != 0:
+				pending = true
+			}
+		}
+		if !pending {
+			return failed
+		}
+	}
+}
+
+// decline tells the server that addrs are in use by another node (RFC 8415 section 18.2.8). Any
+// Reply ends the exchange; without one, the addresses are given up all the same.
+func (c *dhcpClient) decline(ctx context.Context, addrs []netip.Addr) {
+	err := c.exchange(ctx, dhcpv6.MessageTypeDecline, decParams, func(el time.Duration, tid dhcpv6.TransactionID) *dhcpv6.Message {
+		na := &dhcpv6.OptIANA{IaId: c.iaid}
+		for _, a := range addrs {
+			na.Options.Add(&dhcpv6.OptIAAddress{IPv6Addr: a.AsSlice()})
+		}
+		m, _ := dhcpv6.NewMessage(dhcpv6.WithClientID(c.duid), dhcpv6.WithOption(dhcpv6.OptElapsedTime(el)),
+			dhcpv6.WithServerID(c.serverID), dhcpv6.WithOption(na))
+		m.MessageType = dhcpv6.MessageTypeDecline
+		m.TransactionID = tid
+		return m
+	}, func(m *dhcpv6.Message) (bool, bool) {
+		ok := m.MessageType == dhcpv6.MessageTypeReply && c.forUs(m)
+		return ok, ok
+	})
+	if err != nil {
+		debugf("[dhcpv6-client] DECLINE not acknowledged: %v", err)
+		return
+	}
+	infof("[dhcpv6-client] DECLINE acknowledged")
 }
 
 func (c *dhcpClient) clearLease() {

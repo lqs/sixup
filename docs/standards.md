@@ -123,20 +123,20 @@ the Linux stack alone.
 
 | Test | Title | sixup | Tested by |
 |---|---|---|---|
-| 1.1.1 | Basic Message Exchange | 🟡 Partly. After the link returns the binding is confirmed with a Rebind, not a Confirm; no Decline | `TestDHCPv6ClientAgainstKernel` |
+| 1.1.1 | Basic Message Exchange | 🟢 Passes. In part B a Confirm is sent only without a delegation; with one, as in the test setup, a Rebind is, as RFC 8415 section 18.2.12 asks | `TestDHCPv6ClientAgainstKernel`, `TestDHCPv6ClientDeclinesAgainstKernel`, `TestDHCPv6ClientConfirmsAgainstKernel` |
 | 1.1.2 | Implementation of DHCP constants | 🟢 Passes | `TestNextRT` |
 | 1.1.3 | DHCPv6 Option Format | 🟢 Passes | None |
 | 1.1.4 | Client DHCP Unique Identifier Contents | 🟢 Passes | None |
-| 1.1.5 | Elapsed Time Option Format | 🟡 Partly. Confirm and Decline are missing | None |
+| 1.1.5 | Elapsed Time Option Format | 🟡 Partly. A Confirm is sent only without a delegation, as in 1.1.10 | `TestDHCPv6ClientDeclinesAgainstKernel`, `TestDHCPv6ClientConfirmsAgainstKernel` |
 | 1.1.6 | Identity Association Consistency | 🟢 Passes | None |
 | 1.1.7 | Transmission of Solicit Messages | 🟢 Passes | `TestNextRT` |
 | 1.1.8 | Message Exchange Termination for Solicit messages | 🟢 Passes | None |
 | 1.1.9 | Transmission of Request message | 🟢 Passes | None |
-| 1.1.10 | Transmission of Confirm messages | ⌛ Not yet. A Rebind is sent instead of a Confirm | None |
+| 1.1.10 | Transmission of Confirm messages | 🟡 Partly. Passes without a delegation, `-dhcp6c-pd-len 0`; with one, as in the test setup, a Rebind with the parameters of the Confirm is sent instead, as RFC 8415 section 18.2.12 asks | `TestDHCPv6ClientConfirmsAgainstKernel` |
 | 1.1.11 | Transmission of Renew messages | 🟢 Passes | `TestDHCPv6ClientAgainstKernel` |
 | 1.1.12 | Transmission of Rebind message | 🟢 Passes | None |
 | 1.1.13 | Transmission of Release messages | 🟡 Partly. Release only on exit, within 3 to 4 seconds so that exit is not delayed | None |
-| 1.1.14 | Transmission of Decline messages | ⌛ Not yet. No Decline after DAD fails | None |
+| 1.1.14 | Transmission of Decline messages | 🟢 Passes. An IA_NA address that fails DAD is removed and declined | `TestDHCPv6ClientDeclinesAgainstKernel` |
 | 1.1.15 | Reception of Advertise messages | ⌛ Not yet. An Advertise that assigns nothing ends the Solicit | None |
 | 1.1.16 | Client Initiated Exchange – Reception of a Reply message | 🟡 Partly. A Reply with a status other than Success, or without an IA, is not handled as RFC 8415 section 18.2.10 says | `TestApplyReply` |
 | 1.1.17 | Reception of Reply messages for DNS Configuration options | 🙅 Not done on purpose. The router's own resolver is the system's | None |

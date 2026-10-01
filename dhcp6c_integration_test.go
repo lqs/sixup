@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv6"
+	"github.com/insomniacslk/dhcp/iana"
 	"github.com/mdlayher/netlink"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
@@ -67,9 +68,11 @@ type fakeServer struct {
 	ifi    *net.Interface
 	duid   dhcpv6.DUID
 	prefix netip.Prefix
+	na     netip.Addr // the address of an IA_NA, if any
 	seen   chan *dhcpv6.Message
 	silent atomic.Bool
 	short  atomic.Bool // T1 of 2 s in the next Reply, to see a Renew soon
+	moved  atomic.Bool // answer a Confirm with NotOnLink
 }
 
 func (s *fakeServer) serve() {
@@ -101,6 +104,15 @@ func (s *fakeServer) serve() {
 		resp.TransactionID = msg.TransactionID
 		resp.AddOption(dhcpv6.OptServerID(s.duid))
 		resp.AddOption(dhcpv6.OptClientID(msg.Options.ClientID()))
+		if msg.MessageType == dhcpv6.MessageTypeConfirm {
+			st := &dhcpv6.OptStatusCode{StatusCode: iana.StatusSuccess}
+			if s.moved.Load() {
+				st.StatusCode = iana.StatusNotOnLink
+			}
+			resp.AddOption(st)
+			s.pc.WriteTo(resp.ToBytes(), &ipv6.ControlMessage{IfIndex: s.ifi.Index}, src)
+			continue
+		}
 		for _, ia := range msg.Options.IAPD() {
 			t1 := 300 * time.Second
 			if s.short.Load() && msg.MessageType != dhcpv6.MessageTypeSolicit {
@@ -110,6 +122,14 @@ func (s *fakeServer) serve() {
 			pd := &dhcpv6.OptIAPD{IaId: ia.IaId, T1: t1, T2: 2 * t1}
 			pd.Options.Add(&dhcpv6.OptIAPrefix{Prefix: prefixToIPNet(s.prefix), PreferredLifetime: time.Hour, ValidLifetime: 2 * time.Hour})
 			resp.AddOption(pd)
+		}
+		for _, ia := range msg.Options.IANA() {
+			if !s.na.IsValid() || msg.MessageType == dhcpv6.MessageTypeDecline {
+				continue
+			}
+			na := &dhcpv6.OptIANA{IaId: ia.IaId, T1: 300 * time.Second, T2: 600 * time.Second}
+			na.Options.Add(&dhcpv6.OptIAAddress{IPv6Addr: s.na.AsSlice(), PreferredLifetime: time.Hour, ValidLifetime: 2 * time.Hour})
+			resp.AddOption(na)
 		}
 		s.pc.WriteTo(resp.ToBytes(), &ipv6.ControlMessage{IfIndex: s.ifi.Index}, src)
 	}
@@ -247,6 +267,104 @@ func TestDHCPv6ClientAgainstKernel(t *testing.T) {
 		t.Fatal("the store lost the prefix over a link going down")
 	default:
 	}
+}
+
+// An IA_NA address another node on the link already has fails DAD, and is declined and given up
+// (RFC 8415 section 18.2.8, CE Router test 1.1.1 part F), while the delegation is kept.
+func TestDHCPv6ClientDeclinesAgainstKernel(t *testing.T) {
+	if !ownNetns(t) {
+		return
+	}
+	s := dhcpv6Link(t)
+	s.na = netip.MustParseAddr("2001:db8:1::99")
+	// the server's side holds the address, and answers the client's DAD for it
+	if err := addrSet(mustIface(t, "srv-test0"), s.na, 64, time.Hour, time.Hour, false, ifaFNodad); err != nil {
+		t.Fatal(err)
+	}
+	if err := sysctlWrite("/proc/sys/net/ipv6/conf/wan-test0/accept_dad", "1"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := newStore("pd", []lanDef{{"lan0", 0}}, time.Minute, nil, false, 0, 0, "")
+	c := newDHCPClient("wan-test0", store, t.TempDir(), 56, true)
+	go c.run(ctx, false)
+
+	s.expect(t, dhcpv6.MessageTypeRequest, 5*time.Second)
+	dec := s.expect(t, dhcpv6.MessageTypeDecline, 5*time.Second)
+	if !dec.Options.ServerID().Equal(s.duid) || dec.Options.ElapsedTime() != 0 {
+		t.Fatalf("Decline without the server or with an elapsed time: %v", dec)
+	}
+	ias := dec.Options.IANA()
+	if len(ias) != 1 || len(ias[0].Options.Addresses()) != 1 || !ias[0].Options.Addresses()[0].IPv6Addr.Equal(s.na.AsSlice()) {
+		t.Fatalf("Decline does not name %s: %v", s.na, dec)
+	}
+	time.Sleep(200 * time.Millisecond) // the Reply to the Decline
+	list, err := addrList(mustIface(t, "wan-test0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ia := range list {
+		if ia.Addr == s.na {
+			t.Fatalf("%s still on the WAN after the Decline", s.na)
+		}
+	}
+	snap := store.Current()
+	if snap.WANAddr == s.na {
+		t.Fatalf("%s still the WAN address", s.na)
+	}
+	if len(snap.WAN) == 0 {
+		t.Fatal("the delegation went with the declined address")
+	}
+}
+
+// Without a delegation, a link that comes back has its addresses confirmed with a Confirm (RFC 8415
+// sections 18.2.3 and 18.2.12, CE Router test 1.1.10), which names no server and leaves the
+// lifetimes at 0. The binding stays on Success, and a NotOnLink sends the client back to Solicit.
+func TestDHCPv6ClientConfirmsAgainstKernel(t *testing.T) {
+	if !ownNetns(t) {
+		return
+	}
+	s := dhcpv6Link(t)
+	s.na = netip.MustParseAddr("2001:db8:1::99")
+	wan := mustIface(t, "wan-test0")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := newStore("pd", []lanDef{{"lan0", 0}}, time.Minute, nil, false, 0, 0, "")
+	c := newDHCPClient("wan-test0", store, t.TempDir(), 0, true)
+	c.link = newLinkHub(ctx).Subscribe("wan-test0")
+	go c.run(ctx, false)
+	s.expect(t, dhcpv6.MessageTypeRequest, 5*time.Second)
+	time.Sleep(200 * time.Millisecond) // the Reply applied
+
+	flap := func() *dhcpv6.Message {
+		t.Helper()
+		linkDown(t, wan)
+		time.Sleep(time.Second)
+		linkUp(t, wan)
+		return s.expect(t, dhcpv6.MessageTypeConfirm, 10*time.Second)
+	}
+	cnf := flap()
+	if cnf.Options.ServerID() != nil || cnf.Options.ElapsedTime() != 0 {
+		t.Fatalf("Confirm names a server or starts with an elapsed time: %v", cnf)
+	}
+	ias := cnf.Options.IANA()
+	if len(ias) != 1 || len(ias[0].Options.Addresses()) != 1 {
+		t.Fatalf("Confirm without the address: %v", cnf)
+	}
+	if a := ias[0].Options.Addresses()[0]; !a.IPv6Addr.Equal(s.na.AsSlice()) || a.PreferredLifetime != 0 || a.ValidLifetime != 0 {
+		t.Fatalf("Confirm names %v with lifetimes %s and %s", a.IPv6Addr, a.PreferredLifetime, a.ValidLifetime)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if store.Current().WANAddr != s.na {
+		t.Fatal("the confirmed address left the store")
+	}
+
+	s.moved.Store(true)
+	flap()
+	s.expect(t, dhcpv6.MessageTypeSolicit, 5*time.Second)
 }
 
 // Waiting for the RA as main does, the client starts on its M or O flags and asks for a prefix
