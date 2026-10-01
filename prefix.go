@@ -83,6 +83,7 @@ type SourceUpdate struct {
 	DNS      []netip.Addr
 	DNSSL    []string
 	NTP      []netip.Addr   // NTP and SNTP servers from DHCPv6, passed on to the LAN (RFC 7084 L-12)
+	Options  []dhcpOption   // other DHCPv6 options passed on to the LAN as they came, by code
 	PREF64   netip.Prefix   // NAT64 prefix from the upstream RA (RFC 8781); zero when absent
 	MTU      int            // WAN path MTU: the RA MTU option, else the WAN interface MTU
 	WANAddr  netip.Addr     // WAN address from IA_NA or SLAAC
@@ -103,6 +104,7 @@ type Snapshot struct {
 	DNS     []netip.Addr        `json:"dns"`
 	DNSSL   []string            `json:"dnssl"`
 	NTP     []netip.Addr        `json:"ntp,omitempty"`
+	Options []dhcpOption        `json:"dhcpv6_options,omitempty"`
 	PREF64  netip.Prefix        `json:"pref64,omitempty"`
 	WANMTU  int                 `json:"wan_mtu,omitempty"` // drives both the downstream RA MTU option and the tunnel MTU
 	WANAddr netip.Addr          `json:"wan_addr"`
@@ -383,6 +385,7 @@ func (s *Store) recompute(now time.Time) {
 		DNS:     u.DNS,
 		DNSSL:   u.DNSSL,
 		NTP:     u.NTP,
+		Options: u.Options,
 		PREF64:  u.PREF64,
 		NAT64:   s.nat64,
 		WANMTU:  u.MTU,
@@ -405,6 +408,9 @@ func (s *Store) recompute(now time.Time) {
 			}
 			if len(next.NTP) == 0 {
 				next.NTP = o.NTP
+			}
+			if len(next.Options) == 0 {
+				next.Options = o.Options
 			}
 			if !next.PREF64.IsValid() {
 				next.PREF64 = o.PREF64
@@ -677,7 +683,7 @@ func (s *Store) recompute(now time.Time) {
 		if change == changeNone && !slices.Equal(s.cur.DNS, next.DNS) {
 			change = changeRenew
 		}
-		if change == changeNone && (!slices.Equal(s.cur.DNSSL, next.DNSSL) || !slices.Equal(s.cur.NTP, next.NTP)) {
+		if change == changeNone && (!slices.Equal(s.cur.DNSSL, next.DNSSL) || !slices.Equal(s.cur.NTP, next.NTP) || !slices.EqualFunc(s.cur.Options, next.Options, dhcpOption.equal)) {
 			change = changeRenew
 		}
 		if change == changeNone && (s.cur.PREF64 != next.PREF64 || s.cur.NAT64 != next.NAT64 || s.cur.WANMTU != next.WANMTU) {

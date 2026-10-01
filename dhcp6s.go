@@ -240,7 +240,7 @@ func (s *dhcpServer) handle(msg *dhcpv6.Message, peer netip.Addr) *dhcpv6.Messag
 	if cid != nil {
 		resp.AddOption(dhcpv6.OptClientID(cid))
 	}
-	s.addInfo(resp)
+	s.addInfo(resp, msg)
 	if cid == nil {
 		return resp // an anonymous Information-Request
 	}
@@ -354,8 +354,9 @@ func (s *dhcpServer) iaStatus(iaid [4]byte, code iana.StatusCode, text string) *
 	return ia
 }
 
-// addInfo appends DNS and search list from upstream or the config override.
-func (s *dhcpServer) addInfo(resp *dhcpv6.Message) {
+// addInfo appends DNS and search list from upstream or the config override, the time servers, and
+// the other options of the upstream that msg asks for.
+func (s *dhcpServer) addInfo(resp, msg *dhcpv6.Message) {
 	dns := s.dns.resolve(s.snap, s.ifi)
 	if len(dns) > 0 {
 		var ips []net.IP
@@ -378,6 +379,12 @@ func (s *dhcpServer) addInfo(resp *dhcpv6.Message) {
 		}
 		resp.AddOption(ntp)
 		resp.AddOption(dhcpv6.OptSNTP(ips...))
+	}
+	oro := msg.Options.RequestedOptions()
+	for _, o := range s.snap.Options {
+		if slices.Contains(oro, o.Code) {
+			resp.AddOption(&dhcpv6.OptionGeneric{OptionCode: o.Code, OptionData: o.Data})
+		}
 	}
 }
 

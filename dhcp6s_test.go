@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/hex"
 	"net"
 	"net/netip"
@@ -362,5 +363,21 @@ func TestServerPassesNTPOn(t *testing.T) {
 	}
 	if got := resp.Options.SNTP(); len(got) != 1 {
 		t.Fatalf("SNTP: %v", got)
+	}
+}
+
+// The SIP servers of the upstream reach the hosts that ask for them (RFC 7084 L-12)
+func TestServerPassesSIPOn(t *testing.T) {
+	s := newTestServer(false)
+	sip := net.ParseIP("2001:db8::5060")
+	s.snap.Options = []dhcpOption{{dhcpv6.OptionSIPServersIPv6AddressList, sip}}
+	resp := s.handle(cliMsg(dhcpv6.MessageTypeInformationRequest), peerLL)
+	if resp.Options.GetOne(dhcpv6.OptionSIPServersIPv6AddressList) != nil {
+		t.Fatal("SIP servers sent unasked")
+	}
+	resp = s.handle(cliMsg(dhcpv6.MessageTypeInformationRequest, dhcpv6.OptRequestedOption(dhcpv6.OptionSIPServersIPv6AddressList)), peerLL)
+	o := resp.Options.GetOne(dhcpv6.OptionSIPServersIPv6AddressList)
+	if o == nil || !bytes.Equal(o.ToBytes(), sip) {
+		t.Fatalf("SIP servers: %v", o)
 	}
 }

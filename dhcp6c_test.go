@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -85,7 +86,12 @@ func TestParseCommon(t *testing.T) {
 		key[i] = byte(i)
 	}
 	rep.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionAuth, OptionData: key})
+	sip := net.ParseIP("2001:db8::5060")
+	rep.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionSIPServersIPv6AddressList, OptionData: sip})
 	upd := c.parseCommon(rep)
+	if want := []dhcpOption{{dhcpv6.OptionSIPServersIPv6AddressList, sip}}; !slices.EqualFunc(upd.Options, want, dhcpOption.equal) {
+		t.Fatalf("options passed on: %v", upd.Options)
+	}
 	if len(upd.DNS) != 2 || upd.DNS[0] != netip.MustParseAddr("2001:db8::53") {
 		t.Fatalf("dns: %v", upd.DNS)
 	}

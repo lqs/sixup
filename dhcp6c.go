@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/md5"
@@ -52,6 +53,20 @@ var (
 )
 
 const optionReconfAccept dhcpv6.OptionCode = 20
+
+// passedOn are the options of the upstream that the LAN's DHCPv6 server hands on as they came, for
+// the hosts that ask (RFC 7084 L-12): the SIP servers of RFC 3319, the last of the configuration
+// options RFC 3736 section 5.3 lists. DNS and NTP are read instead, as the RA and the config
+// overrides need them too.
+var passedOn = []dhcpv6.OptionCode{dhcpv6.OptionSIPServersDomainNameList, dhcpv6.OptionSIPServersIPv6AddressList}
+
+// dhcpOption is an option of the upstream kept as it came.
+type dhcpOption struct {
+	Code dhcpv6.OptionCode `json:"code"`
+	Data []byte            `json:"data"`
+}
+
+func (o dhcpOption) equal(p dhcpOption) bool { return o.Code == p.Code && bytes.Equal(o.Data, p.Data) }
 
 var allRouters = netip.MustParseAddr("ff02::1:2")
 
@@ -641,12 +656,12 @@ func (c *dhcpClient) baseOptions(elapsed time.Duration) []dhcpv6.Modifier {
 		dhcpv6.WithClientID(c.duid),
 		dhcpv6.WithOption(dhcpv6.OptElapsedTime(elapsed)),
 		dhcpv6.WithOption(&dhcpv6.OptionGeneric{OptionCode: optionReconfAccept}),
-		dhcpv6.WithRequestedOptions(
+		dhcpv6.WithRequestedOptions(append([]dhcpv6.OptionCode{
 			dhcpv6.OptionDNSRecursiveNameServer, dhcpv6.OptionDomainSearchList,
 			dhcpv6.OptionAFTRName, dhcpv6.OptionS46ContMapE, dhcpv6.OptionS46ContMapT, dhcpv6.OptionS46ContLW,
 			dhcpv6.OptionSolMaxRT, dhcpv6.OptionInfMaxRT, dhcpv6.OptionInformationRefreshTime,
 			dhcpv6.OptionNTPServer, dhcpv6.OptionSNTPServerList, dhcpv6.OptionPDExclude,
-		),
+		}, passedOn...)...),
 	}
 	return mods
 }
@@ -995,7 +1010,7 @@ type lease struct {
 	valid    time.Time
 }
 
-// parseCommon extracts DNS, search domains, tunnel parameters and SOL_MAX_RT.
+// parseCommon extracts DNS, search domains, time servers, the options passed on, tunnel parameters and SOL_MAX_RT.
 func (c *dhcpClient) parseCommon(reply *dhcpv6.Message) SourceUpdate {
 	var upd SourceUpdate
 	for _, ip := range reply.Options.DNS() {
@@ -1009,6 +1024,11 @@ func (c *dhcpClient) parseCommon(reply *dhcpv6.Message) SourceUpdate {
 	for _, ip := range append(reply.Options.NTPServers(), reply.Options.SNTP()...) {
 		if a, ok := netip.AddrFromSlice(ip); ok && !slices.Contains(upd.NTP, a.Unmap()) {
 			upd.NTP = append(upd.NTP, a.Unmap())
+		}
+	}
+	for _, code := range passedOn {
+		if o := reply.Options.GetOne(code); o != nil {
+			upd.Options = append(upd.Options, dhcpOption{code, o.ToBytes()})
 		}
 	}
 	if o := reply.Options.GetOne(dhcpv6.OptionSolMaxRT); o != nil {

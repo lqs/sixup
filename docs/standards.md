@@ -76,7 +76,7 @@ ULA, security (S) and the transition sections on top.
 | L-9 | M off and O on unless addresses come from DHCPv6 (SHOULD) | 🟢 Done | None |
 | L-10 | DNS servers and search list in DHCPv6 (MUST) | 🟢 Done | `TestServerInformationRequest` |
 | L-11 | RDNSS and DNSSL in the RA (MUST) | 🟢 Done | `TestRABuildPrefixAndDNS`, `TestRABuildOverridesAndExtras` |
-| L-12 | Pass WAN DHCPv6 options on to the LAN (SHOULD) | 🟡 Partly. DNS servers, search list, and NTP and SNTP servers | `TestServerInformationRequest`, `TestServerPassesNTPOn` |
+| L-12 | Pass WAN DHCPv6 options on to the LAN (SHOULD) | 🟢 Done. DNS servers, search list, NTP and SNTP servers, and the SIP servers of RFC 3319 to the hosts that ask, which completes the configuration options of RFC 3736 section 5.3 | `TestServerInformationRequest`, `TestServerPassesNTPOn`, `TestServerPassesSIPOn`, `TestParseCommon` |
 | L-13 | A replaced prefix is advertised at once with preferred lifetime 0 (MUST) | 🟢 Done, with valid lifetime 0 too as RFC 9096 asks, for `-lan-deprecate-hold` | `TestRABuildDeprecatedPrefix`, `TestStoreLifecycle`, `TestLifetimeClamp`, `TestRAWithdrawsStalePrefixes` |
 | L-14 | ICMPv6 code 5 for traffic from an invalidated prefix (MUST) | 🟢 Done, for any source outside the LAN and delegated prefixes, unless `-source-filter=false` | `TestFirewallBorderAgainstKernel` |
 | 6RD-1 | 6rd configured from DHCPv4 option 212 (MUST, when 6rd is supported) | ➖ Not applicable. sixup has no 6rd | None |
