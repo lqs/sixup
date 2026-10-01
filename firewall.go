@@ -28,6 +28,19 @@ const eifTimeout = 5 * time.Minute
 // ports. Once it is full, new endpoints stay unreachable until old ones time out.
 const eifMax = 65536
 
+// ipsSrcNAT and ipsDstNAT are the conntrack status bits of a flow that source or destination NAT
+// translated, IPS_SRC_NAT and IPS_DST_NAT.
+const (
+	ipsSrcNAT = 1 << 4
+	ipsDstNAT = 1 << 5
+)
+
+// ulaNet and ulaMask are fc00::/7, masked whole so that nft list shows "ip6 saddr fc00::/7".
+var (
+	ulaNet  = netip.MustParseAddr("fc00::").As16()
+	ulaMask = netip.MustParseAddr("fe00::").As16()
+)
+
 // ipprotoHIP is the Host Identity Protocol (RFC 7401), which x/sys/unix does not name.
 const ipprotoHIP = 139
 
@@ -37,6 +50,12 @@ const ipprotoHIP = 139
 // from its own prefixes and is told why otherwise (S-2, L-14), and the WAN reaches only those
 // prefixes, none at all before the line has handed any out (G-3).
 //
+// What other interfaces, such as a container bridge, send out is looked at after source NAT
+// instead, so that the operator's own NAT66 of a ULA works: what it translated goes out, and what
+// would leave with a ULA or a foreign source is dropped, as a postrouting chain cannot reject.
+// Likewise what the operator's NAT forwards in, a port Docker publishes or the reply to what its
+// source NAT translated, passes the checks on where it goes.
+//
 // With inbound set, for -unsolicited request and deny, it is also the simple security of RFC 6092.
 // Traffic from the WAN to the LAN is then let through when it belongs to a flow the LAN started,
 // when it is one of the ICMPv6 messages RFC 4890 says must pass, when it is IPsec or HIP (REC-21
@@ -44,9 +63,11 @@ const ipprotoHIP = 139
 // endpoint-independent filtering REC-17 and REC-33 make the default, which is what lets
 // peer-to-peer programs meet), or when PCP opened a pinhole for it. Traffic for a prefix
 // delegated to a downstream router is that router's to filter. Anything else from the WAN is
-// dropped. Only forwarded traffic is looked at; the router's own services are the operator's.
+// dropped. Only forwarded traffic is looked at; the router's own services and traffic are the
+// operator's.
 type firewall struct {
 	wan     string
+	lans    []string            // the interfaces sixup serves
 	inbound bool                // filter unsolicited traffic from the WAN
 	source  bool                // refuse LAN sources outside ours (-source-filter)
 	holeIn  chan []portMapping  // PCP's pinholes, the latest set replacing the last
@@ -147,14 +168,28 @@ func (f *firewall) install() error {
 		}
 	}
 
+	lans := &nftables.Set{Table: tbl, Name: "lans", Constant: true, KeyType: nftables.TypeIFName}
+	var names []nftables.SetElement
+	for _, l := range f.lans {
+		names = append(names, nftables.SetElement{Key: ifname(l)})
+	}
+	if err := c.AddSet(lans, names); err != nil {
+		return err
+	}
+	fromLAN := []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Lookup{SourceRegister: 1, SetName: lans.Name},
+	}
+
 	fwd := c.AddChain(&nftables.Chain{
 		Name: "forward", Table: tbl, Type: nftables.ChainTypeFilter,
 		Hooknum: nftables.ChainHookForward, Priority: nftables.ChainPriorityFilter,
 		Policy: chainPolicy(nftables.ChainPolicyAccept),
 	})
 	// The border, in every mode. A ULA the upstream advertises is of the same site and crosses the
-	// WAN (RFC 4193 section 4.3); what leaves for another is refused with code 1, so that its
-	// sender learns it at once instead of timing out.
+	// WAN (RFC 4193 section 4.3); what the LAN sends out for another is refused with code 1, so
+	// that its sender learns it at once instead of timing out. What arrives for a ULA is checked
+	// after the operator's destination NAT has had its say, below.
 	for _, dir := range []struct {
 		key     expr.MetaKey
 		what    string
@@ -167,19 +202,20 @@ func (f *firewall) install() error {
 			offset uint32
 			what   string
 		}{{8, "from"}, {24, "to"}} {
-			c.AddRule(newRule(tbl, fwd, fmt.Sprintf("nothing %s a ULA of another site may %s %s (RFC 7084 ULA-4)", addr.what, dir.what, f.wan), append(f.ipv6(dir.key),
-				&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: addr.offset, Len: 1},
-				&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 1, Mask: []byte{0xfe}, Xor: []byte{0}},
-				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0xfc}},
-				&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: addr.offset, Len: 16},
-				&expr.Lookup{SourceRegister: 1, SetName: f.upULA.Name, Invert: true}),
-				dir.verdict))
+			if dir.key == expr.MetaKeyIIFNAME && addr.offset == 24 {
+				continue
+			}
+			match := f.ipv6(dir.key)
+			comment := fmt.Sprintf("nothing %s a ULA of another site may %s %s (RFC 7084 ULA-4)", addr.what, dir.what, f.wan)
+			if dir.key == expr.MetaKeyOIFNAME && addr.offset == 8 {
+				match = append(match, fromLAN...)
+				comment = fmt.Sprintf("nothing from a ULA of another site may leave the LAN by %s (RFC 7084 ULA-4)", f.wan)
+			}
+			c.AddRule(newRule(tbl, fwd, comment, append(match, f.foreignULA(addr.offset)...), dir.verdict))
 		}
 	}
 	if f.source {
-		c.AddRule(newRule(tbl, fwd, "the LAN sends out only from its own prefixes, and is told so otherwise (RFC 7084 S-2 and L-14)", append(f.ipv6(expr.MetaKeyOIFNAME),
-			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: ifname(f.wan)},
+		c.AddRule(newRule(tbl, fwd, "the LAN sends out only from its own prefixes, and is told so otherwise (RFC 7084 S-2 and L-14)", append(append(f.ipv6(expr.MetaKeyOIFNAME), fromLAN...),
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16},
 			&expr.Lookup{SourceRegister: 1, SetName: f.ours.Name, Invert: true}),
 			&expr.Reject{Type: unix.NFT_REJECT_ICMP_UNREACH, Code: 5}))
@@ -191,12 +227,42 @@ func (f *firewall) install() error {
 		&expr.Lookup{SourceRegister: 1, SetName: f.ours.Name},
 		&expr.Lookup{SourceRegister: 1, SetName: f.shared.Name, Invert: true}),
 		&expr.Verdict{Kind: expr.VerdictDrop}))
+	// A port the operator forwards with destination NAT, as Docker does for a published port, is
+	// meant to be reached, though it leads to a ULA or outside our prefixes. So are the replies to
+	// what its source NAT translated, which conntrack has turned back to the ULA by now.
+	c.AddRule(newRule(tbl, fwd, "let what the operator's NAT forwards in", append(f.ipv6(expr.MetaKeyIIFNAME), ctBits(expr.CtKeySTATUS, ipsSrcNAT|ipsDstNAT)...),
+		&expr.Verdict{Kind: expr.VerdictAccept}))
+	c.AddRule(newRule(tbl, fwd, fmt.Sprintf("nothing to a ULA of another site may arrive on %s (RFC 7084 ULA-4)", f.wan), append(f.ipv6(expr.MetaKeyIIFNAME), f.foreignULA(24)...),
+		&expr.Verdict{Kind: expr.VerdictDrop}))
 	if f.source {
 		c.AddRule(newRule(tbl, fwd, "the WAN reaches only the LAN prefixes, none before the line hands one out (RFC 7084 G-3)", append(f.ipv6(expr.MetaKeyIIFNAME),
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 24, Len: 16},
 			&expr.Lookup{SourceRegister: 1, SetName: f.ours.Name, Invert: true}),
 			&expr.Verdict{Kind: expr.VerdictDrop}))
 	}
+
+	// After source NAT, which runs at priority 100, what leaves by the WAN is checked again. The
+	// LAN has passed the forward rules already; this catches the other interfaces.
+	post := c.AddChain(&nftables.Chain{
+		Name: "postrouting", Table: tbl, Type: nftables.ChainTypeFilter,
+		Hooknum: nftables.ChainHookPostrouting, Priority: nftables.ChainPriorityRef(*nftables.ChainPriorityNATSource + 1),
+		Policy: chainPolicy(nftables.ChainPolicyAccept),
+	})
+	c.AddRule(newRule(tbl, post, "let what the operator's source NAT translated out", append(f.ipv6(expr.MetaKeyOIFNAME), ctBits(expr.CtKeySTATUS, ipsSrcNAT)...),
+		&expr.Verdict{Kind: expr.VerdictAccept}))
+	c.AddRule(newRule(tbl, post, "let the router's own traffic out", append(f.ipv6(expr.MetaKeyOIFNAME),
+		&expr.Fib{Register: 1, ResultADDRTYPE: true, FlagSADDR: true},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(unix.RTN_LOCAL)}),
+		&expr.Verdict{Kind: expr.VerdictAccept}))
+	c.AddRule(newRule(tbl, post, fmt.Sprintf("nothing from a ULA of another site may leave by %s untranslated (RFC 7084 ULA-4)", f.wan), append(f.ipv6(expr.MetaKeyOIFNAME), f.foreignULA(8)...),
+		&expr.Verdict{Kind: expr.VerdictDrop}))
+	if f.source {
+		c.AddRule(newRule(tbl, post, "nothing leaves untranslated from outside our prefixes (RFC 7084 S-2)", append(f.ipv6(expr.MetaKeyOIFNAME),
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 8, Len: 16},
+			&expr.Lookup{SourceRegister: 1, SetName: f.ours.Name, Invert: true}),
+			&expr.Verdict{Kind: expr.VerdictDrop}))
+	}
+
 	if !f.inbound {
 		return c.Flush()
 	}
@@ -223,9 +289,9 @@ func (f *firewall) install() error {
 	c.AddRule(newRule(tbl, fwd, "filter IPv6 arriving from "+f.wan, f.ipv6(expr.MetaKeyIIFNAME),
 		&expr.Verdict{Kind: expr.VerdictJump, Chain: in.Name}))
 
-	c.AddRule(newRule(tbl, in, "let flows the LAN started through", ctState(expr.CtStateBitESTABLISHED|expr.CtStateBitRELATED),
+	c.AddRule(newRule(tbl, in, "let flows the LAN started through", ctBits(expr.CtKeySTATE, expr.CtStateBitESTABLISHED|expr.CtStateBitRELATED),
 		&expr.Verdict{Kind: expr.VerdictAccept}))
-	c.AddRule(newRule(tbl, in, "drop what conntrack cannot place", ctState(expr.CtStateBitINVALID),
+	c.AddRule(newRule(tbl, in, "drop what conntrack cannot place", ctBits(expr.CtKeySTATE, expr.CtStateBitINVALID),
 		&expr.Verdict{Kind: expr.VerdictDrop}))
 	c.AddRule(newRule(tbl, in, "let the ICMPv6 RFC 4890 needs through", append(l4(unix.IPPROTO_ICMPV6),
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 0, Len: 1},
@@ -341,6 +407,18 @@ func (f *firewall) ipv6(dir expr.MetaKey) []expr.Any {
 	)
 }
 
+// foreignULA matches an address in fc00::/7, at offset in the IPv6 header, that is not one the
+// upstream advertises.
+func (f *firewall) foreignULA(offset uint32) []expr.Any {
+	return []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: 16},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 16, Mask: ulaMask[:], Xor: make([]byte, 16)},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ulaNet[:]},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: 16},
+		&expr.Lookup{SourceRegister: 1, SetName: f.upULA.Name, Invert: true},
+	}
+}
+
 // nfIPv6 matches IPv6. Rules reading addresses repeat it even in wan_in, which only IPv6 reaches,
 // so that nft list shows "ip6 daddr" rather than a raw @nh offset.
 func nfIPv6() []expr.Any {
@@ -357,9 +435,10 @@ func l4(proto byte) []expr.Any {
 	}
 }
 
-func ctState(bits uint32) []expr.Any {
+// ctBits matches a conntrack field, the state or the status, having any of bits set.
+func ctBits(key expr.CtKey, bits uint32) []expr.Any {
 	return []expr.Any{
-		&expr.Ct{Key: expr.CtKeySTATE, Register: 1},
+		&expr.Ct{Key: key, Register: 1},
 		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
 			Mask: binaryutil.NativeEndian.PutUint32(bits), Xor: binaryutil.NativeEndian.PutUint32(0)},
 		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: []byte{0, 0, 0, 0}},

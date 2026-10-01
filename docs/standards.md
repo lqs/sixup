@@ -63,7 +63,7 @@ ULA, security (S) and the transition sections on top.
 | ULA-1 | Be able to generate a ULA prefix (SHOULD) | 🟢 Done, `-lan-ula auto` | `TestStoreULA` |
 | ULA-2 | Keep the ULA prefix across restarts and power loss (MUST, when generated) | 🟢 Done, stored in the state directory | `TestStoreULA` |
 | ULA-3 | The ULA prefix configurable (SHOULD) | 🟢 Done, `-lan-ula` takes a prefix | None |
-| ULA-4 | Act as a site border router for ULA by default (MUST) | 🟢 Done, in every `-unsolicited` mode. A ULA the upstream advertises is of the same site and crosses the WAN, as RFC 4193 section 4.3 allows; one of another site sent from the LAN is refused with ICMPv6 code 1 | `TestFirewallBorderAgainstKernel`, `TestFirewallSourceFilterOffAgainstKernel`, `TestRAClientReportsUpstreamULA` |
+| ULA-4 | Act as a site border router for ULA by default (MUST) | 🟢 Done, in every `-unsolicited` mode. A ULA the upstream advertises is of the same site and crosses the WAN, as RFC 4193 section 4.3 allows; one of another site sent from the LAN is refused with ICMPv6 code 1. Other interfaces are checked after source NAT, so that the operator's NAT66 works, and a ULA left untranslated is dropped; what the operator's NAT forwards in, a published port or a reply, passes | `TestFirewallBorderAgainstKernel`, `TestFirewallSourceFilterOffAgainstKernel`, `TestFirewallOtherInterfaceAgainstKernel`, `TestRAClientReportsUpstreamULA` |
 | ULA-5 | No default router while only ULA prefixes are advertised (MUST NOT) | 🟢 Done | `TestRARouterLifetime` |
 | L-1 | Router behaviour of RFC 4861 (MUST) | 🟢 Done | None |
 | L-2 | A separate /64 per LAN, from the delegation and the ULA (MUST) | 🟢 Done | `TestSplitLAN`, `TestStoreLifecycle`, `TestStoreULA` |
@@ -90,7 +90,7 @@ ULA, security (S) and the transition sections on top.
 | DLW-2 | No NAT on IPv4 carried by DS-Lite (MUST NOT) | 🟢 Done | `TestNATAgainstKernelDSLite`, `TestNATPlanPerLineType` |
 | DLW-3 | Turn the B4 off when the WAN has an IPv4 address (SHOULD) | 🟡 Partly. The tunnel's IPv4 route has a high metric, so native IPv4 wins | None |
 | S-1 | The simple security of RFC 6092 (SHOULD) | 🟢 Done, see below | `TestFirewallAgainstKernel` |
-| S-2 | Ingress filtering of LAN sources, BCP 38 (SHOULD) | 🟢 Done, on by default and off with `-source-filter=false`, as the 7084bis draft asks | `TestFirewallBorderAgainstKernel`, `TestFirewallSourceFilterOffAgainstKernel` |
+| S-2 | Ingress filtering of LAN sources, BCP 38 (SHOULD) | 🟢 Done, on by default and off with `-source-filter=false`, as the 7084bis draft asks. Other interfaces are checked after source NAT | `TestFirewallBorderAgainstKernel`, `TestFirewallSourceFilterOffAgainstKernel`, `TestFirewallOtherInterfaceAgainstKernel` |
 | S-3 | Filter what comes out of a tunnel (SHOULD) | 🟡 Partly. The filter covers IPv6 from the WAN; IPv4 from the tunnel meets only the NAT | None |
 
 ### RFC 9096, Requirements for CE Routers to Support Renumbering

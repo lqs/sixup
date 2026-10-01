@@ -10,6 +10,7 @@ import (
 // firewall writes nftables through netlink, which exists only on Linux.
 type firewall struct {
 	wan     string
+	lans    []string
 	inbound bool
 	source  bool
 	holeIn  chan []portMapping

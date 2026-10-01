@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/nftables"
+	"github.com/google/nftables/expr"
 	"golang.org/x/sys/unix"
 )
 
@@ -68,9 +69,17 @@ func echo6(from, to netip.Addr) []byte {
 // passes sends pkt in through in and reports whether it came out of out towards its destination.
 func passes(t *testing.T, in, out *os.File, pkt []byte) bool {
 	t.Helper()
+	return forwarded(t, in, out, pkt, netip.AddrFrom16([16]byte(pkt[24:40])))
+}
+
+// forwarded sends pkt in through in and reports whether it came out of out towards to, where
+// destination NAT may have sent it.
+func forwarded(t *testing.T, in, out *os.File, pkt []byte, to netip.Addr) bool {
+	t.Helper()
 	if _, err := in.Write(pkt); err != nil {
 		t.Fatalf("inject: %v", err)
 	}
+	dst := to.As16()
 	out.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	buf := make([]byte, 2048)
 	for {
@@ -79,7 +88,7 @@ func passes(t *testing.T, in, out *os.File, pkt []byte) bool {
 			return false
 		}
 		// the kernel's own traffic on the device aside, such as MLD reports
-		if n >= 40 && buf[0]>>4 == 6 && string(buf[24:40]) == string(pkt[24:40]) && buf[6] == pkt[6] {
+		if n >= 40 && buf[0]>>4 == 6 && string(buf[24:40]) == string(dst[:]) && buf[6] == pkt[6] {
 			return true
 		}
 	}
@@ -96,7 +105,7 @@ func TestFirewallAgainstKernel(t *testing.T) {
 	if err := sysctlWrite("/proc/sys/net/ipv6/conf/all/forwarding", "1"); err != nil {
 		t.Fatal(err)
 	}
-	f := &firewall{wan: "wan-test0", inbound: true, source: true}
+	f := &firewall{wan: "wan-test0", lans: []string{"lan-test0"}, inbound: true, source: true}
 	if err := f.install(); err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -208,7 +217,7 @@ func TestFirewallBorderAgainstKernel(t *testing.T) {
 	if err := sysctlWrite("/proc/sys/net/ipv6/conf/all/forwarding", "1"); err != nil {
 		t.Fatal(err)
 	}
-	f := &firewall{wan: "wan-test0", source: true}
+	f := &firewall{wan: "wan-test0", lans: []string{"lan-test0"}, source: true}
 	if err := f.install(); err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -277,6 +286,118 @@ func TestFirewallBorderAgainstKernel(t *testing.T) {
 	countedAndCommented(t, rules)
 }
 
+// An interface sixup does not serve, such as a container bridge, sends out what the operator's
+// source NAT translated, and nothing else, and is reached through the operator's destination NAT;
+// the router's own traffic is not looked at.
+func TestFirewallOtherInterfaceAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	far := netip.MustParseAddr("2001:db8:f::1")
+	wanDev := openTun(t, "wan-test0", netip.MustParsePrefix("2001:db8:f::/48"))
+	openTun(t, "lan-test0", netip.MustParsePrefix("2001:db8:1::/64"))
+	dockDev := openTun(t, "dock-test0", netip.MustParsePrefix("fd00:2::/64"))
+	if err := sysctlWrite("/proc/sys/net/ipv6/conf/all/forwarding", "1"); err != nil {
+		t.Fatal(err)
+	}
+	f := &firewall{wan: "wan-test0", lans: []string{"lan-test0"}, inbound: true, source: true}
+	if err := f.install(); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	t.Cleanup(f.remove)
+	f.lan = []netip.Prefix{netip.MustParsePrefix("2001:db8:1::/64")}
+	f.applyOurs()
+
+	container := netip.MustParseAddr("fd00:2::10")
+	if passes(t, dockDev, wanDev, udp6(netip.AddrPortFrom(container, 5000), netip.AddrPortFrom(far, 4000))) {
+		t.Fatal("a ULA leaves untranslated (ULA-4)")
+	}
+	if passes(t, dockDev, wanDev, udp6(netip.AddrPortFrom(netip.MustParseAddr("fd00:2::11"), 5000), netip.AddrPortFrom(far, 4000))) {
+		t.Fatal("a source outside our prefixes leaves untranslated (S-2)")
+	}
+
+	c, err := nftables.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tbl := c.AddTable(&nftables.Table{Family: nftables.TableFamilyIPv6, Name: "operator-nat"})
+	post := c.AddChain(&nftables.Chain{Name: "post", Table: tbl, Type: nftables.ChainTypeNAT,
+		Hooknum: nftables.ChainHookPostrouting, Priority: nftables.ChainPriorityNATSource})
+	to := netip.MustParseAddr("2001:db8:f::99").As16()
+	c.AddRule(&nftables.Rule{Table: tbl, Chain: post, Exprs: []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname("wan-test0")},
+		&expr.Immediate{Register: 1, Data: to[:]},
+		&expr.NAT{Type: expr.NATTypeSourceNAT, Family: unix.NFPROTO_IPV6, RegAddrMin: 1},
+	}})
+	// A published port: what comes for the address to goes to the container
+	pre := c.AddChain(&nftables.Chain{Name: "pre", Table: tbl, Type: nftables.ChainTypeNAT,
+		Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityNATDest})
+	ctr := container.As16()
+	c.AddRule(&nftables.Rule{Table: tbl, Chain: pre, Exprs: []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: 24, Len: 16},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: to[:]},
+		&expr.Immediate{Register: 1, Data: ctr[:]},
+		&expr.NAT{Type: expr.NATTypeDestNAT, Family: unix.NFPROTO_IPV6, RegAddrMin: 1},
+	}})
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c.DelTable(tbl)
+		c.Flush()
+	})
+	if !passes(t, dockDev, wanDev, udp6(netip.AddrPortFrom(container, 5001), netip.AddrPortFrom(far, 4000))) {
+		t.Fatal("what the operator's NAT translated goes out")
+	}
+	if !forwarded(t, wanDev, dockDev, udp6(netip.AddrPortFrom(far, 4000), netip.AddrPortFrom(netip.AddrFrom16(to), 5001)), container) {
+		t.Fatal("the reply to what the operator's source NAT translated reaches the container")
+	}
+	if !forwarded(t, wanDev, dockDev, udp6(netip.AddrPortFrom(far, 4001), netip.AddrPortFrom(netip.AddrFrom16(to), 80)), container) {
+		t.Fatal("what the operator's destination NAT forwards in reaches the container")
+	}
+	if passes(t, wanDev, dockDev, udp6(netip.AddrPortFrom(far, 4002), netip.AddrPortFrom(container, 80))) {
+		t.Fatal("the container's ULA is not reachable without the NAT (ULA-4)")
+	}
+
+	// The router's own address in a ULA, outside our prefixes
+	own := netip.MustParseAddr("fd00:2::1")
+	dockIf, err := net.InterfaceByName("dock-test0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := addrSet(dockIf.Index, own, 64, time.Hour, time.Hour, false, ifaFNodad); err != nil {
+		t.Fatal(err)
+	}
+	c.DelTable(tbl)
+	if err := c.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.DialUDP("udp6", net.UDPAddrFromAddrPort(netip.AddrPortFrom(own, 0)), net.UDPAddrFromAddrPort(netip.AddrPortFrom(far, 4000)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	wanDev.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 2048)
+	for {
+		n, err := wanDev.Read(buf)
+		if err != nil {
+			t.Fatal("the router's own traffic goes out")
+		}
+		if n >= 40 && buf[0]>>4 == 6 && netip.AddrFrom16([16]byte(buf[8:24])) == own {
+			break
+		}
+	}
+
+	rules, err := c.GetRules(f.table(), &nftables.Chain{Name: "postrouting"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	countedAndCommented(t, rules)
+}
+
 // With -source-filter off, a LAN source outside the prefixes goes out, as one routed into the LAN
 // by other means has to.
 func TestFirewallSourceFilterOffAgainstKernel(t *testing.T) {
@@ -287,7 +408,7 @@ func TestFirewallSourceFilterOffAgainstKernel(t *testing.T) {
 	if err := sysctlWrite("/proc/sys/net/ipv6/conf/all/forwarding", "1"); err != nil {
 		t.Fatal(err)
 	}
-	f := &firewall{wan: "wan-test0"}
+	f := &firewall{wan: "wan-test0", lans: []string{"lan-test0"}}
 	if err := f.install(); err != nil {
 		t.Fatalf("install: %v", err)
 	}
@@ -324,7 +445,7 @@ func TestFirewallICMPv6AgainstKernel(t *testing.T) {
 	if err := sysctlWrite("/proc/sys/net/ipv6/conf/all/forwarding", "1"); err != nil {
 		t.Fatal(err)
 	}
-	f := &firewall{wan: "wan-test0", inbound: true, source: true}
+	f := &firewall{wan: "wan-test0", lans: []string{"lan-test0"}, inbound: true, source: true}
 	if err := f.install(); err != nil {
 		t.Fatalf("install: %v", err)
 	}

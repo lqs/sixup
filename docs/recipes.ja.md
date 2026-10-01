@@ -105,6 +105,19 @@ MAP-E の回線で、既存のファイアウォールもトンネルから出�
 sudo sixup -wan eth0 -lan eth1 -tunnel-nat off
 ```
 
+## コンテナの NAT66
+
+Docker はコンテナに固定のアドレスを割り当てるので、変わるプレフィックスには追従できません。Docker のネットワークに ULA を割り当て、NAT66 を自分で行うのが現実的です。sixup は LAN インターフェイスから出る ULA を拒否しますが、ほかのインターフェイスから出る通信は送信元 NAT の後で確認します。自分の NAT が変換したものは出て行き、変換されずに ULA のまま出ようとするものは破棄されます。同じように、宛先 NAT で公開したポートにはインターネットから届きます。ルールを書いたのが Docker でも自分でも同じです。
+
+```nft
+table ip6 docker-nat {
+    chain post {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "eth0" ip6 saddr fd00:dead:beef::/48 masquerade
+    }
+}
+```
+
 ## ルーターのアドレスを固定する
 
 プレフィックスが変わってもインターフェイス ID が変わらなければ、ルーターを見つけやすくなります。WAN の最初のインターフェイス ID によるアドレスが、sixup が WAN アドレスとして報告するものです。

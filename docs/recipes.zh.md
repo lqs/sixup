@@ -103,6 +103,19 @@ VPS 的 /64 这类 /64 前缀，处理方式和 RA 给出的一样，与内网�
 sudo sixup -wan eth0 -lan eth1 -tunnel-nat off
 ```
 
+## 给容器做 NAT66
+
+Docker 给容器分配固定地址，跟不上会变的前缀，所以给 Docker 网络配 ULA，再自己做 NAT66，是实际可行的做法。sixup 拒绝从它的 LAN 接口发出的 ULA，但对其他接口发出的流量，要等源地址转换之后才检查：经过你的 NAT 转换的可以出去，没有转换、仍带着 ULA 的会被丢弃。同样，用目的地址转换发布的端口可以从外网访问，不管规则是 Docker 写的还是你自己写的。
+
+```nft
+table ip6 docker-nat {
+    chain post {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "eth0" ip6 saddr fd00:dead:beef::/48 masquerade
+    }
+}
+```
+
 ## 给路由器固定地址
 
 运营商换前缀时接口标识不变，路由器就容易找到。WAN 的第一个接口标识对应的地址，就是 sixup 报告的 WAN 地址。

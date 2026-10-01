@@ -152,6 +152,24 @@ warns about such chains. To leave the tunnel's source NAT and MSS clamp to your 
 sudo sixup -wan eth0 -lan eth1 -tunnel-nat off
 ```
 
+## NAT66 for containers
+
+Docker hands its containers fixed addresses, which cannot follow a prefix that changes, so a
+Docker network with a ULA and a NAT66 of your own is the practical choice. sixup refuses a ULA
+that leaves its LAN interfaces, but checks what other interfaces send only after source NAT: what
+your NAT translated goes out, and what would leave with a ULA untranslated is dropped. Likewise
+a port published with destination NAT is reached from the Internet, whether Docker or your own
+rules set it up.
+
+```nft
+table ip6 docker-nat {
+    chain post {
+        type nat hook postrouting priority srcnat; policy accept;
+        oifname "eth0" ip6 saddr fd00:dead:beef::/48 masquerade
+    }
+}
+```
+
 ## Fixed addresses for the router
 
 Interface identifiers that stay the same across renumbering make the router easy to find. The

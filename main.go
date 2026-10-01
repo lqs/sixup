@@ -236,14 +236,14 @@ func main() {
 		}
 		go (&joolManager{prefix: nat64Pfx, link: joolLink, store: store}).run(ctx)
 	}
+	var names []string
+	for _, l := range lanDefs {
+		names = append(names, l.iface)
+	}
 	// The border of RFC 7084 is kept in every mode; allow only lets unsolicited traffic in
-	fw := &firewall{wan: *wan, inbound: *unsolicited != "allow", source: *srcFilter, holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
+	fw := &firewall{wan: *wan, lans: names, inbound: *unsolicited != "allow", source: *srcFilter, holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
 	go fw.run(ctx, store.Subscribe())
 	if *unsolicited != "deny" {
-		var names []string
-		for _, l := range lanDefs {
-			names = append(names, l.iface)
-		}
 		p := &pcpServer{lans: names, nat: nat}
 		if *unsolicited == "request" {
 			p.fw = fw // IPv6 mappings are the filter's pinholes
