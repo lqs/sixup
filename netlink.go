@@ -583,6 +583,14 @@ func errErrConntrack(err error) error {
 	return fmt.Errorf("%w: %v", errConntrackUnavailable, err)
 }
 
+func linkSetUp(index int) error {
+	hdr := make([]byte, 16)
+	nativeEndian.PutUint32(hdr[4:8], uint32(index))
+	nativeEndian.PutUint32(hdr[8:12], unix.IFF_UP)
+	nativeEndian.PutUint32(hdr[12:16], unix.IFF_UP)
+	return linkRequest(unix.RTM_NEWLINK, 0, hdr, nil)
+}
+
 // ifaceByName resolves an interface and returns its MAC and link-local address.
 func ifaceByName(name string) (*net.Interface, error) {
 	return net.InterfaceByName(name)

@@ -178,7 +178,7 @@ sudo sixup -wan eth0 -lan eth1
 
 内网可以只用 IPv6，没有 IPv4 地址，没有 DHCPv4，也不用同时维护两套协议。客户端仍然可以通过 NAT64 访问 IPv4 互联网，由路由器把它们的 IPv6 包转换成 IPv4。改用 IPv6 单栈，是一个网络能为 IPv6 做的最有意义的事情之一，因为每多一个这样的网络，大家继续保留 IPv4 的理由就少一个。如果你打算这样做，这一节就是为你写的。
 
-加载 Jool 模块（`modprobe jool`），再启用 NAT64。
+安装 Jool 模块，再启用 NAT64。如果模块没有加载，sixup 会用 `/sbin/modprobe jool` 加载它。
 
 ```sh
 sudo sixup -wan eth0 -lan eth1 -nat64 jool

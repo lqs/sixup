@@ -64,6 +64,7 @@ func neighProxySet(_ int, a netip.Addr, _ bool) error {
 	return skipOrUnsupported("proxy neighbor " + a.String())
 }
 func linkWatch(chan<- linkEvent) error { return errUnsupported }
+func linkSetUp(int) error              { return errUnsupported }
 func sysctlSet(iface, key, val string) error {
 	return skipOrUnsupported(fmt.Sprintf("sysctl %s/%s=%s", iface, key, val))
 }

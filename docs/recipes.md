@@ -246,7 +246,7 @@ packets at the router. Going IPv6-only is one of the most useful things a networ
 IPv6, since every such network is one less reason for anyone to keep IPv4 around; if that is
 your plan, this section is for you.
 
-Load the Jool module (`modprobe jool`) and start sixup with NAT64.
+Install the Jool module and start sixup with NAT64. If the module is not loaded, sixup loads it with `/sbin/modprobe jool`.
 
 ```sh
 sudo sixup -wan eth0 -lan eth1 -nat64 jool

@@ -178,6 +178,10 @@ func main() {
 	if !*noSysctl && !dryRun {
 		applySysctl(*wan, lanDefs)
 	}
+	// after the sysctls, so that a LAN interface never comes up taking RAs
+	if !dryRun {
+		bringUp(*wan, lanDefs)
+	}
 	hub := newLinkHub(ctx)
 	pkts := newPacketHub(ctx, *wan)
 

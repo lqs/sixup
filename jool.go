@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -88,6 +90,7 @@ type joolManager struct {
 	ns      int    // descriptor holding the namespace while active
 	family  uint16 // Jool's generic netlink family then; the kernel hands out a new one when the module is reloaded
 	lastErr string // the module may be absent for hours; the same complaint is logged once
+	probed  bool   // modprobe was tried
 }
 
 // joolPortMax is the top of pool4 for TCP and UDP; the two ports above it are the namespace's
@@ -130,6 +133,11 @@ func (m *joolManager) run(ctx context.Context) {
 // away or comes back as a new one, whose instances do not include ours.
 func (m *joolManager) check() {
 	family, err := joolFamily()
+	if err != nil && !m.probed {
+		m.probed = true
+		modprobeJool()
+		family, err = joolFamily()
+	}
 	if m.active && (err != nil || family != m.family) {
 		m.stop()
 		warnf("[jool] the module was unloaded or reloaded, NAT64 stopped until it translates again")
@@ -165,6 +173,19 @@ func (m *joolManager) stop() {
 	unix.Close(m.ns)
 	m.active = false
 	m.store.SetNAT64(netip.Prefix{})
+}
+
+// modprobeJool loads the module the first time Jool is missing, so that it need not be listed for
+// loading at boot. A system without modprobe, or without the module, keeps the minute's check.
+func modprobeJool() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/sbin/modprobe", "jool").CombinedOutput()
+	if err != nil {
+		warnf("[jool] /sbin/modprobe jool failed: %v %s", err, bytes.TrimSpace(out))
+		return
+	}
+	infof("[jool] loaded the module with /sbin/modprobe jool")
 }
 
 // joolFamily returns the generic netlink family of the loaded module, or why there is none.
@@ -533,14 +554,6 @@ func vethAdd(name, peer string, ns int) error {
 		return err
 	}
 	return linkRequest(unix.RTM_NEWLINK, netlink.Create|netlink.Excl, make([]byte, 16), attrs)
-}
-
-func linkSetUp(index int) error {
-	hdr := make([]byte, 16)
-	nativeEndian.PutUint32(hdr[4:8], uint32(index))
-	nativeEndian.PutUint32(hdr[8:12], unix.IFF_UP)
-	nativeEndian.PutUint32(hdr[12:16], unix.IFF_UP)
-	return linkRequest(unix.RTM_NEWLINK, 0, hdr, nil)
 }
 
 func linkDel(index int) error {

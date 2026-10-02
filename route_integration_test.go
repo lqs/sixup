@@ -5,6 +5,7 @@ package main
 import (
 	"net"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 
@@ -150,6 +151,29 @@ func TestRouteDefaultVia(t *testing.T) {
 	}
 	if defaultRouteVia(ifi + 100) {
 		t.Fatal("not through another interface")
+	}
+}
+
+// The WAN and LAN interfaces that are down at startup are brought up; one missing is left alone.
+func TestBringUpAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	ns, err := os.Open("/proc/thread-self/ns/net") // this thread's, which enterNetNS moved
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ns.Close()
+	if err := vethAdd("wan-test0", "lan-test0", int(ns.Fd())); err != nil {
+		t.Fatal(err)
+	}
+	bringUp("wan-test0", []lanDef{{"lan-test0", 0}, {"gone-test0", 1}})
+	for _, name := range []string{"wan-test0", "lan-test0"} {
+		ifi, err := net.InterfaceByName(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ifi.Flags&net.FlagUp == 0 {
+			t.Fatalf("%s still down", name)
+		}
 	}
 }
 

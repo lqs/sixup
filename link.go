@@ -7,6 +7,27 @@ import (
 	"time"
 )
 
+// bringUp sets the WAN and LAN interfaces that exist but are down up, so that a bare system needs
+// no other program for it. One that does not exist yet is waited for as before: whoever creates
+// it, such as pppd, brings it up.
+func bringUp(wan string, lans []lanDef) {
+	names := []string{wan}
+	for _, l := range lans {
+		names = append(names, l.iface)
+	}
+	for _, name := range names {
+		ifi, err := ifaceByName(name)
+		if err != nil || ifi.Flags&net.FlagUp != 0 {
+			continue
+		}
+		if err := linkSetUp(ifi.Index); err != nil {
+			warnf("[link-watch] interface %s is down and cannot be brought up: %v", name, err)
+			continue
+		}
+		infof("[link-watch] interface %s was down, brought up", name)
+	}
+}
+
 // waitIface polls every 2s until the interface exists and is UP; returns nil on ctx cancel.
 func waitIface(ctx context.Context, name string) *net.Interface {
 	warned := false
