@@ -104,7 +104,7 @@ type addrManager struct {
 	cfg      tempConfig
 	iids     []iidPolicy             // IID sources for static addresses, one address per policy and prefix
 	pick     func(Snapshot) []Prefix // prefixes for the static addresses on this interface (LAN: split result; WAN: upstream A-bit prefixes, else a subnet of the delegation)
-	tempPick func(Snapshot) []Prefix // prefixes for the temporary addresses, pick when nil
+	tempPick func(Snapshot) []Prefix // prefixes for the temporary addresses, nil without them
 	side     side                    // which interface role this manager runs on
 	layout   shared64Layout
 	dadCnt   map[iidSlot]uint8 // DAD_Counter per prefix and policy
@@ -530,7 +530,7 @@ func (m *addrManager) plen(p Prefix) int {
 // tempPrefixes returns the prefixes the temporary addresses go in.
 func (m *addrManager) tempPrefixes() []Prefix {
 	if m.tempPick == nil {
-		return m.pick(m.snap)
+		return nil
 	}
 	return m.tempPick(m.snap)
 }

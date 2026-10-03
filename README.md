@@ -150,7 +150,7 @@ For other needs, such as several LAN segments, fixed addresses, DNS servers or N
 
 ### Temporary addresses
 
-`-tempaddr` turns temporary addresses on, and the other options set how they rotate. They serve only traffic the router itself starts, such as its own DNS queries or a proxy running on it. Traffic forwarded from the LAN keeps the source address of the device that sent it. The router's LAN addresses are always static. With a delegation, the temporary addresses are /128s in the first LAN's /64, which the upstream router does not have to resolve; without one, they go in the SLAAC prefix. When neither SLAAC nor IA_NA gives the WAN an address, its static addresses go in that /64 too, so keep `-wan-iid` clear of the addresses of LAN hosts.
+`-tempaddr` turns temporary addresses on, and the other options set how they rotate. They serve only traffic the router itself starts, such as its own DNS queries or a proxy running on it. Traffic forwarded from the LAN keeps the source address of the device that sent it. The router's LAN addresses are always static. With a delegation, the temporary addresses are /128s in the first LAN's /64, which the upstream router does not have to resolve; without one, they go in the SLAAC prefix. When neither SLAAC nor IA_NA gives the WAN an address, its static addresses go in that /64 too, so keep `-wan-iid` clear of the addresses of LAN hosts; the same suffix as `-lan-iid` is fine, since that address is the router's own.
 
 | Option | Default | Description |
 |---|---|---|

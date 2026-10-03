@@ -153,7 +153,7 @@ func TestAddressTemporaryStaysSourceAgainstKernel(t *testing.T) {
 	}
 	fixed, _ := parseIIDPolicy("::1")
 	m := &addrManager{
-		ifname: ifi.Name, ifi: ifi, iids: []iidPolicy{fixed}, pick: Snapshot.wanSLAAC, side: sideWAN, layout: "lan",
+		ifname: ifi.Name, ifi: ifi, iids: []iidPolicy{fixed}, pick: Snapshot.wanSLAAC, tempPick: Snapshot.wanSLAAC, side: sideWAN, layout: "lan",
 		cfg:     tempConfig{enabled: true, preferredLft: time.Hour, maxConcurrent: 8, skipDAD: true},
 		applied: map[netip.Addr]Prefix{}, plens: map[netip.Addr]int{}, dadCnt: map[iidSlot]uint8{}, announce: map[netip.Addr]int{},
 	}
