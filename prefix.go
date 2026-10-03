@@ -108,7 +108,10 @@ type Snapshot struct {
 	PREF64  netip.Prefix        `json:"pref64,omitempty"`
 	WANMTU  int                 `json:"wan_mtu,omitempty"` // drives both the downstream RA MTU option and the tunnel MTU
 	WANAddr netip.Addr          `json:"wan_addr"`
-	Tunnel  *TunnelParams       `json:"tunnel,omitempty"`
+	// WANSubnet is the /64 of the delegation the WAN takes its /128s from when neither SLAAC nor
+	// IA_NA gives it a global address; OffLink is set, so no on-link route comes with them.
+	WANSubnet Prefix        `json:"wan_subnet,omitzero"`
+	Tunnel    *TunnelParams `json:"tunnel,omitempty"`
 	// The PD result is still awaited on a link whose RA announces DHCPv6. Until it arrives nobody
 	// knows whether the RA /64 will be shared with the LAN, so the WAN takes no address in it yet:
 	// one made now might need another prefix length a moment later.
@@ -132,6 +135,15 @@ func (s Snapshot) wanSLAAC() []Prefix {
 		if p.Source == "ra" && p.SLAAC && p.Prefix.Bits() == 64 {
 			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// wanPrefixes returns the prefixes the WAN takes addresses in: the SLAAC ones, or WANSubnet.
+func (s Snapshot) wanPrefixes() []Prefix {
+	out := s.wanSLAAC()
+	if s.WANSubnet.Prefix.IsValid() {
+		out = append(out, s.WANSubnet)
 	}
 	return out
 }
@@ -630,6 +642,7 @@ func (s *Store) recompute(now time.Time) {
 		}
 		next.WAN = append(next.WAN, p)
 	}
+	next.WANSubnet = next.wanSubnet(s.lans)
 
 	// classify add / renew
 	if change == changeNone {
@@ -836,6 +849,51 @@ func (s *Store) spareSubnet(p Prefix) (netip.Prefix, bool) {
 		}
 	}
 	return netip.Prefix{}, false
+}
+
+// wanSubnet picks the /64 the WAN takes its addresses in when neither SLAAC nor IA_NA gives it one,
+// so that the router's own traffic still leaves from a WAN address (RFC 7084 has a router without
+// one take an address from the delegation). The delegation is routed to this router, so the upstream needs no
+// address resolution for it. A shorter delegation gives its highest subnet that no LAN takes and
+// the ISP does not keep; a /64 is shared with the LAN, where a clash is left to chance.
+func (s Snapshot) wanSubnet(lans []lanDef) Prefix {
+	if len(s.wanSLAAC()) > 0 || s.WANAddr.IsValid() {
+		return Prefix{}
+	}
+	for _, deprecated := range []bool{false, true} {
+		for _, w := range s.WAN {
+			if w.Source != sourcePD || w.Deprecated != deprecated || w.Prefix.Bits() > 64 {
+				continue
+			}
+			w.OffLink = true
+			if w.Prefix.Bits() == 64 {
+				w.Prefix = w.Prefix.Masked()
+				return w
+			}
+			for i := (1 << min(64-w.Prefix.Bits(), 16)) - 1; i >= 0; i-- {
+				if slices.ContainsFunc(lans, func(l lanDef) bool { return l.index == i }) {
+					continue
+				}
+				sub, ok := splitLAN(w.Prefix, i)
+				if !ok || w.Exclude.Overlaps(sub) || s.lanOverlaps(sub) {
+					continue
+				}
+				w.Prefix = sub
+				return w
+			}
+		}
+	}
+	return Prefix{}
+}
+
+// lanOverlaps reports whether any LAN prefix overlaps p.
+func (s Snapshot) lanOverlaps(p netip.Prefix) bool {
+	for _, ps := range s.LAN {
+		if slices.ContainsFunc(ps, func(l Prefix) bool { return l.Prefix.Overlaps(p) }) {
+			return true
+		}
+	}
+	return false
 }
 
 func splitLAN(p netip.Prefix, index int) (netip.Prefix, bool) {
@@ -1058,6 +1116,9 @@ func (s Snapshot) describe(now time.Time) string {
 	}
 	if s.WANAddr.IsValid() {
 		parts = append(parts, "WAN addr="+s.WANAddr.String())
+	}
+	if s.WANSubnet.Prefix.IsValid() {
+		parts = append(parts, "WAN subnet="+s.WANSubnet.Prefix.String())
 	}
 	if len(s.DNS) > 0 {
 		var d []string

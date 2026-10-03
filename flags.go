@@ -22,7 +22,6 @@ var (
 	upRA        = flag.Bool("wan-ra", true, "listen to RA on the WAN side as a second prefix source and maintain the default route")
 	wanSLAAC    = flag.Bool("wan-slaac", true, "run SLAAC on the WAN interface for upstream RA prefixes with the A bit set")
 	wanIID      = flag.String("wan-iid", "", "comma-separated suffixes of the static SLAAC addresses on the WAN interface, one address each: empty or stable for an RFC 7217 stable address, eui64 to derive it from the MAC, or a fixed suffix such as ::1 or ::1111:2222:3333:4444; the first one is reported as the WAN address")
-	wanTemp     = flag.Bool("wan-tempaddr", false, "besides the static SLAAC address, also rotate temporary addresses on the WAN interface according to -tempaddr-regen and friends")
 	prefer      = flag.String("wan-prefer", "pd", "which prefix source wins when both are available: pd / ra")
 	wanPrefix   = flag.String("wan-prefix", "", "comma-separated prefixes the upstream routes to this router when neither RA nor DHCPv6-PD tells it, such as a static prefix routed to the line by contract, or the /64 of a VPS; the DHCPv6 client then asks only for DNS and the like. A /64 is taken as the WAN link's on-link prefix and shared with the LAN as RFC 7278 describes; a shorter one as a delegation")
 	shared64    = flag.String("wan-shared64", "lan", "layout when upstream hands out only one /64: lan(RFC 7278 /64 sharing: /64 on the LAN, /128 routes for same-subnet hosts on the WAN side, default) / wan(/64 on the WAN, one /128 route per LAN host) / split(/128 on both sides, the router itself cannot reach hosts it has not learned); all /128 routes are added automatically once the NDP proxy probes them")
@@ -46,7 +45,7 @@ var (
 	poolRange   = flag.String("dhcp6s-pool", "1000-ffff", "IID range of the address pool (hexadecimal, low 64 bits)")
 	ndMode      = flag.String("ndproxy-mode", "auto", "NDP proxy: auto(enable forward mode when a LAN /64 is also the on-link /64 of a broadcast WAN) / off / static / prefix / forward; forward works in both directions and also proxies between same-subnet hosts on the LAN and WAN sides")
 	ndTTL       = flag.Duration("ndproxy-ttl", 30*time.Second, "TTL of an NDP proxy session")
-	tMode       = flag.String("tempaddr-mode", "off", "address mode of this host: off / stable / temporary / both")
+	tEnable     = flag.Bool("tempaddr", false, "besides the static addresses, rotate temporary addresses (RFC 8981) on the WAN interface; only traffic the router itself starts uses them")
 	tRegen      = flag.Duration("tempaddr-regen", time.Hour, "temporary address generation interval")
 	tPref       = flag.Duration("tempaddr-preferred", time.Hour, "preferred lifetime of a temporary address")
 	tValid      = flag.Duration("tempaddr-valid", 24*time.Hour, "upper bound on the valid lifetime of a temporary address (the real value follows the in-use check)")
@@ -172,11 +171,11 @@ var usageGroups = []struct {
 }{
 	{"Interfaces and prefixes", []string{"wan", "lan", "lan-ula", "lan-iid", "lan-deprecate-hold"}},
 	{"WAN side: DHCPv6 client", []string{"dhcp6c-mode", "dhcp6c-pd-len", "dhcp6c-ia-na", "dhcp6c-pd-grace", "dhcp6c-release"}},
-	{"WAN side: upstream RA and addresses", []string{"wan-ra", "wan-slaac", "wan-iid", "wan-tempaddr", "wan-prefer", "wan-prefix", "wan-shared64"}},
+	{"WAN side: upstream RA and addresses", []string{"wan-ra", "wan-slaac", "wan-iid", "wan-prefer", "wan-prefix", "wan-shared64"}},
 	{"LAN side: RA advertisement", []string{"ra-min", "ra-max", "ra-lifetime", "ra-slaac", "ra-onlink", "ra-mtu", "ra-dns", "ra-pref64", "ra-route"}},
 	{"LAN side: DHCPv6 server", []string{"dhcp6s-mode", "dhcp6s-pool", "dhcp6s-static", "dhcp6s-lease-preferred", "dhcp6s-lease-valid", "dhcp6s-pd-len"}},
 	{"NDP proxy", []string{"ndproxy-mode", "ndproxy-static", "ndproxy-exclude", "ndproxy-ttl"}},
-	{"Local address rotation", []string{"tempaddr-mode", "tempaddr-regen", "tempaddr-preferred", "tempaddr-valid", "tempaddr-max", "tempaddr-desync", "tempaddr-skip-dad", "tempaddr-drain-grace"}},
+	{"Temporary addresses", []string{"tempaddr", "tempaddr-regen", "tempaddr-preferred", "tempaddr-valid", "tempaddr-max", "tempaddr-desync", "tempaddr-skip-dad", "tempaddr-drain-grace"}},
 	{"Tunnel", []string{"tunnel-dev", "tunnel-mtu", "tunnel-route4-metric", "tunnel-nat", "tunnel-mape-rules", "tunnel-capture", "tunnel-capture-max"}},
 	{"NAT64", []string{"nat64", "nat64-prefix", "jool-ipv4"}},
 	{"Unsolicited traffic", []string{"unsolicited", "source-filter"}},

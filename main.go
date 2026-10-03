@@ -81,9 +81,6 @@ func main() {
 	if srv != serverOff && srv != serverStateless && srv != serverStateful {
 		fatalf("-dhcp6s-mode must be off / stateless / stateful")
 	}
-	if *tMode != "off" && *tMode != "stable" && *tMode != "temporary" && *tMode != "both" {
-		fatalf("-tempaddr-mode must be off / stable / temporary / both")
-	}
 	if *tunNAT != "auto" && *tunNAT != "off" {
 		fatalf("-tunnel-nat must be auto / off")
 	}
@@ -266,15 +263,12 @@ func main() {
 	for _, r := range routes {
 		rios = append(rios, netip.MustParsePrefix(r))
 	}
-	tcfg := tempConfig{mode: tempMode(*tMode), regenInterval: *tRegen, preferredLft: *tPref, validLft: *tValid, maxConcurrent: *tMax, desync: *tDesync, skipDAD: *tSkipDAD, grace: *tGrace}
+	tcfg := tempConfig{regenInterval: *tRegen, preferredLft: *tPref, validLft: *tValid, maxConcurrent: *tMax, desync: *tDesync, skipDAD: *tSkipDAD, grace: *tGrace}
 	if *upRA && *wanSLAAC {
-		// The static SLAAC address and the optional temporary addresses coexist on the WAN interface.
+		// The static addresses and the optional temporary addresses coexist on the WAN interface.
 		wcfg := tcfg
-		wcfg.mode = tempStable
-		if *wanTemp {
-			wcfg.mode = "both"
-		}
-		go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanSLAAC, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
+		wcfg.enabled = *tEnable
+		go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanPrefixes, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
 	}
 	poolStart, poolEnd := parsePool(*poolRange)
 	var pd *pdPool
@@ -315,7 +309,7 @@ func main() {
 	}
 
 	infof("[sixup] version %s", version)
-	infof("[sixup] starting: wan=%s lan=%v dhcpv6-client=%s dhcpv6-server=%s ndp-proxy=%s tempaddr=%s", *wan, lans, *dhcpMode, *srvMode, *ndMode, *tMode)
+	infof("[sixup] starting: wan=%s lan=%v dhcpv6-client=%s dhcpv6-server=%s ndp-proxy=%s tempaddr=%t", *wan, lans, *dhcpMode, *srvMode, *ndMode, *tEnable)
 	<-ctx.Done()
 	infof("[sixup] got a termination signal, advertising RA with lifetime=0 and releasing the DHCPv6 bindings before exit")
 	if dhcp != nil {

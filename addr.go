@@ -21,7 +21,6 @@ import (
 
 // IFA_F_* address flags (linux/if_addr.h)
 const (
-	ifaFTemporary  = 0x01
 	ifaFNodad      = 0x02
 	ifaFOptimistic = 0x04
 	ifaFDeprecated = 0x20
@@ -67,17 +66,7 @@ func loadSecret(stateDir string) []byte {
 	return s
 }
 
-// tempMode is what -tempaddr-mode selects for this host's own addresses, and iidMode how the
-// interface identifier of the stable one is formed.
-type tempMode string
-
-const (
-	tempOff       tempMode = "off"
-	tempStable    tempMode = "stable"
-	tempTemporary tempMode = "temporary"
-	tempBoth      tempMode = "both"
-)
-
+// iidMode is how the interface identifier of a static address is formed.
 type iidMode string
 
 const (
@@ -86,9 +75,10 @@ const (
 	iidFixed  iidMode = "fixed" // a suffix given on the command line
 )
 
-// tempConfig is what the -tempaddr-* options select for this host's own addresses.
+// tempConfig is what -tempaddr and the -tempaddr-* options select. Temporary addresses rotate
+// only on the WAN, beside the static ones; the LAN addresses stay static.
 type tempConfig struct {
-	mode          tempMode
+	enabled       bool
 	regenInterval time.Duration
 	preferredLft  time.Duration
 	validLft      time.Duration
@@ -115,7 +105,7 @@ type addrManager struct {
 	secret []byte
 	cfg    tempConfig
 	iids   []iidPolicy             // IID sources for static addresses, one address per policy and prefix
-	pick   func(Snapshot) []Prefix // prefixes to address on this interface (LAN: split result; WAN: upstream A-bit prefixes)
+	pick   func(Snapshot) []Prefix // prefixes to address on this interface (LAN: split result; WAN: upstream A-bit prefixes, else a subnet of the delegation)
 	side   side                    // which interface role this manager runs on
 	layout shared64Layout
 	dadCnt map[iidSlot]uint8 // DAD_Counter per prefix and policy
@@ -163,7 +153,7 @@ func (m *addrManager) run(ctx context.Context, hub *linkHub, store *Store, ch <-
 }
 
 func (m *addrManager) serve(ctx context.Context, ch <-chan Snapshot) {
-	temp := m.cfg.mode == tempTemporary || m.cfg.mode == tempBoth
+	temp := m.cfg.enabled
 	if temp {
 		// Take over the kernel's temporary address mechanism, otherwise both sides generate their own
 		sysctlSet(m.ifname, "use_tempaddr", "0")
@@ -321,6 +311,7 @@ func (m *addrManager) watchWANAddr() {
 	if a := m.snap.WANAddr; m.side == sideWAN && a.IsValid() && a != m.wanAddr {
 		m.wanAddr = a
 		m.awaitAnnounce(a)
+		m.keepTempsNewest()
 	}
 }
 
@@ -392,6 +383,7 @@ func (m *addrManager) applyPrefixAddrs() {
 			want[iid.addr(m.secret, p.Prefix, m.ifi, m.dadCnt[iidSlot{p.Prefix, i}])] = p
 		}
 	}
+	added := false
 	for a, p := range want {
 		pref, valid := p.preferredLeft(now), p.validLeft(now)
 		plen := m.plen(p)
@@ -418,6 +410,7 @@ func (m *addrManager) applyPrefixAddrs() {
 			infof("[address %s] added %s/%d preferred=%s valid=%s", m.ifname, a, plen, pref.Round(time.Second), valid.Round(time.Second))
 			m.dadDue = true
 			m.awaitAnnounce(a)
+			added = true
 		}
 	}
 	for a, p := range m.applied {
@@ -435,6 +428,19 @@ func (m *addrManager) applyPrefixAddrs() {
 	}
 	m.applied = want
 	m.adoptStrays(want)
+	if added {
+		m.keepTempsNewest()
+	}
+}
+
+// keepTempsNewest rotates when a static address has just been added while temporary addresses are
+// in use. Among equally good source addresses the kernel takes the newest: it never knows an
+// address as temporary, so RFC 6724 rule 7 does not apply, and a static address added after the
+// temporary ones would be the source until the next rotation.
+func (m *addrManager) keepTempsNewest() {
+	if slices.ContainsFunc(m.temps, func(t *tempAddr) bool { return t.state == "preferred" }) {
+		m.rotate()
+	}
 }
 
 // iidSlot names one static address: the prefix and the index of the policy in iids.
@@ -559,11 +565,11 @@ func (m *addrManager) rotateFor(targets, active []Prefix) bool {
 	now := time.Now()
 	made := false
 	for _, p := range targets {
-		flags := uint32(ifaFTemporary)
+		// No IFA_F_TEMPORARY: the kernel drops it when userspace adds an address, and what makes a
+		// temporary address the source is that it is the newest, see keepTempsNewest
+		flags := uint32(ifaFOptimistic)
 		if m.cfg.skipDAD {
-			flags |= ifaFNodad
-		} else {
-			flags |= ifaFOptimistic
+			flags = ifaFNodad
 		}
 		na := &tempAddr{addr: randomIID(p.Prefix), prefix: p.Prefix, plen: m.plen(p), created: now, state: "preferred"}
 		pref := m.cfg.preferredLft
@@ -601,7 +607,7 @@ func (m *addrManager) rotateFor(targets, active []Prefix) bool {
 }
 
 func (m *addrManager) deprecate(t *tempAddr) {
-	if err := addrSet(m.ifi.Index, t.addr, t.plen, 0, 0, true, ifaFTemporary|ifaFNodad); err != nil {
+	if err := addrSet(m.ifi.Index, t.addr, t.plen, 0, 0, true, ifaFNodad); err != nil {
 		warnf("[address %s] failed to deprecate %s: %v", m.ifname, t.addr, err)
 		return
 	}

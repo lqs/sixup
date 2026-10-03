@@ -110,7 +110,6 @@ For other needs, such as several LAN segments, fixed addresses, DNS servers or N
 | `-wan-ra` | `true` | Listen to upstream RAs as a second prefix source, and maintain the default route from them. |
 | `-wan-slaac` | `true` | Configure SLAAC addresses on the WAN interface for RA prefixes with the A flag set. |
 | `-wan-iid` | | Interface identifiers of the static SLAAC addresses on the WAN interface, comma separated, one address each. Each is `stable` or empty for an RFC 7217 stable address, `eui64` to derive it from the MAC address, or a fixed suffix such as `::1` or `::1111:2222:3333:4444`. The first one is reported as the WAN address. |
-| `-wan-tempaddr` | `false` | Also rotate temporary addresses on the WAN interface, following the `-tempaddr-*` options. |
 | `-wan-prefer` | `pd` | Which prefix wins when both a delegated prefix and an RA prefix are available: `pd` or `ra`. |
 | `-wan-prefix` | (empty) | Prefixes the upstream routes to this router when neither RA nor DHCPv6-PD tells it, such as a static prefix the ISP routes to the line by contract, or the /64 of a VPS, comma-separated; the DHCPv6 client then asks only for DNS and the like. A /64 is taken as the WAN link's on-link prefix and shared with the LAN (RFC 7278); a shorter one as a delegation. |
 | `-wan-shared64` | `lan` | Layout when the upstream gives only one /64. `lan`: the /64 goes to the LAN, and hosts on the WAN link get /128 routes (RFC 7278). `wan`: the /64 stays on the WAN, and each LAN host gets a /128 route. `split`: /128 routes on both sides; the router itself cannot reach a host it has not learned yet. The /128 routes are added as the NDP proxy finds the hosts. |
@@ -149,13 +148,13 @@ For other needs, such as several LAN segments, fixed addresses, DNS servers or N
 | `-ndproxy-exclude` | | Prefix never proxied, repeatable. |
 | `-ndproxy-ttl` | `30s` | How long a learned proxy entry lives. |
 
-### Local address rotation
+### Temporary addresses
 
-These options govern the router's own addresses on the LAN, and on the WAN with `-wan-tempaddr`.
+`-tempaddr` turns temporary addresses on, and the other options set how they rotate. They serve only traffic the router itself starts, such as its own DNS queries or a proxy running on it. Traffic forwarded from the LAN keeps the source address of the device that sent it. The router's LAN addresses are always static. When neither SLAAC nor IA_NA gives the WAN an address, the WAN addresses, temporary ones included, come from a subnet of the delegation.
 
 | Option | Default | Description |
 |---|---|---|
-| `-tempaddr-mode` | `off` | `temporary` and `both` add rotating temporary addresses (RFC 8981) next to the static ones; `off` and `stable` keep only the static addresses. |
+| `-tempaddr` | `false` | Besides the static addresses, rotate temporary addresses (RFC 8981) on the WAN interface. |
 | `-tempaddr-regen` | `1h` | How often a new temporary address is created. |
 | `-tempaddr-preferred` | `1h` | Preferred lifetime of a temporary address. |
 | `-tempaddr-valid` | `24h` | Upper limit of the valid lifetime of a temporary address. An address still in use is kept up to this limit, an unused one is removed earlier. |

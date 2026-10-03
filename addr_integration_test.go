@@ -92,3 +92,102 @@ func TestAddressLengthLeftByEarlierRunAgainstKernel(t *testing.T) {
 		}
 	}
 }
+
+// A WAN with neither SLAAC nor IA_NA takes its addresses as /128s in a subnet of the delegation,
+// with no on-link route, since the delegation is routed to this router.
+func TestAddressInWANSubnetAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	openTun(t, "wan-test0", netip.MustParsePrefix("192.0.2.0/24"))
+	ifi, err := net.InterfaceByName("wan-test0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixed, _ := parseIIDPolicy("::1")
+	now := time.Now()
+	pd := Prefix{Prefix: netip.MustParsePrefix("2001:db8:100::/56"), Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: "pd"}
+	lan := pd
+	lan.Prefix = netip.MustParsePrefix("2001:db8:100::/64")
+	snap := Snapshot{WAN: []Prefix{pd}, LAN: map[string][]Prefix{"lan0": {lan}}}
+	snap.WANSubnet = snap.wanSubnet([]lanDef{{"lan0", 0}})
+	m := &addrManager{
+		ifname: ifi.Name, ifi: ifi, iids: []iidPolicy{fixed}, pick: Snapshot.wanPrefixes, side: sideWAN, layout: "lan",
+		applied: map[netip.Addr]Prefix{}, plens: map[netip.Addr]int{}, dadCnt: map[iidSlot]uint8{}, announce: map[netip.Addr]int{},
+		snap: snap,
+	}
+	m.applyPrefixAddrs()
+	addr := netip.MustParseAddr("2001:db8:100:ff::1")
+	list, err := addrList(ifi.Index)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, ia := range list {
+		if ia.Addr == addr {
+			found = true
+			if ia.PrefixLen != 128 {
+				t.Fatalf("want /128, got /%d", ia.PrefixLen)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("%s is not on the WAN: %v", addr, list)
+	}
+	if len(routeTypes(t, netip.MustParsePrefix("2001:db8:100:ff::/64"))) != 0 {
+		t.Fatal("the WAN subnet brought an on-link route")
+	}
+}
+
+// The kernel takes the newest of equally good source addresses, so a static address added after
+// the temporary ones must not become the source: a rotation follows it.
+func TestAddressTemporaryStaysSourceAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	openTun(t, "wan-test0", netip.MustParsePrefix("192.0.2.0/24"))
+	ifi, err := net.InterfaceByName("wan-test0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// no DAD, so that a static address is a usable source at once
+	if err := sysctlSet(ifi.Name, "accept_dad", "0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := routeSet(ifi.Index, netip.MustParsePrefix("::/0"), netip.Addr{}, 1024, 0); err != nil {
+		t.Fatal(err)
+	}
+	fixed, _ := parseIIDPolicy("::1")
+	m := &addrManager{
+		ifname: ifi.Name, ifi: ifi, iids: []iidPolicy{fixed}, pick: Snapshot.wanSLAAC, side: sideWAN, layout: "lan",
+		cfg:     tempConfig{enabled: true, preferredLft: time.Hour, maxConcurrent: 8, skipDAD: true},
+		applied: map[netip.Addr]Prefix{}, plens: map[netip.Addr]int{}, dadCnt: map[iidSlot]uint8{}, announce: map[netip.Addr]int{},
+	}
+	now := time.Now()
+	ra := func(s string) Prefix {
+		return Prefix{Prefix: netip.MustParsePrefix(s), Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: "ra", SLAAC: true}
+	}
+	source := func() netip.Addr {
+		c, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: net.ParseIP("2001:4860::1"), Port: 53})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		return c.LocalAddr().(*net.UDPAddr).AddrPort().Addr()
+	}
+	isTemp := func(a netip.Addr) bool {
+		t := m.tempOf(a)
+		return t != nil && t.state == "preferred"
+	}
+
+	m.snap = Snapshot{WAN: []Prefix{ra("2001:db8:1::/64")}}
+	m.applyPrefixAddrs()
+	m.ensureTemps()
+	if a := source(); !isTemp(a) {
+		t.Fatalf("source %s is not the temporary address", a)
+	}
+	// sharing the /64 with the LAN re-adds the static address as /128, newer than the temporary one
+	p := ra("2001:db8:1::/64")
+	m.snap = Snapshot{WAN: []Prefix{p}, LAN: map[string][]Prefix{"lan0": {p}}}
+	m.applyPrefixAddrs()
+	m.ensureTemps()
+	if a := source(); !isTemp(a) {
+		t.Fatalf("after a static address was added the source is %s, not a temporary address", a)
+	}
+}
