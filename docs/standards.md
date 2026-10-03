@@ -48,7 +48,7 @@ ULA, security (S) and the transition sections on top.
 | WAA-4 | IA_NA, Reconfigure Accept and DNS servers in DHCPv6 (MUST), search list (SHOULD) | 🟢 Done, Reconfigure authenticated | `TestApplyReply`, `TestParseCommon`, `TestReconfigureAuth`, `TestReconfigureRoundTrip` |
 | WAA-5 | NTP, with the NTP server option (SHOULD) | 🟡 Partly. The NTP and SNTP servers are requested and passed on to the LAN; the router's own clock is left to the system | `TestServerPassesNTPOn` |
 | WAA-6 | Request IA_NA when the RA sets M (MUST) | 🟢 Done, IA_NA is requested by default | `TestDHCPv6ClientStartsOnTheRAAgainstKernel` |
-| WAA-7 | Take a global address from the delegation when the WAN has none (MUST) | 🟢 Done. Without SLAAC or IA_NA the WAN takes /128s in the highest subnet of the delegation no LAN takes, or in a delegated /64 | `TestStoreWANSubnet`, `TestAddressInWANSubnetAgainstKernel` |
+| WAA-7 | Take a global address from the delegation when the WAN has none (MUST) | 🟢 Done. Without SLAAC or IA_NA the WAN takes /128s in the first LAN's delegated /64, which temporary addresses use in any case | `TestStoreWANSubnet`, `TestAddressInWANSubnetAgainstKernel`, `TestAddressTemporaryInWANSubnetAgainstKernel` |
 | WAA-8 | Support and request SOL_MAX_RT (MUST) | 🟢 Done | `TestParseCommon` |
 | WAA-9 | Weak host model (MUST) | 🐧 Kernel, the Linux default | None |
 | WAA-10 | Information Refresh Time (SHOULD) | 🟢 Done, requested and honoured | None |
@@ -307,7 +307,8 @@ the Linux stack alone.
   and unlinkable across networks, from a secret kept in the state directory, unless
   `-wan-iid` or `-lan-iid` fixes them.
 - **RFC 8981, temporary addresses.** `-tempaddr` adds rotating WAN addresses for the
-  router's own traffic. The kernel does not accept the temporary flag from userspace, so RFC 6724
+  router's own traffic, in the first LAN's delegated /64 when there is one, so that the upstream
+  router keeps no neighbor entry for each. The kernel does not accept the temporary flag from userspace, so RFC 6724
   rule 7 never applies; the newest address is the source instead, and a rotation follows every new
   static address.
 - **RFC 9131, announcing new addresses.** A new WAN address is announced to the upstream routers

@@ -171,7 +171,7 @@ func (p *pdPool) block(s Snapshot, up netip.Prefix, n int, key string) (netip.Pr
 // excludes (RFC 6603) and no live
 // delegation other than key's. An expired one no longer counts, even on an interface that is gone.
 func (p *pdPool) free(s Snapshot, pf netip.Prefix, key string) bool {
-	if s.lanOverlaps(pf) || s.WANSubnet.Prefix.Overlaps(pf) {
+	if s.lanOverlaps(pf) {
 		return false
 	}
 	for _, w := range s.WAN {

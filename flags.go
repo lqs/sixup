@@ -50,7 +50,6 @@ var (
 	tPref       = flag.Duration("tempaddr-preferred", time.Hour, "preferred lifetime of a temporary address")
 	tValid      = flag.Duration("tempaddr-valid", 24*time.Hour, "upper bound on the valid lifetime of a temporary address (the real value follows the in-use check)")
 	tMax        = flag.Int("tempaddr-max", 8, "maximum number of temporary addresses kept at once")
-	tDesync     = flag.Duration("tempaddr-desync", 10*time.Minute, "upper bound of the random jitter applied to rotation")
 	tSkipDAD    = flag.Bool("tempaddr-skip-dad", false, "skip DAD (only on links known to be free of conflicts)")
 	tGrace      = flag.Duration("tempaddr-drain-grace", 5*time.Second, "grace period between the two queries used to decide retirement")
 	stateDir    = flag.String("state-dir", "/var/lib/sixup", "directory where the DUID, the secret and the leases are persisted")
@@ -175,7 +174,7 @@ var usageGroups = []struct {
 	{"LAN side: RA advertisement", []string{"ra-min", "ra-max", "ra-lifetime", "ra-slaac", "ra-onlink", "ra-mtu", "ra-dns", "ra-pref64", "ra-route"}},
 	{"LAN side: DHCPv6 server", []string{"dhcp6s-mode", "dhcp6s-pool", "dhcp6s-static", "dhcp6s-lease-preferred", "dhcp6s-lease-valid", "dhcp6s-pd-len"}},
 	{"NDP proxy", []string{"ndproxy-mode", "ndproxy-static", "ndproxy-exclude", "ndproxy-ttl"}},
-	{"Temporary addresses", []string{"tempaddr", "tempaddr-regen", "tempaddr-preferred", "tempaddr-valid", "tempaddr-max", "tempaddr-desync", "tempaddr-skip-dad", "tempaddr-drain-grace"}},
+	{"Temporary addresses", []string{"tempaddr", "tempaddr-regen", "tempaddr-preferred", "tempaddr-valid", "tempaddr-max", "tempaddr-skip-dad", "tempaddr-drain-grace"}},
 	{"Tunnel", []string{"tunnel-dev", "tunnel-mtu", "tunnel-route4-metric", "tunnel-nat", "tunnel-mape-rules", "tunnel-capture", "tunnel-capture-max"}},
 	{"NAT64", []string{"nat64", "nat64-prefix", "jool-ipv4"}},
 	{"Unsolicited traffic", []string{"unsolicited", "source-filter"}},

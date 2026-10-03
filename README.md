@@ -150,16 +150,15 @@ For other needs, such as several LAN segments, fixed addresses, DNS servers or N
 
 ### Temporary addresses
 
-`-tempaddr` turns temporary addresses on, and the other options set how they rotate. They serve only traffic the router itself starts, such as its own DNS queries or a proxy running on it. Traffic forwarded from the LAN keeps the source address of the device that sent it. The router's LAN addresses are always static. When neither SLAAC nor IA_NA gives the WAN an address, the WAN addresses, temporary ones included, come from a subnet of the delegation.
+`-tempaddr` turns temporary addresses on, and the other options set how they rotate. They serve only traffic the router itself starts, such as its own DNS queries or a proxy running on it. Traffic forwarded from the LAN keeps the source address of the device that sent it. The router's LAN addresses are always static. With a delegation, the temporary addresses are /128s in the first LAN's /64, which the upstream router does not have to resolve; without one, they go in the SLAAC prefix. When neither SLAAC nor IA_NA gives the WAN an address, its static addresses go in that /64 too, so keep `-wan-iid` clear of the addresses of LAN hosts.
 
 | Option | Default | Description |
 |---|---|---|
 | `-tempaddr` | `false` | Besides the static addresses, rotate temporary addresses (RFC 8981) on the WAN interface. |
-| `-tempaddr-regen` | `1h` | How often a new temporary address is created. |
+| `-tempaddr-regen` | `1h` | How often a new temporary address is created. Each rotation comes up to 40% of it earlier at random (RFC 8981). |
 | `-tempaddr-preferred` | `1h` | Preferred lifetime of a temporary address. |
 | `-tempaddr-valid` | `24h` | Upper limit of the valid lifetime of a temporary address. An address still in use is kept up to this limit, an unused one is removed earlier. |
 | `-tempaddr-max` | `8` | Maximum number of temporary addresses at once. |
-| `-tempaddr-desync` | `10m` | Upper limit of the random offset applied to each rotation. |
 | `-tempaddr-skip-dad` | `false` | Skip duplicate address detection. Only for links known to be free of conflicts. |
 | `-tempaddr-drain-grace` | `5s` | Interval between the two checks that decide an address is no longer in use. |
 

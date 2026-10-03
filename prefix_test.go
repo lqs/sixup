@@ -687,8 +687,8 @@ func TestStoreStaticPrefix(t *testing.T) {
 	}
 }
 
-// A WAN without a SLAAC or IA_NA address takes its addresses in the highest subnet of the
-// delegation that no LAN takes and the ISP does not keep; downstream delegations stay clear of it.
+// The WAN subnet is the first LAN's delegated /64: always for temporary addresses, for static
+// ones only without SLAAC and IA_NA.
 func TestStoreWANSubnet(t *testing.T) {
 	st := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 255}}, time.Second, nil, false, 0, 0, "")
 	ch := st.Subscribe()
@@ -698,24 +698,26 @@ func TestStoreWANSubnet(t *testing.T) {
 		Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: "pd"}
 	st.Set("pd", SourceUpdate{Prefixes: []Prefix{pd}})
 	s := recv(t, ch)
-	// subnet 0 is excluded, so lan0 takes fe, the highest no LAN names; the WAN takes fd
-	if s.LAN["lan0"][0].Prefix != netip.MustParsePrefix("2001:db8:100:fe::/64") {
-		t.Fatalf("lan0: %+v", s.LAN["lan0"])
-	}
+	// subnet 0 is excluded, so lan0 takes fe
 	w := s.WANSubnet
-	if w.Prefix != netip.MustParsePrefix("2001:db8:100:fd::/64") || !w.OffLink || !slices.Equal(s.wanPrefixes(), []Prefix{w}) {
+	if w.Prefix != netip.MustParsePrefix("2001:db8:100:fe::/64") || w.Prefix != s.LAN["lan0"][0].Prefix || !w.OffLink ||
+		!slices.Equal(s.wanStatic(), []Prefix{w}) || !slices.Equal(s.wanTemp(), []Prefix{w}) {
 		t.Fatalf("WAN subnet: %+v", w)
 	}
-	p := &pdPool{plen: 64, leases: map[string]*PDLease{}}
-	if p.free(s, w.Prefix, "k") {
-		t.Fatal("the WAN subnet is not free for a downstream delegation")
-	}
-	// An IA_NA address makes it unnecessary
+	// with IA_NA, only temporary addresses
 	st.Set("pd", SourceUpdate{Prefixes: []Prefix{pd}, WANAddr: netip.MustParseAddr("2001:db8:1::5")})
-	if s = recv(t, ch); s.WANSubnet.Prefix.IsValid() {
-		t.Fatalf("WAN subnet with an IA_NA address: %+v", s.WANSubnet)
+	if s = recv(t, ch); len(s.wanStatic()) != 0 || !slices.Equal(s.wanTemp(), []Prefix{w}) {
+		t.Fatalf("with IA_NA: static %v, temporary %v", s.wanStatic(), s.wanTemp())
 	}
-	// A delegated /64 is shared with the LAN
+	// with SLAAC, static addresses in the SLAAC prefix
+	ra := Prefix{Prefix: netip.MustParsePrefix("2001:db8:1::/64"), Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: "ra", SLAAC: true}
+	st.Set("ra", SourceUpdate{Prefixes: []Prefix{ra}})
+	if s = recv(t, ch); len(s.wanStatic()) != 1 || s.wanStatic()[0].Prefix != ra.Prefix || !slices.Equal(s.wanTemp(), []Prefix{w}) {
+		t.Fatalf("with SLAAC: static %v, temporary %v", s.wanStatic(), s.wanTemp())
+	}
+	st.Set("ra", SourceUpdate{})
+	recv(t, ch)
+	// a delegated /64
 	st.Set("pd", SourceUpdate{Prefixes: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8:200::/64"), Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: "pd"}}})
 	if s = recv(t, ch); s.WANSubnet.Prefix != netip.MustParsePrefix("2001:db8:200::/64") {
 		t.Fatalf("WAN subnet of a /64: %+v", s.WANSubnet)

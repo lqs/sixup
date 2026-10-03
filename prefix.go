@@ -108,8 +108,8 @@ type Snapshot struct {
 	PREF64  netip.Prefix        `json:"pref64,omitempty"`
 	WANMTU  int                 `json:"wan_mtu,omitempty"` // drives both the downstream RA MTU option and the tunnel MTU
 	WANAddr netip.Addr          `json:"wan_addr"`
-	// WANSubnet is the /64 of the delegation the WAN takes its /128s from when neither SLAAC nor
-	// IA_NA gives it a global address; OffLink is set, so no on-link route comes with them.
+	// WANSubnet is the /64 of the delegation the WAN takes /128s in (OffLink): temporary
+	// addresses always, static ones only without SLAAC and IA_NA.
 	WANSubnet Prefix        `json:"wan_subnet,omitzero"`
 	Tunnel    *TunnelParams `json:"tunnel,omitempty"`
 	// The PD result is still awaited on a link whose RA announces DHCPv6. Until it arrives nobody
@@ -139,13 +139,21 @@ func (s Snapshot) wanSLAAC() []Prefix {
 	return out
 }
 
-// wanPrefixes returns the prefixes the WAN takes addresses in: the SLAAC ones, or WANSubnet.
-func (s Snapshot) wanPrefixes() []Prefix {
-	out := s.wanSLAAC()
-	if s.WANSubnet.Prefix.IsValid() {
-		out = append(out, s.WANSubnet)
+// wanStatic returns the prefixes for static WAN addresses: SLAAC, else WANSubnet without IA_NA.
+func (s Snapshot) wanStatic() []Prefix {
+	if out := s.wanSLAAC(); len(out) > 0 || s.WANAddr.IsValid() || !s.WANSubnet.Prefix.IsValid() {
+		return out
 	}
-	return out
+	return []Prefix{s.WANSubnet}
+}
+
+// wanTemp returns the prefixes for temporary WAN addresses: WANSubnet, else SLAAC. In an on-link
+// prefix each one is a neighbor entry upstream, which some ISPs limit.
+func (s Snapshot) wanTemp() []Prefix {
+	if s.WANSubnet.Prefix.IsValid() {
+		return []Prefix{s.WANSubnet}
+	}
+	return s.wanSLAAC()
 }
 
 type storeMsg struct {
@@ -851,35 +859,19 @@ func (s *Store) spareSubnet(p Prefix) (netip.Prefix, bool) {
 	return netip.Prefix{}, false
 }
 
-// wanSubnet picks the /64 the WAN takes its addresses in when neither SLAAC nor IA_NA gives it one,
-// so that the router's own traffic still leaves from a WAN address (RFC 7084 has a router without
-// one take an address from the delegation). The delegation is routed to this router, so the upstream needs no
-// address resolution for it. A shorter delegation gives its highest subnet that no LAN takes and
-// the ISP does not keep; a /64 is shared with the LAN, where a clash is left to chance.
+// wanSubnet picks the first LAN's delegated /64: routed to this router, so the upstream resolves
+// none of its addresses, and taken from no downstream delegation (RFC 7084 WAA-7). One also
+// on-link on the WAN is skipped.
 func (s Snapshot) wanSubnet(lans []lanDef) Prefix {
-	if len(s.wanSLAAC()) > 0 || s.WANAddr.IsValid() {
-		return Prefix{}
-	}
 	for _, deprecated := range []bool{false, true} {
-		for _, w := range s.WAN {
-			if w.Source != sourcePD || w.Deprecated != deprecated || w.Prefix.Bits() > 64 {
-				continue
-			}
-			w.OffLink = true
-			if w.Prefix.Bits() == 64 {
-				w.Prefix = w.Prefix.Masked()
-				return w
-			}
-			for i := (1 << min(64-w.Prefix.Bits(), 16)) - 1; i >= 0; i-- {
-				if slices.ContainsFunc(lans, func(l lanDef) bool { return l.index == i }) {
+		for _, l := range lans {
+			for _, p := range s.LAN[l.iface] {
+				if p.Source != sourcePD || p.Stale || p.Deprecated != deprecated ||
+					slices.ContainsFunc(s.WAN, func(w Prefix) bool { return w.Source == sourceRA && w.Prefix.Overlaps(p.Prefix) }) {
 					continue
 				}
-				sub, ok := splitLAN(w.Prefix, i)
-				if !ok || w.Exclude.Overlaps(sub) || s.lanOverlaps(sub) {
-					continue
-				}
-				w.Prefix = sub
-				return w
+				p.OffLink = true
+				return p
 			}
 		}
 	}

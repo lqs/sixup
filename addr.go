@@ -75,15 +75,13 @@ const (
 	iidFixed  iidMode = "fixed" // a suffix given on the command line
 )
 
-// tempConfig is what -tempaddr and the -tempaddr-* options select. Temporary addresses rotate
-// only on the WAN, beside the static ones; the LAN addresses stay static.
+// tempConfig is what -tempaddr and -tempaddr-* select. Only the WAN gets temporary addresses.
 type tempConfig struct {
 	enabled       bool
 	regenInterval time.Duration
 	preferredLft  time.Duration
 	validLft      time.Duration
 	maxConcurrent int
-	desync        time.Duration
 	skipDAD       bool
 	grace         time.Duration
 }
@@ -100,16 +98,17 @@ type tempAddr struct {
 // addrManager owns this host's global addresses on one LAN interface:
 // prefix addresses (one per -lan-iid / -wan-iid policy) follow the snapshot; temporary addresses rotate periodically and retire once no longer in use.
 type addrManager struct {
-	ifname string
-	ifi    *net.Interface
-	secret []byte
-	cfg    tempConfig
-	iids   []iidPolicy             // IID sources for static addresses, one address per policy and prefix
-	pick   func(Snapshot) []Prefix // prefixes to address on this interface (LAN: split result; WAN: upstream A-bit prefixes, else a subnet of the delegation)
-	side   side                    // which interface role this manager runs on
-	layout shared64Layout
-	dadCnt map[iidSlot]uint8 // DAD_Counter per prefix and policy
-	dadDue bool              // new addresses awaiting a DAD verdict
+	ifname   string
+	ifi      *net.Interface
+	secret   []byte
+	cfg      tempConfig
+	iids     []iidPolicy             // IID sources for static addresses, one address per policy and prefix
+	pick     func(Snapshot) []Prefix // prefixes for the static addresses on this interface (LAN: split result; WAN: upstream A-bit prefixes, else a subnet of the delegation)
+	tempPick func(Snapshot) []Prefix // prefixes for the temporary addresses, pick when nil
+	side     side                    // which interface role this manager runs on
+	layout   shared64Layout
+	dadCnt   map[iidSlot]uint8 // DAD_Counter per prefix and policy
+	dadDue   bool              // new addresses awaiting a DAD verdict
 	// New WAN addresses to announce to the first-hop routers (RFC 9131) and how many NAs each still
 	// gets; sent from the DAD poll, one per tick, so a removed address simply drops out
 	announce map[netip.Addr]int
@@ -357,10 +356,11 @@ func (m *addrManager) drainInterval() time.Duration {
 	return d
 }
 
+// nextRegen subtracts a random DESYNC_FACTOR of up to 0.4 of the interval (RFC 8981).
 func (m *addrManager) nextRegen() time.Duration {
 	d := m.cfg.regenInterval
-	if m.cfg.desync > 0 {
-		n, _ := rand.Int(rand.Reader, big.NewInt(int64(m.cfg.desync)))
+	if desync := d * 2 / 5; desync > 0 {
+		n, _ := rand.Int(rand.Reader, big.NewInt(int64(desync)))
 		d -= time.Duration(n.Int64())
 	}
 	if d < time.Second {
@@ -433,10 +433,8 @@ func (m *addrManager) applyPrefixAddrs() {
 	}
 }
 
-// keepTempsNewest rotates when a static address has just been added while temporary addresses are
-// in use. Among equally good source addresses the kernel takes the newest: it never knows an
-// address as temporary, so RFC 6724 rule 7 does not apply, and a static address added after the
-// temporary ones would be the source until the next rotation.
+// keepTempsNewest rotates after a static address is added. The kernel picks the newest of equal
+// source addresses, since it drops IFA_F_TEMPORARY from userspace and RFC 6724 rule 7 never applies.
 func (m *addrManager) keepTempsNewest() {
 	if slices.ContainsFunc(m.temps, func(t *tempAddr) bool { return t.state == "preferred" }) {
 		m.rotate()
@@ -472,9 +470,10 @@ func (m *addrManager) adoptStrays(want map[netip.Addr]Prefix) {
 	if err != nil {
 		return
 	}
-	for _, ia := range strayAddrs(list, want, m.pick(m.snap), m.temps, m.endpoints) {
+	managed := slices.Concat(m.pick(m.snap), m.tempPrefixes())
+	for _, ia := range strayAddrs(list, want, managed, m.temps, m.endpoints) {
 		var prefix netip.Prefix
-		for _, p := range m.pick(m.snap) {
+		for _, p := range managed {
 			if p.Prefix.Contains(ia.Addr) {
 				prefix = p.Prefix
 				break
@@ -528,10 +527,18 @@ func (m *addrManager) plen(p Prefix) int {
 	return m.layout.plen(m.side, m.snap.sharedWith(p.Prefix))
 }
 
-// activePrefixes returns this interface's prefixes still within their preferred lifetime.
+// tempPrefixes returns the prefixes the temporary addresses go in.
+func (m *addrManager) tempPrefixes() []Prefix {
+	if m.tempPick == nil {
+		return m.pick(m.snap)
+	}
+	return m.tempPick(m.snap)
+}
+
+// activePrefixes returns the prefixes for temporary addresses still within their preferred lifetime.
 func (m *addrManager) activePrefixes() []Prefix {
 	var out []Prefix
-	for _, p := range m.pick(m.snap) {
+	for _, p := range m.tempPrefixes() {
 		if !p.Deprecated {
 			out = append(out, p)
 		}
@@ -565,8 +572,7 @@ func (m *addrManager) rotateFor(targets, active []Prefix) bool {
 	now := time.Now()
 	made := false
 	for _, p := range targets {
-		// No IFA_F_TEMPORARY: the kernel drops it when userspace adds an address, and what makes a
-		// temporary address the source is that it is the newest, see keepTempsNewest
+		// no IFA_F_TEMPORARY: the kernel drops it, see keepTempsNewest
 		flags := uint32(ifaFOptimistic)
 		if m.cfg.skipDAD {
 			flags = ifaFNodad

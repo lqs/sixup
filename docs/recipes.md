@@ -22,6 +22,7 @@ both.
 | [A prefix nobody announces](#a-prefix-nobody-announces) | `-wan-prefix 2001:db8:100::/48` |
 | [Your own firewall rules for the tunnel](#your-own-firewall-rules-for-the-tunnel) | `-tunnel-nat off` |
 | [Fixed addresses for the router](#fixed-addresses-for-the-router) | `-wan-iid ::1 -lan-iid ::1` |
+| [Rotating addresses for the router's own traffic](#rotating-addresses-for-the-routers-own-traffic) | `-tempaddr` |
 | [Choosing the DNS servers](#choosing-the-dns-servers) | `-ra-dns self`, or the servers' addresses |
 | [Addresses handed out by DHCPv6](#addresses-handed-out-by-dhcpv6) | `-dhcp6s-mode stateful` |
 | [A router behind this one](#a-router-behind-this-one) | `-dhcp6s-mode stateless` on the upstream router |
@@ -178,6 +179,35 @@ first WAN one is the address sixup reports as the WAN address.
 ```sh
 sudo sixup -wan eth0 -wan-iid ::1 -lan eth1 -lan-iid ::1
 ```
+
+## Rotating addresses for the router's own traffic
+
+With `-tempaddr` the WAN gets temporary addresses (RFC 8981) beside its static ones. Connections
+the router itself opens, such as those of a resolver or a proxy running on it, leave from the
+newest of them, and a new one replaces it every hour. An address stays while connections still
+use it, for a day at most, and is removed once they end. Traffic forwarded from the LAN is not
+affected: LAN hosts keep their own addresses, which most systems already rotate.
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -tempaddr
+```
+
+To rotate faster, shorten `-tempaddr-regen`. Every address still in use counts towards
+`-tempaddr-max`. At the limit the oldest one is removed and its connections break, so raise the
+limit to cover the longest connections.
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -tempaddr -tempaddr-regen 5m -tempaddr-max 32
+```
+
+With a delegation, the temporary addresses go in the first LAN's /64, and the upstream router sees
+only the router's link-local address however many there are. Without one they go in the SLAAC
+prefix, where each is one more neighbor the upstream router keeps. Some ISPs limit their number
+per line, and on some equipment too many of them break IPv6 on the line altogether. On such a
+line, ask the ISP before raising `-tempaddr-max` or shortening the interval.
+
+Only the interface identifier changes. The prefix the ISP assigned stays the same, and it still
+identifies the line.
 
 ## Choosing the DNS servers
 

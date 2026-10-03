@@ -263,12 +263,11 @@ func main() {
 	for _, r := range routes {
 		rios = append(rios, netip.MustParsePrefix(r))
 	}
-	tcfg := tempConfig{regenInterval: *tRegen, preferredLft: *tPref, validLft: *tValid, maxConcurrent: *tMax, desync: *tDesync, skipDAD: *tSkipDAD, grace: *tGrace}
+	tcfg := tempConfig{regenInterval: *tRegen, preferredLft: *tPref, validLft: *tValid, maxConcurrent: *tMax, skipDAD: *tSkipDAD, grace: *tGrace}
 	if *upRA && *wanSLAAC {
-		// The static addresses and the optional temporary addresses coexist on the WAN interface.
 		wcfg := tcfg
 		wcfg.enabled = *tEnable
-		go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanPrefixes, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
+		go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanStatic, tempPick: Snapshot.wanTemp, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
 	}
 	poolStart, poolEnd := parsePool(*poolRange)
 	var pd *pdPool
