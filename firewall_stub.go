@@ -13,6 +13,7 @@ type firewall struct {
 	lans    []string
 	inbound bool
 	source  bool
+	nat64   bool
 	holeIn  chan []portMapping
 	delegIn chan []netip.Prefix
 }

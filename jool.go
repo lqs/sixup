@@ -541,6 +541,10 @@ func vethAdd(name, peer string, ns int) error {
 	}
 	ae := netlink.NewAttributeEncoder()
 	ae.String(unix.IFLA_IFNAME, name)
+	// Packets GRO merged on their way in are split again before they leave this end, as one with
+	// more segments than gso_max_segs is segmented in software. Jool would otherwise translate the
+	// merged packet whole and cut it into fragments.
+	ae.Uint32(unix.IFLA_GSO_MAX_SEGS, 1)
 	ae.Nested(unix.IFLA_LINKINFO, func(ae *netlink.AttributeEncoder) error {
 		ae.String(unix.IFLA_INFO_KIND, "veth")
 		ae.Nested(unix.IFLA_INFO_DATA, func(ae *netlink.AttributeEncoder) error {

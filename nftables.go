@@ -280,25 +280,30 @@ func (m *natManager) egress() []expr.Any {
 	}
 }
 
-// mssRules clamp the MSS of SYNs through the tunnel to what fits it, in both directions: the LAN
-// host's, so the far end sends segments that fit, and the far end's, so the LAN host does too.
-// Large transfers stall without it whenever the ICMP that path MTU discovery depends on is filtered.
-// The kernel only ever lowers an MSS it writes, so a smaller one is left alone.
+// mssRules clamp the MSS of SYNs through the tunnel to what fits it. Large transfers stall without
+// it whenever the ICMP that path MTU discovery depends on is filtered.
 func (m *natManager) mssRules(tbl *nftables.Table, ch *nftables.Chain, mtu int) []*nftables.Rule {
-	mss := binaryutil.BigEndian.PutUint16(uint16(mtu - 40)) // IPv4 and TCP headers
+	return clampMSS(tbl, ch, m.dev, mtu-40) // IPv4 and TCP headers
+}
+
+// clampMSS lowers the MSS of SYNs through dev to mss, in both directions: the near host's, so the
+// far end sends segments that small, and the far end's, so the near host does too. The kernel only
+// ever lowers an MSS it writes, so a smaller one is left alone.
+func clampMSS(tbl *nftables.Table, ch *nftables.Chain, dev string, mss int) []*nftables.Rule {
+	value := binaryutil.BigEndian.PutUint16(uint16(mss))
 	var out []*nftables.Rule
 	for _, dir := range []expr.MetaKey{expr.MetaKeyOIFNAME, expr.MetaKeyIIFNAME} {
 		way := map[expr.MetaKey]string{expr.MetaKeyOIFNAME: "leaving", expr.MetaKeyIIFNAME: "arriving"}[dir]
-		out = append(out, newRule(tbl, ch, fmt.Sprintf("clamp MSS to %d for SYNs %s via %s", mtu-40, way, m.dev), []expr.Any{
+		out = append(out, newRule(tbl, ch, fmt.Sprintf("clamp MSS to %d for SYNs %s via %s", mss, way, dev), []expr.Any{
 			&expr.Meta{Key: dir, Register: 1},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(m.dev)},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(dev)},
 			&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.IPPROTO_TCP}},
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 13, Len: 1},
 			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 1, Mask: []byte{0x02 | 0x04}, Xor: []byte{0x00}},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0x02}}, // SYN set, RST clear
 		},
-			&expr.Immediate{Register: 1, Data: mss},
+			&expr.Immediate{Register: 1, Data: value},
 			&expr.Exthdr{SourceRegister: 1, Type: 2, Offset: 2, Len: 2, Op: expr.ExthdrOpTcpopt},
 		))
 	}

@@ -748,3 +748,64 @@ func TestFirewallReportsNftablesFailures(t *testing.T) {
 		t.Fatalf("a table that is not there should be reported:\n%s", logged.String())
 	}
 }
+
+// syn6MSS is syn6 with an MSS option.
+func syn6MSS(from, to netip.AddrPort, mss uint16) []byte {
+	tcp := make([]byte, 24)
+	binary.BigEndian.PutUint16(tcp[0:], from.Port())
+	binary.BigEndian.PutUint16(tcp[2:], to.Port())
+	tcp[12], tcp[13] = 6<<4, 0x02
+	binary.BigEndian.PutUint16(tcp[14:], 65535)
+	tcp[20], tcp[21] = 2, 4
+	binary.BigEndian.PutUint16(tcp[22:], mss)
+	return ip6(from.Addr(), to.Addr(), unix.IPPROTO_TCP, tcp)
+}
+
+// Through the NAT64 every SYN goes with an MSS of at most 1220, either way, so nothing Jool
+// translates exceeds 1280 bytes.
+func TestFirewallNAT64MSSAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	host := netip.AddrPortFrom(netip.MustParseAddr("2001:db8:1::10"), 40000)
+	far := netip.AddrPortFrom(netip.MustParseAddr("64:ff9b::c000:201"), 443)
+	lanDev := openTun(t, "lan-test0", netip.MustParsePrefix("2001:db8:1::/56"))
+	natDev := openTun(t, joolOutside, nat64WKP)
+	if err := sysctlWrite("/proc/sys/net/ipv6/conf/all/forwarding", "1"); err != nil {
+		t.Fatal(err)
+	}
+	f := &firewall{wan: "wan-test0", lans: []string{"lan-test0"}, nat64: true}
+	if err := f.install(); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	t.Cleanup(f.remove)
+	mss := func(in, out *os.File, pkt []byte) uint16 {
+		t.Helper()
+		if _, err := in.Write(pkt); err != nil {
+			t.Fatal(err)
+		}
+		out.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 2048)
+		for {
+			n, err := out.Read(buf)
+			if err != nil {
+				t.Fatalf("the SYN was not forwarded: %v", err)
+			}
+			if n >= 64 && buf[0]>>4 == 6 && buf[6] == unix.IPPROTO_TCP {
+				return binary.BigEndian.Uint16(buf[40+22:])
+			}
+		}
+	}
+	for _, c := range []struct {
+		name      string
+		in, out   *os.File
+		from, to  netip.AddrPort
+		mss, want uint16
+	}{
+		{"to the NAT64", lanDev, natDev, host, far, 1440, 1220},
+		{"to the NAT64, already small", lanDev, natDev, host, far, 1000, 1000},
+		{"from the NAT64", natDev, lanDev, far, host, 1440, 1220},
+	} {
+		if got := mss(c.in, c.out, syn6MSS(c.from, c.to, c.mss)); got != c.want {
+			t.Errorf("%s: MSS %d came out as %d, want %d", c.name, c.mss, got, c.want)
+		}
+	}
+}

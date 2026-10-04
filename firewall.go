@@ -70,6 +70,7 @@ type firewall struct {
 	lans    []string            // the interfaces sixup serves
 	inbound bool                // filter unsolicited traffic from the WAN
 	source  bool                // refuse LAN sources outside ours (-source-filter)
+	nat64   bool                // Jool translates behind joolOutside
 	holeIn  chan []portMapping  // PCP's pinholes, the latest set replacing the last
 	delegIn chan []netip.Prefix // the prefixes delegated to downstream routers, likewise
 	holes   *nftables.Set
@@ -184,6 +185,14 @@ func (f *firewall) install() error {
 		Hooknum: nftables.ChainHookForward, Priority: nftables.ChainPriorityFilter,
 		Policy: chainPolicy(nftables.ChainPolicyAccept),
 	})
+	// Jool leaves the MSS alone, so clamping it to 1220, the IPv6 minimum MTU less the IPv6 and TCP
+	// headers, keeps every TCP segment within 1280 bytes once translated, either way. Jool then
+	// fragments no TCP whatever DF says, and any IPv6 link behind this router carries it.
+	if f.nat64 {
+		for _, r := range clampMSS(tbl, fwd, joolOutside, 1280-40-20) {
+			c.AddRule(r)
+		}
+	}
 	// The border, in every mode. A ULA the upstream advertises is of the same site and crosses the
 	// WAN (RFC 4193 section 4.3); what the LAN sends out for another is refused with code 1, so
 	// that its sender learns it at once instead of timing out. What arrives for a ULA is checked

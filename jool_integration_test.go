@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mdlayher/genetlink"
+	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -357,5 +358,46 @@ func TestJoolRequestOverGenericNetlink(t *testing.T) {
 	const seg6CmdGetTunsrc = 4 // SEG6_CMD_GET_TUNSRC, which ignores what it is sent
 	if err := joolRequest(c, seg6.ID, 0, seg6CmdGetTunsrc, nil); err != nil {
 		t.Fatalf("a plain reply is a success, got %v", err)
+	}
+}
+
+// The host's end of the veth splits merged packets before Jool sees them.
+func TestJoolVethSplitsMergedPackets(t *testing.T) {
+	if !ownNetns(t) {
+		return
+	}
+	ns, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ns.Close()
+	if err := vethAdd("gso-test0", "gso-test1", int(ns.Fd())); err != nil {
+		t.Fatal(err)
+	}
+	c, err := rtDial()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for name, want := range map[string]uint32{"gso-test0": 1, "gso-test1": 65535} {
+		hdr := make([]byte, 16)
+		nativeEndian.PutUint32(hdr[4:8], uint32(mustIface(t, name)))
+		msgs, err := c.Execute(netlink.Message{Header: netlink.Header{Type: unix.RTM_GETLINK, Flags: netlink.Request}, Data: hdr})
+		if err != nil || len(msgs) != 1 {
+			t.Fatalf("%s: %v", name, err)
+		}
+		ad, err := netlink.NewAttributeDecoder(msgs[0].Data[16:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got uint32
+		for ad.Next() {
+			if ad.Type() == unix.IFLA_GSO_MAX_SEGS {
+				got = ad.Uint32()
+			}
+		}
+		if got != want {
+			t.Errorf("%s gso_max_segs = %d, want %d", name, got, want)
+		}
 	}
 }
