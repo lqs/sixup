@@ -3,6 +3,7 @@
 <strong>English</strong> | <a href="README.zh.md" lang="zh-Hans">简体中文</a> | <a href="README.ja.md" lang="ja">日本語</a>
 
 [![CI](https://github.com/lqs/sixup/actions/workflows/ci.yml/badge.svg)](https://github.com/lqs/sixup/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/lqs/sixup/graph/badge.svg)](https://codecov.io/gh/lqs/sixup)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 In the past, setting up IPv6 routing on Linux took a number of programs. `odhcp6c`

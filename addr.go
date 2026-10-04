@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"math/big"
 	"net"
 	"net/netip"
@@ -109,6 +110,9 @@ type addrManager struct {
 	layout   shared64Layout
 	dadCnt   map[iidSlot]uint8 // DAD_Counter per prefix and policy
 	dadDue   bool              // new addresses awaiting a DAD verdict
+	// Prefix addresses added and not yet past DAD. They have a finite valid lifetime, so the
+	// kernel deletes one that fails DAD instead of marking it; gone from here means failed.
+	dadWait map[netip.Addr]bool
 	// New WAN addresses to announce to the first-hop routers (RFC 9131) and how many NAs each still
 	// gets; sent from the DAD poll, one per tick, so a removed address simply drops out
 	announce map[netip.Addr]int
@@ -142,6 +146,7 @@ func (m *addrManager) run(ctx context.Context, hub *linkHub, store *Store, ch <-
 		}
 		m.temps = nil
 		m.dadCnt = map[iidSlot]uint8{}
+		m.dadWait = map[netip.Addr]bool{}
 		m.endpoints = map[netip.Addr]string{}
 		m.announce = map[netip.Addr]int{}
 		m.wanAddr = netip.Addr{}
@@ -209,6 +214,8 @@ func (m *addrManager) checkDAD() {
 	}
 	pending := false
 	listed := map[netip.Addr]bool{}
+	// addresses that replace a failed one in this call are not in list yet
+	waiting := maps.Clone(m.dadWait)
 	for _, ia := range list {
 		listed[ia.Addr] = true
 		if n := m.announce[ia.Addr]; n > 0 {
@@ -258,16 +265,12 @@ func (m *addrManager) checkDAD() {
 			continue
 		}
 		if ia.Flags&ifaFDadFailed == 0 {
+			delete(m.dadWait, ia.Addr)
 			continue
 		}
-		if p, ok := m.applied[ia.Addr]; ok {
-			slot := m.slotOf(ia.Addr, p.Prefix)
-			m.dadCnt[slot]++
-			warnf("[address %s] %s failed DAD, switching to address with DAD_Counter=%d", m.ifname, ia.Addr, m.dadCnt[slot])
+		if _, ok := m.applied[ia.Addr]; ok {
 			addrDel(m.ifi.Index, ia.Addr, ia.PrefixLen)
-			delete(m.applied, ia.Addr)
-			delete(m.plens, ia.Addr)
-			m.applyPrefixAddrs()
+			m.prefixDADFailed(ia.Addr)
 			pending = true
 			continue
 		}
@@ -286,12 +289,29 @@ func (m *addrManager) checkDAD() {
 			pending = true
 		}
 	}
+	for a := range waiting {
+		if !listed[a] && m.dadWait[a] {
+			m.prefixDADFailed(a)
+			pending = true
+		}
+	}
 	for a := range m.announce {
 		if !listed[a] {
 			delete(m.announce, a)
 		}
 	}
 	m.dadDue = pending
+}
+
+// prefixDADFailed moves a prefix address that failed DAD to the next RFC 7217 DAD_Counter.
+func (m *addrManager) prefixDADFailed(a netip.Addr) {
+	slot := m.slotOf(a, m.applied[a].Prefix)
+	m.dadCnt[slot]++
+	warnf("[address %s] %s failed DAD, switching to address with DAD_Counter=%d", m.ifname, a, m.dadCnt[slot])
+	delete(m.dadWait, a)
+	delete(m.applied, a)
+	delete(m.plens, a)
+	m.applyPrefixAddrs()
 }
 
 // awaitAnnounce queues a new address for announcement once DAD lets it go, or at once if it is
@@ -409,6 +429,7 @@ func (m *addrManager) applyPrefixAddrs() {
 		if !had {
 			infof("[address %s] added %s/%d preferred=%s valid=%s", m.ifname, a, plen, pref.Round(time.Second), valid.Round(time.Second))
 			m.dadDue = true
+			m.dadWait[a] = true
 			m.awaitAnnounce(a)
 			added = true
 		}
@@ -424,6 +445,7 @@ func (m *addrManager) applyPrefixAddrs() {
 				warnf("[address %s] failed to delete %s: %v", m.ifname, a, err)
 			}
 			delete(m.plens, a)
+			delete(m.dadWait, a)
 		}
 	}
 	m.applied = want

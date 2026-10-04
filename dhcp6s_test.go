@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"net"
 	"net/netip"
@@ -379,5 +380,252 @@ func TestServerPassesSIPOn(t *testing.T) {
 	o := resp.Options.GetOne(dhcpv6.OptionSIPServersIPv6AddressList)
 	if o == nil || !bytes.Equal(o.ToBytes(), sip) {
 		t.Fatalf("SIP servers: %v", o)
+	}
+}
+
+// dhcp6sDryRun turns route changes into no-ops for the test.
+func dhcp6sDryRun(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	t.Cleanup(func() { dryRun = old })
+}
+
+// A GUA wins over a ULA, a deprecated prefix is skipped, and with nothing left no address is offered.
+func TestDHCP6sActivePrefix(t *testing.T) {
+	s := newTestServer(true)
+	ula1, ula2 := netip.MustParsePrefix("fd00:1::/64"), netip.MustParsePrefix("fd00:2::/64")
+	gua := s.snap.LAN["lan0"][0]
+	dep := gua
+	dep.Deprecated = true
+	s.snap.LAN["lan0"] = []Prefix{dep, {Prefix: ula1, Source: "ula"}, {Prefix: ula2, Source: "ula"}}
+	if p, ok := s.activePrefix(); !ok || p.Prefix != ula1 {
+		t.Fatalf("the first ULA when no GUA is usable: %v %v", p, ok)
+	}
+	s.snap.LAN["lan0"] = []Prefix{{Prefix: ula1, Source: "ula"}, gua}
+	if p, ok := s.activePrefix(); !ok || p.Prefix != gua.Prefix {
+		t.Fatalf("a GUA over a ULA: %v %v", p, ok)
+	}
+	s.snap.LAN["lan0"] = []Prefix{dep}
+	rep := s.handle(cliMsg(dhcpv6.MessageTypeSolicit, iana1(), &dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionRapidCommit}), peerLL)
+	if st := rep.Options.IANA()[0].Options.Status(); st == nil || st.StatusCode != iana.StatusNoAddrsAvail {
+		t.Fatalf("no active prefix: want NoAddrsAvail, got %v", st)
+	}
+}
+
+// Messages the server does not act on, and odd contents of those it does.
+func TestDHCP6sOddMessages(t *testing.T) {
+	s := newTestServer(true)
+	if s.unicast(cliMsg(dhcpv6.MessageTypeRequest, iana1())) != nil {
+		t.Error("a unicast Request without a Server ID is dropped")
+	}
+	if s.handle(cliMsg(dhcpv6.MessageTypeReply, dhcpv6.OptServerID(srvDUID)), peerLL) != nil {
+		t.Error("a Reply sent to the server is dropped")
+	}
+	bad := iana1()
+	bad.Options.Add(&dhcpv6.OptIAAddress{IPv6Addr: net.IP{1, 2, 3}})
+	if st := s.handle(cliMsg(dhcpv6.MessageTypeConfirm, bad), peerLL).Options.Status(); st == nil || st.StatusCode != iana.StatusSuccess {
+		t.Errorf("an address that does not parse is skipped in a Confirm: %v", st)
+	}
+	rel := s.handle(cliMsg(dhcpv6.MessageTypeRelease, dhcpv6.OptServerID(srvDUID), iapd()), peerLL)
+	if ias := rel.Options.IAPD(); len(ias) != 1 || ias[0].Options.Status().StatusCode != iana.StatusNoBinding {
+		t.Errorf("releasing an IA_PD without a pool answers NoBinding: %v", rel)
+	}
+}
+
+// A client that accepts Reconfigure but is given nothing to hold gets no key.
+func TestDHCP6sNoKeyWithoutBinding(t *testing.T) {
+	s := newTestServer(false)
+	rep := s.handle(cliMsg(dhcpv6.MessageTypeRequest, dhcpv6.OptServerID(srvDUID), iana1(),
+		&dhcpv6.OptionGeneric{OptionCode: optionReconfAccept}), peerLL)
+	if rep.Options.GetOne(dhcpv6.OptionAuth) != nil {
+		t.Fatal("a stateless server holding no binding hands out no key")
+	}
+}
+
+// An empty prefix entry is skipped, and a router that moves to another link-local address gets its
+// route moved too.
+func TestDHCP6sDelegationMoves(t *testing.T) {
+	dhcp6sDryRun(t)
+	s := newPDServer(false, pdSnap("2001:db8:100::/56"))
+	ia := iapd(hint(56))
+	ia.Options.Add(&dhcpv6.OptIAPrefix{})
+	live, _, _ := granted(t, s.handle(cliMsg(dhcpv6.MessageTypeRequest, dhcpv6.OptServerID(srvDUID), ia), peerLL))
+	other := netip.MustParseAddr("fe80::99")
+	again, _, _ := granted(t, s.handle(cliMsg(dhcpv6.MessageTypeRenew, dhcpv6.OptServerID(srvDUID), iapd(live[0])), other))
+	if len(again) != 1 || again[0] != live[0] {
+		t.Fatalf("the prefix stays: %v then %v", live, again)
+	}
+	if l := s.pd.leases[leaseKey(duidOf(cliDUID), 7)]; l.Peer != other {
+		t.Fatalf("the lease follows the router: %+v", l)
+	}
+}
+
+func TestDHCP6sRoutesOfOtherInterfaces(t *testing.T) {
+	dhcp6sDryRun(t)
+	ifs, err := net.Interfaces()
+	if err != nil || len(ifs) == 0 {
+		t.Skip("no interfaces")
+	}
+	s := newPDServer(false, pdSnap("2001:db8:100::/56"))
+	pf := netip.MustParsePrefix("2001:db8:100:10::/60")
+	// a missing interface is skipped, an existing one is used
+	s.pdRoute(&PDLease{Prefix: pf, Iface: "nope-dhcp6s0", Peer: peerLL}, true)
+	s.pdRoute(&PDLease{Prefix: pf, Iface: ifs[0].Name, Peer: peerLL}, true)
+
+	now := time.Now()
+	s.pd.leases["live"] = &PDLease{Prefix: pf, Iface: "lan0", Peer: peerLL, Expires: now.Add(time.Hour)}
+	s.pd.leases["gone"] = &PDLease{Prefix: pf, Iface: "lan0", Peer: peerLL, Expires: now.Add(-time.Hour)}
+	s.pd.leases["other"] = &PDLease{Prefix: pf, Iface: "lan9", Peer: peerLL, Expires: now.Add(time.Hour)}
+	s.restoreRoutes()
+
+	s.pd = nil
+	s.restoreRoutes()
+	s.dropDelegations(func(*PDLease) bool { return true })
+}
+
+func TestDHCP6sAllocateSkipsStaticsAndOldDeclines(t *testing.T) {
+	s := newTestServer(true)
+	s.poolEnd = s.poolStart // a pool of one
+	only := netip.MustParseAddr("2001:db8:1::1000")
+	s.statics = []staticBind{{mac: "02:00:00:00:00:99", addr: only}}
+	rep := s.handle(cliMsg(dhcpv6.MessageTypeSolicit, iana1()), peerLL)
+	if st := rep.Options.IANA()[0].Options.Status(); st == nil || st.StatusCode != iana.StatusNoAddrsAvail {
+		t.Fatalf("another host's static address is not handed out: %v", rep.Options.IANA()[0].Options)
+	}
+	s.statics = nil
+	s.declined = map[netip.Addr]time.Time{only: time.Now().Add(-time.Second)}
+	if a, _ := firstAddr(t, s.handle(cliMsg(dhcpv6.MessageTypeSolicit, iana1()), peerLL)); a != only {
+		t.Fatalf("a decline that ran out frees the address: %s", a)
+	}
+	if len(s.declined) != 0 {
+		t.Fatalf("the old decline is forgotten: %v", s.declined)
+	}
+}
+
+func TestDHCP6sMACFromDUID(t *testing.T) {
+	m := cliMsg(dhcpv6.MessageTypeSolicit)
+	llt := &dhcpv6.DUIDLLT{HWType: iana.HWTypeEthernet, LinkLayerAddr: net.HardwareAddr{2, 0, 0, 0, 0, 7}}
+	if got := macFromDUID(llt, m); got != "02:00:00:00:00:07" {
+		t.Errorf("DUID-LLT: %q", got)
+	}
+	en := &dhcpv6.DUIDEN{EnterpriseNumber: 1, EnterpriseIdentifier: []byte{1}}
+	if got := macFromDUID(en, m); got != "" {
+		t.Errorf("DUID-EN without the relay's option: %q", got)
+	}
+	m.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionClientLinkLayerAddr, OptionData: []byte{0, 1, 2, 0, 0, 0, 0, 8}})
+	if got := macFromDUID(en, m); got != "02:00:00:00:00:08" {
+		t.Errorf("the relay's client link-layer address: %q", got)
+	}
+	short := cliMsg(dhcpv6.MessageTypeSolicit, &dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionClientLinkLayerAddr, OptionData: []byte{0, 1}})
+	if got := macFromDUID(en, short); got != "" {
+		t.Errorf("a truncated link-layer address: %q", got)
+	}
+}
+
+// Leases off the new prefix go when their client cannot be told to renew.
+func TestDHCP6sPrefixChangeDropsUnreachableLeases(t *testing.T) {
+	s := newTestServer(true)
+	on := netip.MustParseAddr("2001:db8:1::1000")
+	s.leases["on"] = &Lease{DUID: "aa", Addr: on}
+	s.leases["off"] = &Lease{DUID: "bb", Addr: netip.MustParseAddr("2001:db8:9::1000"), ReconfKey: "00"}
+	s.onPrefixChange(Snapshot{})
+	if len(s.leases) != 1 || s.leases["on"] == nil {
+		t.Fatalf("only the lease on the prefix stays: %v", s.leases)
+	}
+}
+
+func TestDHCP6sBuildReconfigureRefusesBadLeases(t *testing.T) {
+	for _, duid := range []string{"zz", "00"} {
+		if _, ok := buildReconfigure(srvDUID, &Lease{DUID: duid, ReconfKey: "0011"}, time.Now()); ok {
+			t.Errorf("DUID %q: nothing to send", duid)
+		}
+	}
+}
+
+func TestDHCP6sExpireLeases(t *testing.T) {
+	dhcp6sDryRun(t)
+	s := newPDServer(true, pdSnap("2001:db8:100::/56"))
+	s.leaseFile = filepath.Join(t.TempDir(), "leases.json")
+	now := time.Now()
+	s.leases["old"] = &Lease{DUID: "aa", Addr: netip.MustParseAddr("2001:db8:1::1"), Expires: now.Add(-time.Second)}
+	s.leases["new"] = &Lease{DUID: "bb", Addr: netip.MustParseAddr("2001:db8:1::2"), Expires: now.Add(time.Hour)}
+	s.pd.leases["old"] = &PDLease{Prefix: netip.MustParsePrefix("2001:db8:100:10::/60"), Iface: "lan0", Expires: now.Add(-time.Second)}
+	s.expireLeases()
+	if len(s.leases) != 1 || s.leases["new"] == nil || len(s.pd.leases) != 0 {
+		t.Fatalf("expired leases and delegations go: %v %v", s.leases, s.pd.leases)
+	}
+	if _, err := os.Stat(s.leaseFile); err != nil {
+		t.Fatalf("the change is saved: %v", err)
+	}
+	os.Remove(s.leaseFile)
+	s.expireLeases()
+	if _, err := os.Stat(s.leaseFile); err == nil {
+		t.Fatal("nothing changed, nothing saved")
+	}
+}
+
+func TestDHCP6sLeaseFileErrors(t *testing.T) {
+	dir := t.TempDir()
+	s := newTestServer(true)
+	s.leaseFile = filepath.Join(dir, "missing.json")
+	s.loadLeases()
+	if len(s.leases) != 0 {
+		t.Fatal("no file, no leases")
+	}
+	s.leaseFile = filepath.Join(dir, "corrupt.json")
+	os.WriteFile(s.leaseFile, []byte("{"), 0o600)
+	s.loadLeases()
+	if len(s.leases) != 0 {
+		t.Fatal("a corrupt file is ignored")
+	}
+	s.leaseFile = filepath.Join(dir, "no-such-dir", "leases.json")
+	s.leases["a"] = &Lease{Addr: netip.MustParseAddr("2001:db8:1::2")}
+	s.leases["b"] = &Lease{Addr: netip.MustParseAddr("2001:db8:1::1")}
+	s.saveLeases()
+	if _, err := os.Stat(s.leaseFile); err == nil {
+		t.Fatal("a lease file in a missing directory cannot be written")
+	}
+	if l := s.leaseList(); l[0].Addr != netip.MustParseAddr("2001:db8:1::1") {
+		t.Fatalf("leases are listed by address: %v", l)
+	}
+}
+
+func TestDHCP6sServerDUID(t *testing.T) {
+	if d := serverDUID(context.Background(), &dhcpClient{duid: cliDUID}, "", ""); d != cliDUID {
+		t.Fatalf("the client's DUID: %v", d)
+	}
+	// the client's DUID is waited for, until the context ends
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if d := serverDUID(ctx, &dhcpClient{}, "", ""); d != nil {
+		t.Fatalf("no DUID yet: %v", d)
+	}
+	done, cancelDone := context.WithCancel(context.Background())
+	cancelDone()
+	if d := serverDUID(done, nil, t.TempDir(), "nope-dhcp6s0"); d != nil {
+		t.Fatalf("no WAN interface: %v", d)
+	}
+
+	var up string
+	ifs, _ := net.Interfaces()
+	for _, ifi := range ifs {
+		if ifi.Flags&net.FlagUp != 0 {
+			up = ifi.Name
+			break
+		}
+	}
+	if up == "" {
+		t.Skip("no interface is up")
+	}
+	dir := t.TempDir()
+	if d := serverDUID(context.Background(), nil, dir, up); d == nil {
+		t.Fatal("a DUID is made and kept for the WAN")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "duid")); err != nil {
+		t.Fatalf("the DUID is saved: %v", err)
+	}
+	// a state directory that is a file cannot keep it
+	if d := serverDUID(context.Background(), nil, filepath.Join(dir, "duid"), up); d != nil {
+		t.Fatalf("an unwritable state directory: %v", d)
 	}
 }

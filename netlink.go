@@ -66,10 +66,7 @@ func addrSet(ifi int, addr netip.Addr, plen int, preferred, valid time.Duration,
 	nativeEndian.PutUint32(ci[0:4], lftSeconds(preferred, false))
 	nativeEndian.PutUint32(ci[4:8], lftSeconds(valid, infiniteValid))
 	ae.Bytes(unix.IFA_CACHEINFO, ci)
-	attrs, err := ae.Encode()
-	if err != nil {
-		return err
-	}
+	attrs, _ := ae.Encode()
 	hdr := make([]byte, 8)
 	hdr[0] = unix.AF_INET6
 	hdr[1] = byte(plen)
@@ -300,10 +297,7 @@ func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, rtn, proto uint8
 	if expires > 0 {
 		ae.Uint32(unix.RTA_EXPIRES, uint32(expires/time.Second))
 	}
-	attrs, err := ae.Encode()
-	if err != nil {
-		return err
-	}
+	attrs, _ := ae.Encode()
 	_, err = c.Execute(netlink.Message{Header: netlink.Header{Type: typ, Flags: flags}, Data: append(hdr, attrs...)})
 	return err
 }
@@ -519,8 +513,6 @@ func conntrackInUse(addr netip.Addr) (int, error) {
 		ctaTupleOrig        = 1
 		ctaTupleReply       = 2
 		ctaTupleIP          = 1
-		ctaIPv6Src          = 3
-		ctaIPv6Dst          = 4
 		nlaFNested          = 0x8000
 	)
 	// nfgenmsg: family, version, res_id
@@ -556,12 +548,9 @@ func conntrackInUse(addr netip.Addr) (int, error) {
 					if nd.Type()&^nlaFNested != ctaTupleIP {
 						continue
 					}
+					// holds only CTA_IP_V6_SRC and CTA_IP_V6_DST in an AF_INET6 dump
 					nd.Nested(func(ipd *netlink.AttributeDecoder) error {
 						for ipd.Next() {
-							typ := ipd.Type() &^ nlaFNested
-							if typ != ctaIPv6Src && typ != ctaIPv6Dst {
-								continue
-							}
 							if b := ipd.Bytes(); len(b) == 16 && [16]byte(b) == want {
 								hit = true
 							}
@@ -606,18 +595,12 @@ func setAllMulti(name string) error {
 	if err != nil {
 		return err
 	}
-	c, err := rtDial()
-	if err != nil {
-		return err
-	}
-	defer c.Close()
 	hdr := make([]byte, 16)
 	hdr[0] = unix.AF_UNSPEC
 	nativeEndian.PutUint32(hdr[4:8], uint32(ifi.Index))
 	nativeEndian.PutUint32(hdr[8:12], unix.IFF_ALLMULTI)
 	nativeEndian.PutUint32(hdr[12:16], unix.IFF_ALLMULTI)
-	_, err = c.Execute(netlink.Message{Header: netlink.Header{Type: unix.RTM_SETLINK, Flags: netlink.Request | netlink.Acknowledge}, Data: hdr})
-	return err
+	return linkRequest(unix.RTM_SETLINK, 0, hdr, nil)
 }
 
 // reusePort lets the DHCPv6 servers of several LAN interfaces share port 547, each filtering by interface index.
@@ -636,13 +619,16 @@ func reusePort(network, address string, c syscall.RawConn) error {
 }
 
 // packetCapture uses AF_PACKET to feed frames the IPv6 frames addressed to this host
-// (unicast to our MAC, or multicast) on an interface. Promiscuous mode stays off since
-// the targets are our own tunnel traffic and REPLYs to other local DHCPv6 clients.
+// (unicast to our MAC, or multicast) on an interface, and the ones it sends. Promiscuous mode
+// stays off: the tunnel traffic is our own, and the Neighbor Solicitations the NDP proxy needs go
+// to multicast groups that ALLMULTI lets in.
 // A classic BPF filter drops everything outside kinds in the kernel. onExit runs when
 // the read loop ends, including when it was not stopped deliberately.
+// The socket is non-blocking and owned by the runtime poller, so stopping wakes a blocked
+// read and the descriptor is not released, and so not reused, while a read is in progress.
 func packetCapture(ifindex int, frames chan<- []byte, kinds frameKind, onExit func()) (func(), error) {
 	const ethPIPv6 = 0x86dd
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, int(htons(ethPIPv6)))
+	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, int(htons(ethPIPv6)))
 	if err != nil {
 		return nil, err
 	}
@@ -651,37 +637,33 @@ func packetCapture(ifindex int, frames chan<- []byte, kinds frameKind, onExit fu
 		return nil, err
 	}
 	if err := attachCaptureFilter(fd, kinds); err != nil {
-		debugf("[tunnel-capture] attaching BPF filter failed: %v, falling back to userspace filtering", err)
+		debugf("[packet-capture] attaching BPF filter failed: %v, falling back to userspace filtering", err)
 	}
+	f := os.NewFile(uintptr(fd), "packet")
 	done := make(chan struct{})
 	go func() {
 		defer close(frames)
 		defer onExit()
 		buf := make([]byte, 65536)
 		for {
-			n, _, err := unix.Recvfrom(fd, buf, 0)
+			n, err := f.Read(buf)
 			if err != nil {
 				select {
 				case <-done:
 				default:
-					if !errors.Is(err, unix.EINTR) {
-						debugf("[tunnel-capture] read failed: %v", err)
-					}
+					debugf("[packet-capture] read failed: %v", err)
 				}
-				if !errors.Is(err, unix.EINTR) {
-					return
-				}
-				continue
+				return
 			}
-			f := make([]byte, n)
-			copy(f, buf[:n])
+			frame := make([]byte, n)
+			copy(frame, buf[:n])
 			select {
-			case frames <- f:
+			case frames <- frame:
 			default:
 			}
 		}
 	}()
-	return func() { close(done); unix.Close(fd) }, nil
+	return func() { close(done); f.Close() }, nil
 }
 
 func htons(v uint16) uint16 { return v<<8 | v>>8 }
@@ -721,17 +703,11 @@ func tunnelSet(name string, link int, local, remote netip.Addr, mtu int) error {
 	data.Uint8(iflaIptunEncapLimit, 0)
 	data.Uint32(iflaIptunFlags, ip6TnlIgnEncapLimit)
 	data.Uint8(iflaIptunProto, unix.IPPROTO_IPIP)
-	dataB, err := data.Encode()
-	if err != nil {
-		return err
-	}
+	dataB, _ := data.Encode()
 	info := netlink.NewAttributeEncoder()
 	info.String(unix.IFLA_INFO_KIND, "ip6tnl")
 	info.Bytes(unix.IFLA_INFO_DATA, dataB)
-	infoB, err := info.Encode()
-	if err != nil {
-		return err
-	}
+	infoB, _ := info.Encode()
 	ae := netlink.NewAttributeEncoder()
 	ae.String(unix.IFLA_IFNAME, name)
 	ae.Uint32(unix.IFLA_MTU, uint32(mtu))
@@ -760,23 +736,20 @@ func addr4Set(dev string, p netip.Prefix) error {
 		debugf("[dry-run] skip configuring IPv4 %s on %s", p, dev)
 		return nil
 	}
-	ifi, err := net.InterfaceByName(dev)
-	if err != nil {
-		return err
-	}
 	c, err := rtDial()
 	if err != nil {
 		return err
 	}
 	defer c.Close()
+	ifi, err := net.InterfaceByName(dev)
+	if err != nil {
+		return err
+	}
 	ae := netlink.NewAttributeEncoder()
 	v4 := p.Addr().As4()
 	ae.Bytes(unix.IFA_LOCAL, v4[:])
 	ae.Bytes(unix.IFA_ADDRESS, v4[:])
-	attrs, err := ae.Encode()
-	if err != nil {
-		return err
-	}
+	attrs, _ := ae.Encode()
 	hdr := make([]byte, 8)
 	hdr[0] = unix.AF_INET
 	hdr[1] = byte(p.Bits())

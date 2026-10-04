@@ -137,3 +137,36 @@ func TestMAPEFromOption94(t *testing.T) {
 		t.Fatal("without a BR address there is no tunnel remote endpoint")
 	}
 }
+
+// Edge cases of the rule table and of option 94: a provider prefix no rule covers, port sets
+// that do not fit or have no A field, and rules that cannot map the delegation.
+func TestMAPEEdges(t *testing.T) {
+	if r, ok := calcMAPE(netip.MustParsePrefix("240b:ffff:ff00::/56")); ok {
+		t.Fatalf("no rule covers this JPNE prefix: %+v", r)
+	}
+	if s := portSpans(10, 8, 0); s != nil {
+		t.Fatalf("offset and PSID length over 16 bits: %v", s)
+	}
+	if s := portSpans(0, 4, 3); len(s) != 1 || s[0] != (portSpan{0x3000, 0x3fff}) {
+		t.Fatalf("without an A field the PSID owns one block: %v", s)
+	}
+
+	br := []netip.Addr{netip.MustParseAddr("2001:db8:ffff::1")}
+	pd := netip.MustParsePrefix("2001:db8:0:5600::/56")
+	tooLong := uint8(17)
+	psid := uint16(5)
+	for name, r := range map[string]S46Rule{
+		"delegation shorter than the EA bits": {EALen: 32, IPv6Prefix: netip.MustParsePrefix("2001:db8::/40"), IPv4Prefix: netip.MustParsePrefix("192.0.2.0/24")},
+		"PSID length over 16":                 {EALen: 16, IPv6Prefix: netip.MustParsePrefix("2001:db8::/40"), IPv4Prefix: netip.MustParsePrefix("192.0.2.0/24"), PSIDLen: &tooLong},
+	} {
+		if m, ok := mapeFromS46(&S46Cont{BR: br, Rules: []S46Rule{r}}, pd); ok {
+			t.Errorf("%s: mapped to %+v", name, m)
+		}
+	}
+	// No EA bits: the whole IPv4 address and the PSID come from the rule.
+	r := S46Rule{IPv6Prefix: netip.MustParsePrefix("2001:db8::/32"), IPv4Prefix: netip.MustParsePrefix("192.0.2.9/32"), PSID: &psid}
+	m, ok := mapeFromS46(&S46Cont{BR: br, Rules: []S46Rule{r}}, pd)
+	if !ok || m.IPv4 != netip.MustParseAddr("192.0.2.9") || m.PSID != 5 {
+		t.Fatalf("%+v", m)
+	}
+}

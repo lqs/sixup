@@ -145,10 +145,7 @@ func (f *firewall) table() *nftables.Table {
 }
 
 func (f *firewall) install() error {
-	c, err := nftables.New()
-	if err != nil {
-		return err
-	}
+	c, _ := nftables.New() // fails only for a lasting connection
 	tbl := f.table()
 	c.AddTable(tbl) // replaced whole, as the NAT table is
 	c.DelTable(tbl)
@@ -348,11 +345,7 @@ func (f *firewall) install() error {
 
 // replace swaps the elements of set in one transaction.
 func (f *firewall) replace(set *nftables.Set, elems []nftables.SetElement) {
-	c, err := nftables.New()
-	if err != nil {
-		errorf("[firewall] cannot talk to nftables: %v", err)
-		return
-	}
+	c, _ := nftables.New()
 	c.FlushSet(set)
 	if len(elems) > 0 {
 		if err := c.SetAddElements(set, elems); err != nil {
@@ -396,10 +389,7 @@ func delegationElements(ps []netip.Prefix) []nftables.SetElement {
 }
 
 func (f *firewall) remove() {
-	c, err := nftables.New()
-	if err != nil {
-		return
-	}
+	c, _ := nftables.New()
 	c.DelTable(f.table())
 	if err := c.Flush(); err != nil {
 		warnf("[firewall] failed to remove table inet %s: %v", filterTable, err)

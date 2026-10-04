@@ -19,14 +19,18 @@ jobs:
           ./build.sh ci
           test "$(stat -c %s dist/sixup-ci-linux-x86_64)" -le 6291456
 
-  nftables:
-    # The unit tests cover what the rules should be; this covers the kernel accepting them.
+  integration:
+    # The unit tests cover the logic; these cover the kernel accepting it. Coverage counts both.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with: { go-version-file: go.mod }
-      - run: sudo -E env "PATH=$PATH" go test -tags integration -run 'TestNAT|TestRoute|TestMSS|TestAddress|TestJool|TestPCP|TestFirewall|TestAFTR|TestDHCPv6|TestRAServer|TestBringUp' ./...
+      - run: sudo -E env "PATH=$PATH" go test -tags integration -coverprofile=coverage.out ./...
+      - uses: codecov/codecov-action@v7
+        with:
+          files: coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
 
   lint:
     runs-on: ubuntu-latest
@@ -57,7 +61,7 @@ jobs:
   # time in their version, so package managers see each build as newer.
   dev:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, nftables, lint, image]
+    needs: [test, integration, lint, image]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -257,3 +257,150 @@ func TestRAClientReportsUpstreamULA(t *testing.T) {
 		t.Fatalf("got %v, want %v", s.UpstreamULA, want)
 	}
 }
+
+// One router's RAs over time: the first wakes the DHCPv6 client, a higher preference moves the
+// default route, an RIO with lifetime 0 withdraws its route, an MTU above the link is ignored, a new
+// prefix set makes the DHCPv6 client reconfirm, and lifetime 0 ends the router's default route.
+func TestRAClientHandleSequence(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	defer func() { dryRun = old }()
+	st := newStore("ra", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	ch := st.Subscribe()
+	recv(t, ch)
+	stable, _ := parseIIDPolicy("stable")
+	dhcp := &dhcpClient{start: make(chan raFlags, 1), reconfirm: make(chan string, 1)}
+	c := &raClient{ifname: "wan0", ifi: &net.Interface{Index: 2, Name: "wan0", MTU: 1500}, store: st, dhcp: dhcp, slaac: true, iid: stable, layout: "wan", routers: map[netip.Addr]*routerInfo{}}
+	a := netip.MustParseAddr("fe80::1")
+	rt := netip.MustParsePrefix("2001:db8:aa::/48")
+	c.handle(&ndp.RouterAdvertisement{
+		ManagedConfiguration: true, RouterLifetime: 30 * time.Minute, CurrentHopLimit: 64, ReachableTime: 30 * time.Second, RetransmitTimer: time.Second,
+		Options: []ndp.Option{
+			pio("2001:db8:0:1::/64", time.Hour, time.Hour, true, true),
+			pio("2001:db8:0:3::/64", 2*time.Hour, time.Hour, true, true), // preferred above valid: ignored
+			pio("2001:db8:0:9::/64", 0, 0, true, true),
+			&ndp.RouteInformation{PrefixLength: 48, Preference: ndp.Medium, RouteLifetime: time.Hour, Prefix: rt.Addr()},
+			ndp.NewMTU(1400),
+		},
+	}, a)
+	if f := <-dhcp.start; !f.managed || f.other {
+		t.Fatalf("the first RA starts DHCPv6 with its flags: %+v", f)
+	}
+	r := c.routers[a]
+	if _, ok := r.routes[rt]; !ok || r.mtu != 1400 || r.metric != routerMetric(ndp.Medium) || len(r.prefixes) != 1 {
+		t.Fatalf("first RA: %+v", r)
+	}
+	c.publish()
+	recv(t, ch)
+
+	c.handle(&ndp.RouterAdvertisement{RouterLifetime: 30 * time.Minute, RouterSelectionPreference: ndp.High, Options: []ndp.Option{
+		pio("2001:db8:0:2::/64", time.Hour, time.Hour, true, true),
+		&ndp.RouteInformation{PrefixLength: 48, Preference: ndp.Medium, RouteLifetime: 0, Prefix: rt.Addr()},
+		ndp.NewMTU(9000),
+	}}, a)
+	if _, ok := r.routes[rt]; ok || r.mtu != 1400 || r.metric != routerMetric(ndp.High) {
+		t.Fatalf("second RA: %+v", r)
+	}
+	c.publish()
+	recv(t, ch)
+	select {
+	case <-dhcp.reconfirm:
+	default:
+		t.Fatal("a changed prefix set must make the DHCPv6 client reconfirm")
+	}
+
+	c.handle(&ndp.RouterAdvertisement{}, a)
+	if !r.lifetime.IsZero() || r.metric != 0 || r.prefixes != nil {
+		t.Fatalf("lifetime 0: %+v", r)
+	}
+}
+
+// publish merges what all routers say: a prefix two routers advertise counts once, a router whose
+// lifetime ran out keeps its prefixes deprecated, and a gone one with none left is forgotten.
+func TestRAClientPublishMergesRouters(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	defer func() { dryRun = old }()
+	st := newStore("ra", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	ch := st.Subscribe()
+	recv(t, ch)
+	now := time.Now()
+	p := func(s string) []Prefix {
+		return []Prefix{{Prefix: netip.MustParsePrefix(s), Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: sourceRA}}
+	}
+	a, b, d, e := netip.MustParseAddr("fe80::a"), netip.MustParseAddr("fe80::b"), netip.MustParseAddr("fe80::d"), netip.MustParseAddr("fe80::e")
+	c := &raClient{ifname: "wan0", ifi: &net.Interface{Index: 2, Name: "wan0", MTU: 1500}, store: st, routers: map[netip.Addr]*routerInfo{
+		a: {lifetime: now.Add(time.Hour), pref: ndp.Medium, prefixes: p("2001:db8:0:1::/64")},
+		b: {lifetime: now.Add(time.Hour), pref: ndp.Low, prefixes: p("2001:db8:0:1::/64")},
+		d: {lifetime: now.Add(-time.Second), metric: 1024, prefixes: p("2001:db8:0:2::/64")},
+		e: {gone: true},
+	}}
+	c.publish()
+	if _, ok := c.routers[e]; ok {
+		t.Fatal("a gone router without prefixes is forgotten")
+	}
+	if r := c.routers[d]; !r.gone || r.metric != 0 || r.prefixes[0].Preferred.After(time.Now()) {
+		t.Fatalf("timed out router: %+v", r)
+	}
+	if s := recv(t, ch); len(s.WAN) != 2 || s.NoWANRouter {
+		t.Fatalf("merged: %+v", s.WAN)
+	}
+}
+
+// The next wake-up is the earliest router lifetime, valid or preferred end, but never under a second.
+func TestRAClientNextExpiry(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		r    routerInfo
+		want time.Duration
+	}{
+		{routerInfo{lifetime: now.Add(3 * time.Second), prefixes: []Prefix{{Preferred: now.Add(5 * time.Second), Valid: now.Add(20 * time.Second)}}}, 3100 * time.Millisecond},
+		{routerInfo{prefixes: []Prefix{{Preferred: now.Add(5 * time.Second), Valid: now.Add(20 * time.Second)}}}, 5100 * time.Millisecond},
+		{routerInfo{prefixes: []Prefix{{Preferred: now.Add(-time.Second), Valid: now.Add(10 * time.Millisecond)}}}, 1100 * time.Millisecond},
+	} {
+		c := &raClient{routers: map[netip.Addr]*routerInfo{netip.MustParseAddr("fe80::1"): &tc.r}}
+		if got := c.nextExpiry(); got > tc.want || got < tc.want-200*time.Millisecond {
+			t.Errorf("%+v: got %v, want about %v", tc.r, got, tc.want)
+		}
+	}
+}
+
+func TestRAClientHasRouter(t *testing.T) {
+	c := &raClient{routers: map[netip.Addr]*routerInfo{netip.MustParseAddr("fe80::1"): {gone: true}}}
+	if c.hasRouter() {
+		t.Fatal("a gone router does not count")
+	}
+	c.routers[netip.MustParseAddr("fe80::2")] = &routerInfo{}
+	if !c.hasRouter() {
+		t.Fatal("an advertising router counts")
+	}
+}
+
+// Only a point-to-point link takes a default route without a gateway, and only when it is set.
+func TestPPPDefaultRoute(t *testing.T) {
+	old := dryRun
+	defer func() { dryRun = old }()
+	ppp := &net.Interface{Index: 1 << 30, Name: "ppp-test", Flags: net.FlagPointToPoint}
+	dryRun = true
+	if pppDefaultRoute(nil) || pppDefaultRoute(&net.Interface{Index: 2, Name: "eth0"}) {
+		t.Fatal("no interface, or not point-to-point")
+	}
+	if !pppDefaultRoute(ppp) {
+		t.Fatal("point-to-point")
+	}
+	dryRun = false
+	if pppDefaultRoute(ppp) {
+		t.Fatal("the route cannot be set on an interface that does not exist")
+	}
+}
+
+// A known prefix keeps its preferred lifetime within its valid one.
+func TestMergePIOsClampsPreferred(t *testing.T) {
+	now := time.Now()
+	x := netip.MustParsePrefix("2001:db8:1::/64")
+	have := []Prefix{{Prefix: x, Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour)}}
+	got := mergePIOs(have, raInfo{prefixes: []Prefix{{Prefix: x, Preferred: now.Add(3 * time.Hour), Valid: now.Add(30 * time.Minute)}}}, now)
+	if !got[0].Valid.Equal(now.Add(time.Hour)) || !got[0].Preferred.Equal(got[0].Valid) {
+		t.Fatalf("got %+v", got[0])
+	}
+}

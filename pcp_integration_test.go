@@ -4,13 +4,148 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"testing"
 	"time"
 
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 )
+
+// pcpTestLinks enters a namespace of its own with lo up and a veth pair whose end pcp-lan0 is up
+// and pcp-down0 down, and returns the namespace.
+func pcpTestLinks(t *testing.T) int {
+	t.Helper()
+	enterNetNS(t)
+	loUp(t)
+	ns, err := unix.Open("/proc/thread-self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { unix.Close(ns) })
+	if err := vethAdd("pcp-lan0", "pcp-down0", ns); err != nil {
+		t.Fatal(err)
+	}
+	linkUp(t, mustIface(t, "pcp-lan0"))
+	return ns
+}
+
+// pcpTestConns opens the sockets the announcements go out on, in the namespace of the caller.
+func pcpTestConns(t *testing.T) (*ipv4.PacketConn, *ipv6.PacketConn) {
+	t.Helper()
+	c4, err := net.ListenPacket("udp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c4.Close() })
+	c6, err := net.ListenPacket("udp6", "[::]:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { c6.Close() })
+	return ipv4.NewPacketConn(c4), ipv6.NewPacketConn(c6)
+}
+
+// pcpSendFromPort0 sends payload to dst over UDP from source port 0, which no reply can go to.
+func pcpSendFromPort0(t *testing.T, dst *net.UDPAddr, payload []byte) {
+	t.Helper()
+	network, laddr := "ip4:udp", "0.0.0.0" // an IPv4 checksum of 0 means none
+	if dst.IP.To4() == nil {
+		network, laddr = "ip6:udp", "::"
+	}
+	c, err := net.ListenPacket(network, laddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if dst.IP.To4() == nil {
+		// IPv6 requires the checksum, which the kernel fills in at offset 6
+		raw, err := c.(*net.IPConn).SyscallConn()
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw.Control(func(fd uintptr) { err = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_CHECKSUM, 6) })
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	b := make([]byte, 8, 8+len(payload))
+	binary.BigEndian.PutUint16(b[2:], uint16(dst.Port))
+	binary.BigEndian.PutUint16(b[4:], uint16(8+len(payload)))
+	if _, err := c.WriteTo(append(b, payload...), &net.IPAddr{IP: dst.IP, Zone: dst.Zone}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// pcpCancelAfter cancels the context it returns after d.
+func pcpCancelAfter(d time.Duration) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(d, cancel)
+	return ctx
+}
+
+// The server gives up when it can listen on neither family, ignores requests from interfaces that
+// are not LANs, and follows the tunnel's IPv4.
+func TestPCPServerRunAgainstKernel(t *testing.T) {
+	ns := pcpTestLinks(t)
+	h6, err := net.ListenPacket("udp6", "[::]:5351")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h4, err := net.ListenPacket("udp4", "0.0.0.0:5351")
+	if err != nil {
+		t.Fatal(err)
+	}
+	(&pcpServer{}).run(t.Context(), nil)
+	h6.Close()
+	h4.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := make(chan Snapshot)
+	done := make(chan struct{})
+	p := &pcpServer{lans: []string{"pcp-lan0"}, nat: &natManager{mapIn: make(chan []portMapping, 1)}}
+	go func() {
+		defer close(done)
+		inNetns(ns, func() error { p.run(ctx, ch); return nil })
+	}()
+	time.Sleep(200 * time.Millisecond) // let it bind
+
+	for network, ip := range map[string]net.IP{"udp6": net.IPv6loopback, "udp4": net.IPv4(127, 0, 0, 1)} {
+		dst := &net.UDPAddr{IP: ip, Port: pcpServerPort}
+		c, err := net.DialUDP(network, nil, dst)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if _, err := c.Write([]byte{0, natpmpOpAddress}); err != nil {
+			t.Fatal(err)
+		}
+		c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+		if n, err := c.Read(make([]byte, 64)); err == nil {
+			t.Fatalf("%s: a request over lo, not a LAN, is answered with %d bytes", dst, n)
+		}
+	}
+
+	tunnel := Snapshot{Tunnel: &TunnelParams{Local: netip.MustParseAddr("2001:db8::2"), Remote: netip.MustParseAddr("2001:db8::1"), IPv4: netip.MustParseAddr("203.0.113.9")}}
+	ch <- tunnel     // gained
+	ch <- Snapshot{} // lost
+	ch <- Snapshot{} // unchanged
+	cancel()
+	<-done
+}
+
+// The PCP announcement skips a missing LAN, goes on when sending on one fails, and repeats after a
+// growing gap until stopped.
+func TestPCPAnnounceAgainstKernel(t *testing.T) {
+	pcpTestLinks(t)
+	c4, c6 := pcpTestConns(t)
+	p := &pcpServer{lans: []string{"nope0", "pcp-down0", "lo"}, c4: c4, c6: c6, start: time.Now()}
+	p.announce(pcpCancelAfter(700 * time.Millisecond))
+}
 
 // The server answers on the interface a request came in on and from the address it was sent to,
 // and ignores interfaces that are not LANs.
@@ -27,6 +162,10 @@ func TestPCPServerAgainstKernel(t *testing.T) {
 	defer unix.Close(ns)
 	go inNetns(ns, func() error { (&pcpServer{lans: []string{"lo"}}).run(ctx, nil); return nil })
 	time.Sleep(200 * time.Millisecond) // let it bind
+
+	// A request from port 0 cannot be answered; the replies below show it was dealt with first
+	pcpSendFromPort0(t, &net.UDPAddr{IP: net.IPv6loopback, Port: pcpServerPort}, []byte{0, natpmpOpAddress})
+	pcpSendFromPort0(t, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: pcpServerPort}, []byte{0, natpmpOpAddress})
 
 	c, err := net.DialUDP("udp6", nil, &net.UDPAddr{IP: net.IPv6loopback, Port: pcpServerPort})
 	if err != nil {

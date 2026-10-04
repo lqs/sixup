@@ -210,13 +210,10 @@ func linkLocalOf(ifi *net.Interface) (netip.Addr, error) {
 		return netip.Addr{}, err
 	}
 	for _, a := range addrs {
-		ipn, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip, ok := netip.AddrFromSlice(ipn.IP)
-		if ok && ip.Is6() && ip.IsLinkLocalUnicast() {
-			return ip.Unmap(), nil
+		if ipn, ok := a.(*net.IPNet); ok {
+			if ip, ok := netip.AddrFromSlice(ipn.IP); ok && ip.Is6() && ip.IsLinkLocalUnicast() {
+				return ip.Unmap(), nil
+			}
 		}
 	}
 	return netip.Addr{}, errors.New("interface has no link-local address")
@@ -234,9 +231,6 @@ func (c *dhcpClient) reader(conn *net.UDPConn) {
 				}
 			}
 			return
-		}
-		if n > 1500 {
-			continue
 		}
 		msg, err := dhcpv6.MessageFromBytes(buf[:n])
 		if err != nil {
@@ -389,6 +383,14 @@ func (c *dhcpClient) rejoin(ctx context.Context, l *lease) *lease {
 		cancel()
 		if !c.linkUp || ctx.Err() != nil {
 			return nil
+		}
+		// the link going down flushed the addresses; they are still ours until a Reply says otherwise
+		for _, a := range l.addrs {
+			if life := l.addrLife[a]; time.Until(life[1]) > 0 {
+				if err := addrSet(c.ifi.Index, a, 128, time.Until(life[0]), time.Until(life[1]), false, 0); err != nil {
+					errorf("[dhcpv6-client] restoring WAN address %s failed: %v", a, err)
+				}
+			}
 		}
 		mt := dhcpv6.MessageTypeRebind
 		if len(l.prefixes) == 0 {
@@ -634,9 +636,6 @@ func (c *dhcpClient) verifyReconfigure(msg *dhcpv6.Message) bool {
 	// Recompute with the HMAC field zeroed
 	raw := msg.ToBytes()
 	idx := findAuthValue(raw)
-	if idx < 0 {
-		return false
-	}
 	for i := range 16 {
 		raw[idx+i] = 0
 	}
@@ -758,9 +757,6 @@ func (c *dhcpClient) solicit(ctx context.Context) (*dhcpv6.Message, error) {
 	}
 	if refused > 0 {
 		return nil, errNoPrefix
-	}
-	if err == nil {
-		err = errTimeout
 	}
 	return nil, err
 }
@@ -1052,6 +1048,9 @@ func nextRT(prev, mrt time.Duration) time.Duration {
 type lease struct {
 	prefixes []Prefix
 	addrs    []netip.Addr
+	// When each address stops being preferred and valid, to put it back on the WAN after the
+	// link went down: the kernel flushes addresses with a lifetime then
+	addrLife map[netip.Addr][2]time.Time
 	t1, t2   time.Time
 	valid    time.Time
 }
@@ -1127,7 +1126,7 @@ func parsePDExclude(pd netip.Prefix, b []byte) (netip.Prefix, bool) {
 // Returns nil when there is no usable binding and a new SOLICIT is needed.
 func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 	now := time.Now()
-	l := &lease{}
+	l := &lease{addrLife: map[netip.Addr][2]time.Time{}}
 	upd := c.parseCommon(reply)
 	var t1, t2, minPref, maxValid time.Duration
 	pickT := func(cur, v time.Duration) time.Duration {
@@ -1198,6 +1197,7 @@ func (c *dhcpClient) apply(reply *dhcpv6.Message) *lease {
 			}
 			addr = addr.Unmap()
 			l.addrs = append(l.addrs, addr)
+			l.addrLife[addr] = [2]time.Time{now.Add(a.PreferredLifetime), now.Add(a.ValidLifetime)}
 			minPref = pickT(minPref, a.PreferredLifetime)
 			if a.ValidLifetime > maxValid {
 				maxValid = a.ValidLifetime
@@ -1279,7 +1279,7 @@ func (c *dhcpClient) bind(ctx context.Context, reply *dhcpv6.Message) *lease {
 
 // awaitDAD polls the WAN interface until none of addrs is tentative, and returns those that failed.
 // The kernel marks a failed address only when it has no lifetime; one with a lifetime, as these
-// have, it deletes, so an address gone from the interface failed too. It gives up after 10 s,
+// have, it deletes, so an address gone from an interface still up failed too. It gives up after 10 s,
 // enough for DupAddrDetectTransmits well above the default of 1.
 func (c *dhcpClient) awaitDAD(ctx context.Context, addrs []netip.Addr) []netip.Addr {
 	t := time.NewTicker(200 * time.Millisecond)
@@ -1301,6 +1301,13 @@ func (c *dhcpClient) awaitDAD(ctx context.Context, addrs []netip.Addr) []netip.A
 		pending := false
 		for _, a := range addrs {
 			i := slices.IndexFunc(list, func(ia ifAddr) bool { return ia.Addr == a })
+			if i < 0 {
+				// gone because the link went down and the kernel flushed its addresses: no DAD
+				// failed, and what follows the link coming back decides on the binding
+				if ifi, err := net.InterfaceByIndex(c.ifi.Index); err != nil || ifi.Flags&net.FlagUp == 0 {
+					return nil
+				}
+			}
 			switch {
 			case i < 0 || list[i].Flags&ifaFDadFailed != 0:
 				failed = append(failed, a)

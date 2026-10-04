@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"net"
 	"net/netip"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -322,5 +323,20 @@ func TestDelegationCarriesTheReconfigureKey(t *testing.T) {
 	reply = st.handle(cliMsg(dhcpv6.MessageTypeRequest, dhcpv6.OptServerID(srvDUID), iapd(hint(56)), accept), peerLL)
 	if reply.Options.GetOne(dhcpv6.OptionAuth) == nil {
 		t.Fatal("a stateless server gives a delegating router its key too")
+	}
+}
+
+func TestPDLeaseFileErrors(t *testing.T) {
+	dir := t.TempDir()
+	corrupt := filepath.Join(dir, "corrupt.json")
+	os.WriteFile(corrupt, []byte("["), 0o600)
+	if p := newPDPool(60, corrupt, nil); len(p.leases) != 0 {
+		t.Fatalf("a corrupt file is ignored: %v", p.leases)
+	}
+	p := newPDPool(60, filepath.Join(dir, "no-such-dir", "pd.json"), nil)
+	p.leases["a"] = &PDLease{Prefix: netip.MustParsePrefix("2001:db8:100:10::/60"), Expires: time.Now().Add(time.Hour)}
+	p.save()
+	if _, err := os.Stat(p.file); err == nil {
+		t.Fatal("a file in a missing directory cannot be written")
 	}
 }

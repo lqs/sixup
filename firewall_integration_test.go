@@ -3,11 +3,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"log"
 	"net"
 	"net/netip"
 	"os"
+	"runtime"
+	"slices"
 	"testing"
 	"time"
 
@@ -586,5 +590,161 @@ func TestFirewallICMPv6AgainstKernel(t *testing.T) {
 	if !passes(t, lanDev, wanDev, syn6(netip.AddrPortFrom(host, 7100), netip.AddrPortFrom(far, 7200))) ||
 		!passes(t, wanDev, lanDev, syn6(netip.AddrPortFrom(far, 7200), netip.AddrPortFrom(host, 7100))) {
 		t.Error("the SYN of a simultaneous open is let through")
+	}
+}
+
+// firewallSetStarts lists the addresses that begin the elements of a set in the filter table, and
+// counts its elements.
+func firewallSetStarts(t *testing.T, name string) (starts []netip.Addr, n int) {
+	t.Helper()
+	c, err := nftables.New()
+	if err != nil {
+		t.Error(err)
+		return nil, 0
+	}
+	elems, err := c.GetSetElements(&nftables.Set{Table: (&firewall{}).table(), Name: name})
+	if err != nil {
+		t.Errorf("reading the set %s: %v", name, err)
+		return nil, 0
+	}
+	for _, e := range elems {
+		if a, ok := netip.AddrFromSlice(e.Key); ok && len(e.Key) == 16 && !e.IntervalEnd {
+			starts = append(starts, a)
+		}
+	}
+	return starts, len(elems)
+}
+
+// run installs the table, follows the snapshots, the pinholes and the delegations into the sets,
+// and takes the table away when it is stopped.
+func TestFirewallRunAgainstKernel(t *testing.T) {
+	enterNetNS(t)
+	ns, err := unix.Open("/proc/thread-self/ns/net", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(ns)
+	shared, pd := netip.MustParsePrefix("2001:db8:1::/64"), netip.MustParsePrefix("2001:db8:2::/64")
+	stale, ula := netip.MustParsePrefix("2001:db8:3::/64"), netip.MustParsePrefix("fd00:1::/64")
+	upULA, deleg := netip.MustParsePrefix("fd01::/48"), netip.MustParsePrefix("2001:db8:9::/48")
+	snap := Snapshot{
+		WAN: []Prefix{{Prefix: shared, Source: sourceRA}},
+		LAN: map[string][]Prefix{"lan-run0": {
+			{Prefix: shared, Source: sourceRA},
+			{Prefix: pd, Source: sourcePD},
+			{Prefix: stale, Source: sourcePD, Stale: true},
+			{Prefix: ula, Source: sourceULA},
+		}},
+		UpstreamULA: []netip.Prefix{upULA},
+	}
+	f := &firewall{wan: "wan-run0", lans: []string{"lan-run0"}, inbound: true, source: true,
+		holeIn: make(chan []portMapping), delegIn: make(chan []netip.Prefix)}
+	ch := make(chan Snapshot)
+	ctx, cancel := context.WithCancel(t.Context())
+	sets := map[string][]netip.Addr{}
+	holes := 0
+	go func() {
+		defer cancel()
+		ch <- snap
+		f.holeIn <- []portMapping{{proto: unix.IPPROTO_UDP, internal: netip.MustParseAddrPort("[2001:db8:1::10]:5000")}}
+		f.delegIn <- []netip.Prefix{deleg}
+		ch <- snap // unchanged, and the delegation above is in by the time run takes it
+		if err := inNetns(ns, func() error {
+			for _, name := range []string{"ours", "wan_link", "upstream_ula", "delegated"} {
+				sets[name], _ = firewallSetStarts(t, name)
+			}
+			_, holes = firewallSetStarts(t, "pinholes")
+			return nil
+		}); err != nil {
+			t.Error(err)
+		}
+	}()
+	f.run(ctx, ch)
+
+	for name, want := range map[string][]netip.Prefix{
+		"ours":         {shared, pd, deleg},
+		"wan_link":     {shared},
+		"upstream_ula": {upULA},
+		"delegated":    {deleg},
+	} {
+		got := sets[name]
+		if len(got) != len(want) {
+			t.Errorf("the set %s should hold %v, got %v", name, want, got)
+			continue
+		}
+		for _, p := range want {
+			if !slices.Contains(got, p.Addr()) {
+				t.Errorf("the set %s should hold %v, got %v", name, want, got)
+			}
+		}
+	}
+	if holes != 1 {
+		t.Errorf("the pinhole should be in its set, got %d elements", holes)
+	}
+	c, err := nftables.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := c.ListTables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tbl := range tables {
+		if tbl.Name == filterTable {
+			t.Fatal("stopping must remove the table")
+		}
+	}
+}
+
+// Without CAP_NET_ADMIN the table cannot go in, which run reports and gives up on.
+func TestFirewallRunWithoutNetAdmin(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("dropping a capability needs one to begin with")
+	}
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel() // should the table go in after all, run returns at once and removes it
+	done := make(chan error)
+	go func() {
+		// The thread keeps its reduced capabilities, so it is never handed back to the runtime
+		runtime.LockOSThread()
+		hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+		var data [2]unix.CapUserData
+		if err := unix.Capget(&hdr, &data[0]); err != nil {
+			done <- err
+			return
+		}
+		data[0].Effective &^= 1 << unix.CAP_NET_ADMIN
+		if err := unix.Capset(&hdr, &data[0]); err != nil {
+			done <- err
+			return
+		}
+		(&firewall{wan: "wan-run0", lans: []string{"lan-run0"}}).run(ctx, nil)
+		done <- nil
+	}()
+	if err := <-done; err != nil {
+		t.Fatalf("dropping CAP_NET_ADMIN: %v", err)
+	}
+	if !bytes.Contains(logged.Bytes(), []byte("cannot install table inet "+filterTable)) {
+		t.Fatalf("the failure should be reported:\n%s", logged.String())
+	}
+}
+
+// A set or a table the kernel does not have is reported, not fatal: the next update tries again.
+func TestFirewallReportsNftablesFailures(t *testing.T) {
+	enterNetNS(t)
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
+	f := &firewall{}
+	f.replace(&nftables.Set{Table: f.table(), Name: "ours", KeyType: nftables.TypeIP6Addr, Interval: true}, nil)
+	if !bytes.Contains(logged.Bytes(), []byte("failed to update the set ours")) {
+		t.Fatalf("a set outside any table should be reported:\n%s", logged.String())
+	}
+	f.remove()
+	if !bytes.Contains(logged.Bytes(), []byte("failed to remove table inet "+filterTable)) {
+		t.Fatalf("a table that is not there should be reported:\n%s", logged.String())
 	}
 }

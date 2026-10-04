@@ -12,6 +12,7 @@ type frameKind uint8
 
 const (
 	kindTunnel frameKind = 1 << iota // IPv6 next-header 4, IPv4-in-IPv6
+	kindNS                           // ICMPv6 Neighbor Solicitation, for the NDP proxy
 )
 
 // packetHub is the single capture socket per interface, shared so listeners do not each pay for a raw socket.
@@ -65,7 +66,7 @@ func (h *packetHub) reconcile() {
 		if h.stop != nil {
 			h.stop()
 			h.stop = nil
-			infof("[tunnel-capture %s] no listeners, stopping capture", h.ifname)
+			infof("[packet-capture %s] no listeners, stopping capture", h.ifname)
 		}
 		return
 	}
@@ -91,14 +92,14 @@ func (h *packetHub) open(gen int) {
 			h.stop = stop
 			h.lastErr = ""
 			go h.dispatch(gen, frames)
-			infof("[tunnel-capture %s] capture started (kinds %d)", h.ifname, h.kinds)
+			infof("[packet-capture %s] capture started (kinds %d)", h.ifname, h.kinds)
 			return
 		}
 		err = err2
 	}
 	if msg := err.Error(); msg != h.lastErr {
 		h.lastErr = msg
-		warnf("[tunnel-capture %s] capture open failed: %v, retrying every 2s (same error not repeated)", h.ifname, err)
+		warnf("[packet-capture %s] capture open failed: %v, retrying every 2s (same error not repeated)", h.ifname, err)
 	}
 	time.AfterFunc(2*time.Second, func() {
 		h.mu.Lock()
@@ -120,7 +121,7 @@ func (h *packetHub) onReaderExit(gen int) {
 	if len(h.subs) == 0 || h.ctx.Err() != nil {
 		return
 	}
-	warnf("[tunnel-capture %s] socket lost, reopening once the interface returns", h.ifname)
+	warnf("[packet-capture %s] socket lost, reopening once the interface returns", h.ifname)
 	h.gen++
 	g := h.gen
 	time.AfterFunc(2*time.Second, func() {
@@ -159,23 +160,35 @@ func (h *packetHub) dispatch(gen int, frames <-chan []byte) {
 
 // classifyFrame mirrors captureFilter for userspace dispatch and covers the case where BPF attach failed.
 func classifyFrame(f []byte) frameKind {
-	if len(f) < 14 {
+	off := ipv6Offset(f)
+	switch {
+	case off < 0:
 		return 0
+	case f[off+6] == 4:
+		return kindTunnel
+	case f[off+6] == 58 && len(f) > off+40 && f[off+40] == 135:
+		return kindNS
+	}
+	return 0
+}
+
+// ipv6Offset returns where the IPv6 header of an Ethernet frame starts, past any VLAN tags, or -1
+// when the frame does not hold a whole IPv6 header.
+func ipv6Offset(f []byte) int {
+	if len(f) < 14 {
+		return -1
 	}
 	et := binary.BigEndian.Uint16(f[12:14])
 	off := 14
 	for et == 0x8100 || et == 0x88a8 {
 		if len(f) < off+4 {
-			return 0
+			return -1
 		}
 		et = binary.BigEndian.Uint16(f[off+2 : off+4])
 		off += 4
 	}
 	if et != 0x86dd || len(f) < off+40 {
-		return 0
+		return -1
 	}
-	if f[off+6] == 4 {
-		return kindTunnel
-	}
-	return 0
+	return off
 }

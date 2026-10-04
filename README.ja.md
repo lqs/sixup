@@ -5,6 +5,7 @@
 <a href="README.md" lang="en">English</a> | <a href="README.zh.md" lang="zh-Hans">简体中文</a> | <strong>日本語</strong>
 
 [![CI](https://github.com/lqs/sixup/actions/workflows/ci.yml/badge.svg)](https://github.com/lqs/sixup/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/lqs/sixup/graph/badge.svg)](https://codecov.io/gh/lqs/sixup)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 かつて Linux で IPv6 ルーティングを組むには、いくつものプログラムが必要でした。

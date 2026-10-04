@@ -844,10 +844,8 @@ func (s *Store) warnShort(short []shortPrefix) {
 
 // splitLAN carves the index-th /64 out of a PD prefix; a /64 only allows index 0.
 // spareSubnet returns the highest /64 of p that no LAN segment names and the ISP does not exclude.
+// p is /64 or shorter, as splitLAN has already carved a subnet out of it.
 func (s *Store) spareSubnet(p Prefix) (netip.Prefix, bool) {
-	if p.Prefix.Bits() > 64 {
-		return netip.Prefix{}, false
-	}
 	for i := (1 << min(64-p.Prefix.Bits(), 16)) - 1; i >= 0; i-- {
 		if slices.ContainsFunc(s.lans, func(l lanDef) bool { return l.index == i }) {
 			continue

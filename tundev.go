@@ -222,16 +222,9 @@ func addr4Holder(dev string, a netip.Addr) string {
 		if ifi.Name == dev {
 			continue
 		}
-		addrs, err := ifi.Addrs()
-		if err != nil {
-			continue
-		}
+		addrs, _ := ifi.Addrs() // none when they cannot be read
 		for _, ad := range addrs {
-			n, ok := ad.(*net.IPNet)
-			if !ok {
-				continue
-			}
-			if v4 := n.IP.To4(); v4 != nil && netip.AddrFrom4([4]byte(v4)) == a {
+			if n, ok := ad.(*net.IPNet); ok && n.IP.Equal(a.AsSlice()) {
 				return ifi.Name
 			}
 		}

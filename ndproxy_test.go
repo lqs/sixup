@@ -1,10 +1,15 @@
 package main
 
 import (
+	"context"
+	"encoding/binary"
 	"net"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/mdlayher/ndp"
 )
 
 func newTestProxy(layout shared64Layout) *ndProxy {
@@ -277,5 +282,213 @@ func TestProxyAutoMode(t *testing.T) {
 	n.setPrefixes(snap)
 	if n.autoOn || len(n.prefixes) != 0 {
 		t.Fatalf("point-to-point WAN: proxy should be off, scope %v", n.prefixes)
+	}
+}
+
+// With a delegation clear of the on-link /64 there is nothing to ask the ISP for, and auto mode
+// then proxies like forward mode.
+func TestProxyAutoModeWithClearDelegation(t *testing.T) {
+	p := netip.MustParsePrefix("2001:db8::/64")
+	snap := Snapshot{
+		WAN: []Prefix{{Prefix: p, Source: sourceRA}, {Prefix: netip.MustParsePrefix("2001:db8:100::/56"), Source: sourcePD}},
+		LAN: map[string][]Prefix{"lan0": {{Prefix: p, Source: sourceRA}}},
+	}
+	n := newTestProxy("wan")
+	n.mode, n.lanIf, n.prefixes = proxyAuto, "lan0", nil
+	n.setPrefixes(snap)
+	if !n.autoOn || n.effectiveMode() != proxyForward {
+		t.Fatalf("auto mode should be on and forward: %v %v", n.autoOn, n.effectiveMode())
+	}
+	host := netip.MustParseAddr("2001:db8::abcd")
+	n.mu.Lock()
+	n.onSolicit(sideWAN, host, netip.MustParseAddr("fe80::1"))
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if s := n.sessions[host]; s == nil || s.State != "probing" {
+		t.Fatalf("auto mode probes like forward mode: %+v", s)
+	}
+}
+
+// Excluded addresses are never proxied, and static ones always are.
+func TestProxyExcludeAndStatic(t *testing.T) {
+	n := newTestProxy("wan")
+	n.exclude = []netip.Prefix{netip.MustParsePrefix("2001:db8::ff00/120")}
+	n.static = []netip.Prefix{netip.MustParsePrefix("2001:db9::5/128")}
+	if n.covered(netip.MustParseAddr("2001:db8::ff01")) {
+		t.Fatal("excluded address proxied")
+	}
+	if !n.covered(netip.MustParseAddr("2001:db9::5")) {
+		t.Fatal("static address not proxied")
+	}
+}
+
+// A known neighbour on the other side is answered for, a known absent one is not, and a probe
+// already under way is not repeated within a second: the asker only joins the list, once.
+func TestProxyKnownSessionsAndDuplicateNS(t *testing.T) {
+	n := newTestProxy("wan")
+	valid, invalid, probing := netip.MustParseAddr("2001:db8::a"), netip.MustParseAddr("2001:db8::b"), netip.MustParseAddr("2001:db8::c")
+	up, up2 := netip.MustParseAddr("fe80::1"), netip.MustParseAddr("fe80::2")
+	now := time.Now()
+	n.sessions[valid] = &proxySession{State: "valid", Side: sideLAN, Expires: now.Add(time.Minute)}
+	n.sessions[invalid] = &proxySession{State: "invalid", Side: sideLAN, Expires: now.Add(time.Minute)}
+	for _, target := range []netip.Addr{valid, invalid, probing, probing, probing} {
+		n.mu.Lock()
+		n.onSolicit(sideWAN, target, up)
+	}
+	n.mu.Lock()
+	n.onSolicit(sideWAN, probing, up2)
+	n.mu.Lock()
+	n.onSolicit(sideWAN, probing, netip.Addr{}) // the router's own NS joins no list
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.pending[valid]) != 0 || len(n.pending[invalid]) != 0 || n.sessions[invalid].State != "invalid" {
+		t.Fatalf("known sessions start no probe: %+v", n.pending)
+	}
+	if got := n.pending[probing]; len(got) != 2 || got[0].addr != up || got[1].addr != up2 {
+		t.Fatalf("askers: %+v", got)
+	}
+}
+
+// A full table turns a new target away before any probe.
+func TestProxyFullTableRefusesProbe(t *testing.T) {
+	n := newTestProxy("wan")
+	now := time.Now()
+	base := netip.MustParseAddr("2001:db8::").As16()
+	for i := range maxProxySessions {
+		b := base
+		b[13], b[14], b[15] = byte(i>>16), byte(i>>8), byte(i)
+		n.sessions[netip.AddrFrom16(b)] = &proxySession{State: "valid", Side: sideLAN, Expires: now.Add(time.Minute)}
+	}
+	target := netip.MustParseAddr("2001:db8::1:0:0:1")
+	n.mu.Lock()
+	n.onSolicit(sideWAN, target, netip.MustParseAddr("fe80::1"))
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if _, ok := n.sessions[target]; ok || len(n.pending) != 0 {
+		t.Fatal("a full table must not take a new probe")
+	}
+}
+
+// An unsolicited NA from a LAN host is learned, its /128 route added once; one from the WAN side
+// for a target without a session is ignored.
+func TestProxyUnsolicitedNA(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	defer func() { dryRun = old }()
+	n := newTestProxy("wan")
+	host, far := netip.MustParseAddr("2001:db8::a"), netip.MustParseAddr("2001:db8::b")
+	n.mu.Lock()
+	n.onAdvert(sideLAN, host)
+	n.mu.Lock()
+	n.onAdvert(sideWAN, far)
+	n.mu.Lock()
+	n.learn(sideLAN, host, time.Now()) // the route is in place already
+	defer n.mu.Unlock()
+	if s := n.sessions[host]; s == nil || s.Side != sideLAN || n.kernelSet[host] != 3 {
+		t.Fatalf("LAN host: %+v %v", s, n.kernelSet)
+	}
+	if _, ok := n.sessions[far]; ok {
+		t.Fatal("a WAN NA without a session must be ignored")
+	}
+}
+
+// prefix mode answers an NS from the WAN for any address in scope, and nothing else.
+func TestProxyPrefixMode(t *testing.T) {
+	n := newTestProxy("wan")
+	n.mode = proxyPrefix
+	host := netip.MustParseAddr("2001:db8::a")
+	n.mu.Lock()
+	n.onSolicit(sideLAN, host, netip.MustParseAddr("2001:db8::b"))
+	n.mu.Lock()
+	n.onSolicit(sideWAN, host, netip.Addr{})
+	n.mu.Lock()
+	if len(n.sessions) != 0 { // the LAN sender is not learned outside forward mode
+		n.mu.Unlock()
+		t.Fatalf("neither the LAN side nor the router itself is answered: %+v", n.sessions)
+	}
+	n.onSolicit(sideWAN, host, netip.MustParseAddr("fe80::1"))
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if s := n.sessions[host]; s == nil || s.State != "valid" || s.Side != sideLAN {
+		t.Fatalf("prefix mode: %+v", s)
+	}
+}
+
+// static mode only installs kernel proxy entries for single addresses and waits.
+func TestProxyStaticMode(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	defer func() { dryRun = old }()
+	n := newTestProxy("wan")
+	n.mode = proxyStatic
+	n.static = []netip.Prefix{netip.MustParsePrefix("2001:db8::5/128"), netip.MustParsePrefix("2001:db8:1::/64")}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	n.serve(ctx, nil)
+}
+
+// The router's own addresses are collected from both sides, skipping a side not known yet.
+func TestProxyRefreshSelfAddrs(t *testing.T) {
+	lo, err := net.InterfaceByIndex(1)
+	if err != nil {
+		t.Skip(err)
+	}
+	n := newTestProxy("wan")
+	n.wanIfi, n.lanIfi = nil, lo
+	n.refreshSelfAddrs()
+	if !n.selfAddrs[netip.MustParseAddr("127.0.0.1")] {
+		t.Fatalf("loopback addresses: %v", n.selfAddrs)
+	}
+}
+
+// nsFrame builds an Ethernet frame carrying the ICMPv6 message m from src, with a correct checksum.
+func nsFrame(src netip.Addr, hop byte, m []byte) []byte {
+	f := make([]byte, 14+40, 14+40+len(m))
+	f[12], f[13] = 0x86, 0xdd
+	ip := f[14:]
+	ip[0], ip[6], ip[7] = 0x60, 58, hop
+	binary.BigEndian.PutUint16(ip[4:], uint16(len(m)))
+	s, d := src.As16(), netip.MustParseAddr("ff02::1:ff00:10").As16()
+	copy(ip[8:], s[:])
+	copy(ip[24:], d[:])
+	f = append(f, m...)
+	binary.BigEndian.PutUint16(f[14+42:], icmpv6Checksum(f[14+8:14+40], f[14+40:]))
+	return f
+}
+
+// A captured NS is taken only when it passes the checks the kernel makes: hop limit 255, a correct
+// checksum, code 0, a well-formed Neighbor Solicitation in an IPv6 packet holding all of it.
+func TestParseNS(t *testing.T) {
+	src, target := netip.MustParseAddr("fe80::1"), netip.MustParseAddr("2001:db8::10")
+	ns, _ := ndp.MarshalMessage(&ndp.NeighborSolicitation{TargetAddress: target})
+	na, _ := ndp.MarshalMessage(&ndp.NeighborAdvertisement{TargetAddress: target})
+	good := nsFrame(src, 255, ns)
+	tagged := append(append(append([]byte{}, good[:12]...), 0x81, 0x00, 0x00, 0x01), good[12:]...)
+	padded := append(slices.Clone(good), 0, 0, 0, 0) // an Ethernet trailer
+	for _, f := range [][]byte{good, tagged, padded} {
+		if from, got, ok := parseNS(f); !ok || from != src || got != target {
+			t.Fatalf("%x: %v %v %v", f, from, got, ok)
+		}
+	}
+
+	badSum := slices.Clone(good)
+	badSum[14+42]++
+	code := slices.Clone(ns)
+	code[1] = 1
+	udp := slices.Clone(good)
+	udp[14+6] = 17
+	for name, f := range map[string][]byte{
+		"hop limit 64":  nsFrame(src, 64, ns),
+		"checksum":      badSum,
+		"code 1":        nsFrame(src, 255, code),
+		"NA":            nsFrame(src, 255, na),
+		"odd length":    nsFrame(src, 255, append(slices.Clone(ns), 0)),
+		"truncated":     good[:len(good)-1],
+		"not ICMPv6":    udp,
+		"no IPv6 frame": good[:14+39],
+	} {
+		if _, _, ok := parseNS(f); ok {
+			t.Fatalf("%s: taken", name)
+		}
 	}
 }

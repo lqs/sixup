@@ -461,3 +461,61 @@ func TestNATPMP(t *testing.T) {
 		t.Fatalf("over IPv6: % x", resp)
 	}
 }
+
+// An ANNOUNCE whose options do not parse, or carry a mandatory one this server does not know, is
+// refused.
+func TestPCPAnnounceOptions(t *testing.T) {
+	p := &pcpServer{start: time.Now()}
+	if resp := p.handle(pcpReq(pcpOpAnnounce, 0, nil, []byte{1, 0, 0, 8}), pcpHost, time.Now()); resp[3] != pcpMalformedOption {
+		t.Fatalf("an option longer than the request: result %d", resp[3])
+	}
+	if resp := p.handle(pcpReq(pcpOpAnnounce, 0, nil, []byte{1, 0, 0, 0}), pcpHost, time.Now()); resp[3] != pcpUnsuppOption {
+		t.Fatalf("THIRD_PARTY: result %d", resp[3])
+	}
+	if _, code := pcpOptions([]byte{1, 0}); code != pcpMalformedOption {
+		t.Fatalf("an option cut short: result %d", code)
+	}
+}
+
+func TestPCPPinholeRefusesOtherProtocols(t *testing.T) {
+	p := &pcpServer{start: time.Now(), fw: &firewall{holeIn: make(chan []portMapping, 1)}}
+	if resp := p.handle(pcpReq(pcpOpMap, 3600, mapData(0, 0)), pcpHost, time.Now()); resp[3] != pcpUnsuppProtocol {
+		t.Fatalf("all protocols: result %d", resp[3])
+	}
+}
+
+// With the line's only port taken, another host gets NO_RESOURCES.
+func TestPCP4NoPortLeft(t *testing.T) {
+	p := pcpServer4([]portSpan{{2000, 2000}})
+	other := netip.MustParseAddr("192.168.1.11")
+	if _, port := external(t, p.handle(pcpReq4(pcpHost4, 3600, pcpProtoTCP, 8080, 0, "nonce-aaaaaa"), pcpHost4, time.Now())); port != 2000 {
+		t.Fatalf("the only port: %d", port)
+	}
+	if resp := p.handle(pcpReq4(other, 3600, pcpProtoTCP, 8080, 0, "nonce-bbbbbb"), other, time.Now()); resp[3] != pcpNoResources {
+		t.Fatalf("no port left: result %d", resp[3])
+	}
+	if got := nthPort([]portSpan{{2000, 2001}}, 2); got != 0 {
+		t.Fatalf("past the spans: %d", got)
+	}
+}
+
+// PREFER_FAILURE comes back in a success, and a renewal whose suggestion no longer matches fails.
+func TestPCP4PreferFailureRenewal(t *testing.T) {
+	p := pcpServer4(nil)
+	prefer := []byte{pcpOptPreferFailure, 0, 0, 0}
+	resp := p.handle(pcpReq4(pcpHost4, 3600, pcpProtoTCP, 8080, 9090, "nonce-aaaaaa", prefer), pcpHost4, time.Now())
+	if _, port := external(t, resp); port != 9090 || len(resp) != pcpHeaderLen+pcpMapLen+4 || resp[pcpHeaderLen+pcpMapLen] != pcpOptPreferFailure {
+		t.Fatalf("the suggested port with the option echoed: % x", resp)
+	}
+	if resp := p.handle(pcpReq4(pcpHost4, 3600, pcpProtoTCP, 8080, 9091, "nonce-aaaaaa", prefer), pcpHost4, time.Now()); resp[3] != pcpCannotProvideExternal {
+		t.Fatalf("a renewal insisting on another port: result %d", resp[3])
+	}
+}
+
+// Without a substitute the router's own listeners are asked of the system; whether that works
+// depends on it, so only that it returns is checked.
+func TestPCPLocalPortsFromTheSystem(t *testing.T) {
+	p := &pcpServer{ipv4: netip.MustParseAddr("203.0.113.9")}
+	p.localPorts(pcpProtoUDP)
+	p.localPorts(0)
+}

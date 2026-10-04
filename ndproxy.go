@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"slices"
@@ -47,6 +48,7 @@ type ndProxy struct {
 	layout     shared64Layout
 	wanIfi     *net.Interface
 	lanIfi     *net.Interface
+	wanPkts    *packetHub // the WAN capture, shared with the tunnel watcher
 	wanConn    *ndp.Conn
 	lanConn    *ndp.Conn
 	mu         sync.Mutex
@@ -177,27 +179,36 @@ func (n *ndProxy) serve(ctx context.Context, ch <-chan Snapshot) {
 		<-ctx.Done()
 		return
 	}
+	// The sockets send, and receive NA. An NS goes to the target's solicited-node group, and the
+	// IPv6 layer drops it unless someone on the interface joined that group, which for every
+	// address in the prefix is impractical; so NS come from a packet capture instead, as in ndppd,
+	// and ALLMULTI lets their frames past the NIC's filter.
 	var err error
-	n.wanConn, err = openNDConn(n.wanIfi, ipv6.ICMPTypeNeighborSolicitation, ipv6.ICMPTypeNeighborAdvertisement)
+	n.wanConn, err = openNDConn(n.wanIfi, ipv6.ICMPTypeNeighborAdvertisement)
 	if err != nil {
 		errorf("[ndp-proxy] failed to open %s: %v", n.wanIf, err)
 		return
 	}
 	defer n.wanConn.Close()
-	// upstream NS goes to a solicited-node multicast group; joining one per address in the prefix is impractical, so receive in promiscuous mode
 	setAllMulti(n.wanIfi.Name)
 
 	if n.effectiveMode() == proxyForward {
-		n.lanConn, err = openNDConn(n.lanIfi, ipv6.ICMPTypeNeighborSolicitation, ipv6.ICMPTypeNeighborAdvertisement)
+		n.lanConn, err = openNDConn(n.lanIfi, ipv6.ICMPTypeNeighborAdvertisement)
 		if err != nil {
 			errorf("[ndp-proxy] failed to open %s: %v", n.lanIf, err)
 			return
 		}
 		defer n.lanConn.Close()
 		setAllMulti(n.lanIfi.Name)
+		lanNS := newPacketHub(ctx, n.lanIf).Subscribe(kindNS)
+		defer lanNS.Close()
 		go n.reader(sideLAN, n.lanConn)
+		go n.solicitReader(ctx, sideLAN, lanNS.C)
 	}
+	wanNS := n.wanPkts.Subscribe(kindNS)
+	defer wanNS.Close()
 	go n.reader(sideWAN, n.wanConn)
+	go n.solicitReader(ctx, sideWAN, wanNS.C)
 	gc := time.NewTicker(n.ttl / 2)
 	defer gc.Stop()
 	selfTick := time.NewTicker(30 * time.Second)
@@ -322,41 +333,92 @@ func (n *ndProxy) ifi(side side) *net.Interface {
 	return n.lanIfi
 }
 
-// reader handles the NS and NA arriving on one side.
+// reader handles the NA arriving on one side.
 func (n *ndProxy) reader(side side, c *ndp.Conn) {
 	for {
 		msg, cm, from, err := c.ReadFrom()
 		if err != nil {
 			return
 		}
-		if cm == nil || cm.HopLimit != 255 {
+		m, ok := msg.(*ndp.NeighborAdvertisement)
+		if !ok || cm == nil || cm.HopLimit != 255 {
 			continue
 		}
+		// ReadFrom zones every source, global ones too; our own addresses hold none
 		n.mu.Lock()
-		self := n.selfAddrs[from]
-		switch m := msg.(type) {
-		case *ndp.NeighborSolicitation:
-			if self {
-				// our own probe NS echoed back, ignore it; otherwise the kernel is resolving a neighbor for
-				// the router itself, so probe the other side and add the /128 route before the kernel retransmits
-				if ps := n.sessions[m.TargetAddress]; ps != nil && ps.State == "probing" && ps.Side == side {
-					n.mu.Unlock()
-					continue
-				}
-				n.onSolicit(side, m.TargetAddress, netip.Addr{})
+		if n.selfAddrs[from.WithZone("")] {
+			n.mu.Unlock()
+			continue
+		}
+		n.onAdvert(side, m.TargetAddress)
+	}
+}
+
+// solicitReader handles the NS the capture on one side hands over until ctx ends. The capture also
+// sees the NS the router sends.
+func (n *ndProxy) solicitReader(ctx context.Context, side side, frames <-chan []byte) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case f := <-frames:
+			from, target, ok := parseNS(f)
+			if !ok {
 				continue
 			}
-			n.onSolicit(side, m.TargetAddress, from)
-		case *ndp.NeighborAdvertisement:
-			if self {
+			n.mu.Lock()
+			if !n.selfAddrs[from] {
+				n.onSolicit(side, target, from)
+				continue
+			}
+			// our own probe NS, ignore it; otherwise the kernel is resolving a neighbor for the router
+			// itself, so probe the other side and add the /128 route before the kernel retransmits
+			if ps := n.sessions[target]; ps != nil && ps.State == "probing" && ps.Side == side {
 				n.mu.Unlock()
 				continue
 			}
-			n.onAdvert(side, m.TargetAddress)
-		default:
-			n.mu.Unlock()
+			n.onSolicit(side, target, netip.Addr{})
 		}
 	}
+}
+
+// parseNS takes a captured frame for a Neighbor Solicitation when it passes the checks the kernel
+// makes before handing one to a socket (RFC 4861 section 7.1.1: hop limit 255, a correct
+// checksum, code 0, a well-formed message) and returns its source and target.
+func parseNS(f []byte) (from, target netip.Addr, ok bool) {
+	off := ipv6Offset(f)
+	if off < 0 {
+		return
+	}
+	ip := f[off:]
+	plen := int(binary.BigEndian.Uint16(ip[4:6]))
+	if ip[6] != 58 || ip[7] != 255 || len(ip) < 40+plen || icmpv6Checksum(ip[8:40], ip[40:40+plen]) != 0 {
+		return
+	}
+	m, err := ndp.ParseMessage(ip[40 : 40+plen])
+	ns, isNS := m.(*ndp.NeighborSolicitation)
+	if err != nil || !isNS || ip[41] != 0 {
+		return
+	}
+	return netip.AddrFrom16([16]byte(ip[8:24])), ns.TargetAddress, true
+}
+
+// icmpv6Checksum folds the one's complement sum over the pseudo-header, given its addresses, and
+// the message; it is 0 for a message whose checksum is correct.
+func icmpv6Checksum(addrs, msg []byte) uint16 {
+	sum := uint32(len(msg)) + 58
+	for _, b := range [][]byte{addrs, msg} {
+		for i := 0; i < len(b); i += 2 {
+			sum += uint32(b[i]) << 8
+			if i+1 < len(b) {
+				sum += uint32(b[i+1])
+			}
+		}
+	}
+	for sum > 0xffff {
+		sum = sum>>16 + sum&0xffff
+	}
+	return ^uint16(sum)
 }
 
 // onSolicit handles an NS received on side; it is entered holding the lock and releases it before returning.

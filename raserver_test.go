@@ -429,4 +429,29 @@ func TestRSValidation(t *testing.T) {
 			t.Errorf("%T from %s hop %d: got %v", c.msg, c.from, c.cm.HopLimit, got)
 		}
 	}
+	if parseND([]byte{byte(ipv6.ICMPTypeRouterAdvertisement), 0}) != nil {
+		t.Fatal("a truncated RA does not parse")
+	}
+}
+
+// A fixed interval when the minimum is not below the maximum, and no PIO for a LAN prefix whose
+// valid lifetime is over.
+func TestRAIntervalAndExpiredPrefix(t *testing.T) {
+	now := time.Now()
+	s := lanSnap(now)
+	s.LAN["lan0"] = append(s.LAN["lan0"], Prefix{Prefix: netip.MustParsePrefix("2001:db8:2::/64"), Valid: now.Add(-time.Second), Source: sourcePD})
+	r := newTestRA(s)
+	r.minI, r.maxI = 5*time.Second, 5*time.Second
+	if got := r.interval(); got != 5*time.Second {
+		t.Fatalf("interval: %v", got)
+	}
+	n := 0
+	for _, o := range r.build().Options {
+		if _, ok := o.(*ndp.PrefixInformation); ok {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("only the live prefix is advertised, got %d PIOs", n)
+	}
 }

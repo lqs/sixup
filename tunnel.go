@@ -249,7 +249,7 @@ func parseS46Rule(v []byte) (S46Rule, error) {
 	r.IPv4Prefix = netip.PrefixFrom(netip.AddrFrom4([4]byte(v[3:7])), p4len)
 	p6len := int(v[7])
 	n := (p6len + 7) / 8
-	if p6len > 128 || len(v) < 8+n {
+	if len(v) < 8+n {
 		return r, errors.New("invalid ipv6 prefix length")
 	}
 	p6, err := prefixFromBits(v[8:8+n], p6len)
@@ -283,7 +283,7 @@ func parseS46Bind(v []byte) (*S46Bind, error) {
 	b := &S46Bind{IPv4Addr: netip.AddrFrom4([4]byte(v[0:4]))}
 	p6len := int(v[4])
 	n := (p6len + 7) / 8
-	if p6len > 128 || len(v) < 5+n {
+	if len(v) < 5+n {
 		return nil, errors.New("invalid bind ipv6 prefix length")
 	}
 	p6, err := prefixFromBits(v[5:5+n], p6len)

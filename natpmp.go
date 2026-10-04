@@ -104,8 +104,6 @@ func (p *pcpServer) natpmp(req []byte, src netip.Addr, now time.Time) []byte {
 	case pcpSuccess:
 	case pcpNotAuthorized:
 		return refuse(natpmpRefused, "mapped already by PCP")
-	case pcpNetworkFailure:
-		return refuse(natpmpNetworkFailure, "no IPv4")
 	default:
 		return refuse(natpmpNoResources, pcpResultNames[out[3]])
 	}

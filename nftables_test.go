@@ -3,7 +3,9 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"net/netip"
 	"testing"
 
@@ -145,5 +147,104 @@ func TestNATApplyWritesOnlyOnChange(t *testing.T) {
 	m.apply(snap(0x57))
 	if sent == first {
 		t.Fatal("a different port set has to be installed")
+	}
+}
+
+// nftablesSnap is a MAP-E line whose port set follows psid.
+func nftablesSnap(psid uint16) Snapshot {
+	return Snapshot{Tunnel: &TunnelParams{
+		Kind: "map-e", Local: netip.MustParseAddr("2001:db8::1"), Remote: netip.MustParseAddr("2001:db8::2"),
+		RuleMAPE: &mapeResult{IPv4: netip.MustParseAddr("203.0.113.9"), Ports: portSpans(4, 8, psid)},
+	}}
+}
+
+// nftablesDial counts the messages a natManager sends and answers them with fail, or echoes them.
+func nftablesDial(sent *int, fail error) func() (*nftables.Conn, error) {
+	return func() (*nftables.Conn, error) {
+		return nftables.New(nftables.WithTestDial(func(req []netlink.Message) ([]netlink.Message, error) {
+			*sent += len(req)
+			return req, fail
+		}))
+	}
+}
+
+// The manager follows the snapshots and the PCP mappings until it is stopped, and then takes its
+// table away.
+func TestNATRunFollowsSnapshotsAndMappings(t *testing.T) {
+	sent := 0
+	m := &natManager{dev: "sixup-ipv4", mtu: 1460, warned: true, mapIn: make(chan []portMapping), dial: nftablesDial(&sent, nil)}
+	ch := make(chan Snapshot)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		m.run(ctx, ch)
+		close(done)
+	}()
+	ch <- nftablesSnap(0x56)
+	mp := portMapping{proto: unix.IPPROTO_TCP, internal: netip.MustParseAddrPort("192.168.1.10:8080"), external: 0x5600 + 0x1000}
+	m.mapIn <- []portMapping{mp}
+	ch <- nftablesSnap(0x56) // unchanged: nothing is written, but the mapping above has been applied by now
+	cancel()
+	<-done
+	if len(m.mappings) != 1 || m.mappings[0] != mp {
+		t.Fatalf("the mapping should have been kept for the next snapshot, got %v", m.mappings)
+	}
+	if m.applied != "" {
+		t.Fatal("stopping must remove the table")
+	}
+	if sent == 0 {
+		t.Fatal("nothing was written")
+	}
+}
+
+// A snapshot without a tunnel leaves nothing to translate, so the table goes.
+func TestNATApplyWithoutTunnelRemovesTheTable(t *testing.T) {
+	sent := 0
+	m := &natManager{dev: "sixup-ipv4", warned: true, dial: nftablesDial(&sent, nil)}
+	m.apply(nftablesSnap(0x56))
+	installed := sent
+	m.apply(Snapshot{})
+	if m.applied != "" || sent == installed {
+		t.Fatalf("the table should have been deleted: applied %q, %d messages after %d", m.applied, sent, installed)
+	}
+	removed := sent
+	m.remove()
+	if sent != removed {
+		t.Fatalf("nothing is installed, so there is nothing to remove: %d messages", sent-removed)
+	}
+}
+
+// When nftables refuses, the ruleset counts as not installed, so the next snapshot tries again.
+func TestNATSurvivesNftablesFailures(t *testing.T) {
+	m := &natManager{dev: "sixup-ipv4", dial: func() (*nftables.Conn, error) { return nil, errors.New("no netlink") }}
+	m.apply(nftablesSnap(0x56))
+	m.remove()
+	if m.applied != "" {
+		t.Fatal("remove forgets the table even when it cannot reach nftables")
+	}
+
+	sent := 0
+	m = &natManager{dev: "sixup-ipv4", dial: nftablesDial(&sent, unix.EPERM)}
+	m.apply(nftablesSnap(0x56))
+	if m.applied != "" {
+		t.Fatal("a ruleset the kernel refused must be installed again with the next snapshot")
+	}
+	if m.warned {
+		t.Fatal("chains that could not be listed have not been checked")
+	}
+	m.applied = "installed"
+	m.remove()
+	if m.applied != "" {
+		t.Fatal("remove forgets the table even when the kernel refuses")
+	}
+}
+
+// Without a configured MTU the clamp follows the tunnel device, and there is none without one.
+func TestNATTunnelMTUReadsTheDevice(t *testing.T) {
+	if mtu := (&natManager{dev: "lo"}).tunnelMTU(); mtu <= 0 {
+		t.Fatalf("lo has an MTU, got %d", mtu)
+	}
+	if mtu := (&natManager{dev: "sixup-absent"}).tunnelMTU(); mtu != 0 {
+		t.Fatalf("a missing device has no MTU, got %d", mtu)
 	}
 }

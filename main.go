@@ -297,7 +297,7 @@ func main() {
 	}
 	var proxy *ndProxy
 	if *ndMode != "off" {
-		proxy = &ndProxy{mode: proxyMode(*ndMode), wanIf: *wan, lanIf: lanDefs[0].iface, ttl: *ndTTL, layout: layout}
+		proxy = &ndProxy{mode: proxyMode(*ndMode), wanIf: *wan, wanPkts: pkts, lanIf: lanDefs[0].iface, ttl: *ndTTL, layout: layout}
 		for _, s := range ndStatic {
 			proxy.static = append(proxy.static, parsePrefixOrAddr(s))
 		}

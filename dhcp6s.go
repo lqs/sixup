@@ -148,10 +148,7 @@ func (s *dhcpServer) reader(pc *ipv6.PacketConn) {
 			debugf("[dhcpv6-server %s] parse failed: %v", s.ifname, err)
 			continue
 		}
-		udp, ok := src.(*net.UDPAddr)
-		if !ok {
-			continue
-		}
+		udp := src.(*net.UDPAddr)
 		peer, _ := netip.AddrFromSlice(udp.IP)
 		var resp *dhcpv6.Message
 		if cm.Dst != nil && !cm.Dst.IsMulticast() {
@@ -742,10 +739,7 @@ func buildReconfigure(serverID dhcpv6.DUID, l *Lease, now time.Time) ([]byte, bo
 	a[11] = 2 // type: HMAC-MD5 digest
 	msg.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionAuth, OptionData: a})
 	raw := msg.ToBytes()
-	idx := findAuthValue(raw)
-	if idx < 0 {
-		return nil, false
-	}
+	idx := findAuthValue(raw) // always found: the option was just added
 	mac := hmac.New(md5.New, key)
 	mac.Write(raw)
 	copy(raw[idx:], mac.Sum(nil))

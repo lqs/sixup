@@ -1,8 +1,10 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/md5"
+	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -330,5 +332,589 @@ func TestDUIDPersists(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "duid")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// dhcp6cOffline is a client on an interface that does not exist: every send fails, so only what a
+// test puts on its channels reaches it.
+func dhcp6cOffline(t *testing.T) *dhcpClient {
+	t.Helper()
+	store := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	c := newDHCPClient("dhcp6c-none", store, t.TempDir(), 56, true)
+	c.ifi = &net.Interface{Index: 1 << 20, Name: "dhcp6c-none"}
+	c.duid = &dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: net.HardwareAddr{2, 0, 0, 0, 0, 0x0c}}
+	return c
+}
+
+// dhcp6cLoopback names the loopback interface, which is up.
+func dhcp6cLoopback(t *testing.T) string {
+	t.Helper()
+	ifs, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ifi := range ifs {
+		if ifi.Flags&net.FlagLoopback != 0 && ifi.Flags&net.FlagUp != 0 {
+			return ifi.Name
+		}
+	}
+	t.Skip("no loopback interface up")
+	return ""
+}
+
+// dhcp6cCanceled is a context that has already ended.
+func dhcp6cCanceled() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}
+
+// dhcp6cReconfigure is a Reconfigure from server to client, signed with key as sendReconfigure
+// signs it; msgType, if any, is its Reconfigure Message option.
+func dhcp6cReconfigure(t *testing.T, key []byte, server, client dhcpv6.DUID, msgType []byte) *dhcpv6.Message {
+	t.Helper()
+	msg, _ := dhcpv6.NewMessage()
+	msg.MessageType = dhcpv6.MessageTypeReconfigure
+	msg.AddOption(dhcpv6.OptServerID(server))
+	msg.AddOption(dhcpv6.OptClientID(client))
+	if msgType != nil {
+		msg.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionReconfMessage, OptionData: msgType})
+	}
+	a := make([]byte, 28)
+	a[0], a[1], a[11] = 3, 1, 2
+	msg.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionAuth, OptionData: a})
+	raw := msg.ToBytes()
+	mac := hmac.New(md5.New, key)
+	mac.Write(raw)
+	copy(raw[findAuthValue(raw):], mac.Sum(nil))
+	signed, err := dhcpv6.MessageFromBytes(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return signed
+}
+
+// A Reconfigure is acted on only when it comes from the server of the binding, names this client
+// and carries the right key (RFC 8415 section 20.4); it asks for the message its option names, a
+// Renew without one.
+func TestDHCP6cHandleReconfigure(t *testing.T) {
+	key := []byte("0123456789abcdef")
+	server := &dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: []byte{1, 2, 3, 4, 5, 6}}
+	other := &dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: []byte{1, 2, 3, 4, 5, 7}}
+	client := &dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: []byte{6, 5, 4, 3, 2, 1}}
+	c := &dhcpClient{duid: client, serverID: server, reconfKey: key, reconfig: make(chan dhcpv6.MessageType, 1)}
+	none := func() {
+		t.Helper()
+		select {
+		case mt := <-c.reconfig:
+			t.Fatalf("unexpected %s", mt)
+		default:
+		}
+	}
+
+	reply, _ := dhcpv6.NewMessage()
+	reply.MessageType = dhcpv6.MessageTypeReply
+	c.handleUnsolicited(reply)
+	none()
+
+	if c.verifyReconfigure(dhcp6cReconfigure(t, key, other, client, nil)) {
+		t.Fatal("another server's Reconfigure passed")
+	}
+	if c.verifyReconfigure(dhcp6cReconfigure(t, key, server, other, nil)) {
+		t.Fatal("another client's Reconfigure passed")
+	}
+	noAuth, _ := dhcpv6.NewMessage()
+	noAuth.MessageType = dhcpv6.MessageTypeReconfigure
+	noAuth.AddOption(dhcpv6.OptServerID(server))
+	noAuth.AddOption(dhcpv6.OptClientID(client))
+	if c.verifyReconfigure(noAuth) {
+		t.Fatal("a Reconfigure without authentication passed")
+	}
+	badAuth := make([]byte, 28)
+	badAuth[0], badAuth[1], badAuth[11] = 3, 2, 2 // not HMAC-MD5
+	noAuth.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionAuth, OptionData: badAuth})
+	if c.verifyReconfigure(noAuth) {
+		t.Fatal("a Reconfigure with another algorithm passed")
+	}
+
+	c.handleUnsolicited(dhcp6cReconfigure(t, []byte("fedcba9876543210"), server, client, nil))
+	none()
+
+	c.handleUnsolicited(dhcp6cReconfigure(t, key, server, client, []byte{byte(dhcpv6.MessageTypeRebind)}))
+	if mt := <-c.reconfig; mt != dhcpv6.MessageTypeRebind {
+		t.Fatalf("got %s, want REBIND", mt)
+	}
+	c.handleUnsolicited(dhcp6cReconfigure(t, key, server, client, nil))
+	c.handleUnsolicited(dhcp6cReconfigure(t, key, server, client, nil)) // queue full: dropped
+	if mt := <-c.reconfig; mt != dhcpv6.MessageTypeRenew {
+		t.Fatalf("got %s, want RENEW", mt)
+	}
+	none()
+}
+
+func TestDHCP6cWalkOptions(t *testing.T) {
+	if findAuthValue([]byte{7, 0}) != -1 {
+		t.Fatal("a message shorter than its header has no AUTH")
+	}
+	walkOptionsOffset([]byte{0, 11, 0, 9, 1}, func(code uint16, _, _ int) {
+		t.Fatalf("option %d runs past the end", code)
+	})
+}
+
+// A corrupt state file gets a new DUID; an interface without a MAC gets a random locally
+// administered one; a dry run keeps nothing; and an unwritable state directory is an error.
+func TestDHCP6cLoadDUID(t *testing.T) {
+	old := dryRun
+	defer func() { dryRun = old }()
+	dryRun = false
+	ifi := &net.Interface{Name: "wan0", HardwareAddr: net.HardwareAddr{2, 0, 0, 0, 0, 7}}
+
+	dir := t.TempDir()
+	p := filepath.Join(dir, "duid")
+	if err := os.WriteFile(p, []byte("not hex\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := &dhcpClient{stateDir: dir, ifi: ifi}
+	if err := c.loadDUID(); err != nil || c.duid == nil {
+		t.Fatalf("regenerating: %v %v", c.duid, err)
+	}
+	if b, _ := os.ReadFile(p); string(b) == "not hex\n" {
+		t.Fatal("the corrupt state file was kept")
+	}
+
+	dryRun = true
+	c = &dhcpClient{stateDir: t.TempDir(), ifi: &net.Interface{Name: "ppp0"}}
+	if err := c.loadDUID(); err != nil {
+		t.Fatal(err)
+	}
+	ll, ok := c.duid.(*dhcpv6.DUIDLL)
+	if !ok || len(ll.LinkLayerAddr) != 6 || ll.LinkLayerAddr[0]&0x03 != 0x02 {
+		t.Fatalf("want a DUID-LL from a random local unicast address, got %v", c.duid)
+	}
+	if _, err := os.Stat(filepath.Join(c.stateDir, "duid")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a dry run wrote the DUID: %v", err)
+	}
+
+	dryRun = false
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c = &dhcpClient{stateDir: filepath.Join(file, "state"), ifi: ifi}
+	if err := c.loadDUID(); err == nil {
+		t.Fatal("a state directory under a file must fail")
+	}
+}
+
+// NTP servers come once each, from either option, and an INF_MAX_RT in range is taken.
+func TestDHCP6cParseCommonTimeServers(t *testing.T) {
+	c := &dhcpClient{solMaxRT: solParams.mrt, infMaxRT: infParams.mrt}
+	rep, _ := dhcpv6.NewMessage()
+	rep.MessageType = dhcpv6.MessageTypeReply
+	ntp := net.ParseIP("2001:db8::123")
+	rep.AddOption(dhcpv6.OptSNTP(ntp, ntp))
+	rep.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionInfMaxRT, OptionData: be32(120)})
+	upd := c.parseCommon(rep)
+	if len(upd.NTP) != 1 || upd.NTP[0] != netip.MustParseAddr("2001:db8::123") {
+		t.Fatalf("ntp: %v", upd.NTP)
+	}
+	if c.infMaxRT != 120*time.Second {
+		t.Fatalf("INF_MAX_RT not applied: %v", c.infMaxRT)
+	}
+}
+
+// What apply skips or derives besides TestApplyReply: refused and malformed IAs, the Prefix
+// Exclude option, addresses no longer given, and a T2 below T1.
+func TestDHCP6cApplyEdges(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	defer func() { dryRun = old }()
+	store := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	gone := netip.MustParseAddr("2001:db8::dead")
+	c := &dhcpClient{ifi: &net.Interface{Index: 2}, store: store, naAddrs: []netip.Addr{gone}}
+
+	rep, _ := dhcpv6.NewMessage()
+	rep.MessageType = dhcpv6.MessageTypeReply
+	refused := &dhcpv6.OptIAPD{IaId: [4]byte{1}}
+	refused.Options.Add(&dhcpv6.OptStatusCode{StatusCode: iana.StatusNoPrefixAvail})
+	rep.AddOption(refused)
+	pd := &dhcpv6.OptIAPD{IaId: [4]byte{2}, T1: 1000 * time.Second}
+	pd.Options.Add(&dhcpv6.OptIAPrefix{Prefix: &net.IPNet{IP: net.IP{1, 2, 3}, Mask: net.CIDRMask(56, 128)}, PreferredLifetime: time.Hour, ValidLifetime: time.Hour})
+	ex := &dhcpv6.OptIAPrefix{Prefix: prefixToIPNet(netip.MustParsePrefix("2001:db8:100::/56")), PreferredLifetime: 1000 * time.Second, ValidLifetime: time.Hour}
+	ex.Options.Add(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionPDExclude, OptionData: []byte{64, 0x12}})
+	pd.Options.Add(ex)
+	rep.AddOption(pd)
+	badT := &dhcpv6.OptIANA{IaId: [4]byte{3}, T1: 20 * time.Second, T2: 10 * time.Second}
+	badT.Options.Add(&dhcpv6.OptIAAddress{IPv6Addr: net.ParseIP("2001:db8::1"), PreferredLifetime: time.Hour, ValidLifetime: time.Hour})
+	rep.AddOption(badT)
+	na := &dhcpv6.OptIANA{IaId: [4]byte{4}}
+	na.Options.Add(&dhcpv6.OptIAAddress{IPv6Addr: net.ParseIP("2001:db8::2"), PreferredLifetime: time.Hour}) // valid 0
+	na.Options.Add(&dhcpv6.OptIAAddress{IPv6Addr: net.ParseIP("2001:db8::3"), PreferredLifetime: time.Hour, ValidLifetime: 3 * time.Hour})
+	rep.AddOption(na)
+
+	l := c.apply(rep)
+	if l == nil || len(l.prefixes) != 1 || len(l.addrs) != 1 || l.addrs[0] != netip.MustParseAddr("2001:db8::3") {
+		t.Fatalf("binding: %+v", l)
+	}
+	if l.prefixes[0].Exclude != netip.MustParsePrefix("2001:db8:100:12::/64") {
+		t.Fatalf("Prefix Exclude: %v", l.prefixes[0].Exclude)
+	}
+	if !l.t2.Equal(l.t1) || time.Until(l.t1) < 999*time.Second {
+		t.Fatalf("T2 below T1 must be raised to it: T1 in %s, T2 in %s", time.Until(l.t1), time.Until(l.t2))
+	}
+	if d := time.Until(l.valid); d < 3*time.Hour-time.Second {
+		t.Fatalf("the binding lasts as long as its longest lifetime: %s", d)
+	}
+	if slices.Contains(c.naAddrs, gone) || len(c.fresh) != 1 {
+		t.Fatalf("addresses: %v, fresh %v", c.naAddrs, c.fresh)
+	}
+}
+
+// A Renew or Rebind names the addresses of the binding.
+func TestDHCP6cIAOptionsFromLease(t *testing.T) {
+	c := &dhcpClient{pdLen: 56, wantNA: true, iaid: [4]byte{9}}
+	a := netip.MustParseAddr("2001:db8::5")
+	l := &lease{
+		prefixes: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8:100::/56"), Preferred: time.Now().Add(time.Hour), Valid: time.Now().Add(time.Hour)}},
+		addrs:    []netip.Addr{a},
+	}
+	m, _ := dhcpv6.NewMessage(c.iaOptions(l)...)
+	nas := m.Options.IANA()
+	if len(nas) != 1 || len(nas[0].Options.Addresses()) != 1 || !nas[0].Options.Addresses()[0].IPv6Addr.Equal(a.AsSlice()) {
+		t.Fatalf("IA_NA: %v", nas)
+	}
+	if pds := m.Options.IAPD(); len(pds) != 1 || len(pds[0].Options.Prefixes()) != 1 {
+		t.Fatalf("IA_PD: %v", pds)
+	}
+}
+
+// waitBound ends on whatever comes first, and handles messages that come meanwhile.
+func TestDHCP6cWaitBound(t *testing.T) {
+	c := dhcp6cOffline(t)
+	ctx := context.Background()
+	later := time.Now().Add(time.Hour)
+	if got := c.waitBound(dhcp6cCanceled(), later); got != "ctx" {
+		t.Fatalf("canceled: %s", got)
+	}
+	if got := c.waitBound(ctx, time.Now()); got != "t1" {
+		t.Fatalf("at T1: %s", got)
+	}
+	c.Reconfirm("test")
+	c.Reconfirm("test again") // one is enough
+	if got := c.waitBound(ctx, later); got != "reconfirm" {
+		t.Fatalf("reconfirm: %s", got)
+	}
+	c.reconfig <- dhcpv6.MessageTypeRenew
+	if got := c.waitBound(ctx, later); got != "reconf" {
+		t.Fatalf("reconfigure: %s", got)
+	}
+	c.link <- linkEvent{Up: true}
+	c.link <- linkEvent{Up: false}
+	if got := c.waitBound(ctx, later); got != "down" || c.linkUp {
+		t.Fatalf("link down: %s", got)
+	}
+	reply, _ := dhcpv6.NewMessage()
+	reply.MessageType = dhcpv6.MessageTypeReply
+	c.recv <- reply
+	if got := c.waitBound(ctx, time.Now().Add(20*time.Millisecond)); got != "t1" || len(c.recv) != 0 {
+		t.Fatalf("a stray Reply: %s", got)
+	}
+}
+
+func TestDHCP6cOnExchangeErr(t *testing.T) {
+	c := &dhcpClient{}
+	for _, err := range []error{context.Canceled, errLinkDown, errTimeout} {
+		c.onExchangeErr(err)
+	}
+}
+
+// Only an O-only line falls back to Information-Request, and only once.
+func TestDHCP6cFallbackInfo(t *testing.T) {
+	c := &dhcpClient{}
+	if c.fallbackInfo() || c.infoOnly {
+		t.Fatal("no O-only RA, no fallback")
+	}
+	c.raOther = true
+	if !c.fallbackInfo() || !c.infoOnly {
+		t.Fatal("O-only RA: fall back")
+	}
+	if c.fallbackInfo() {
+		t.Fatal("already in Information-Request mode")
+	}
+}
+
+// The backoff after a refusal starts at 5 minutes and doubles up to an hour.
+func TestDHCP6cRefusedWait(t *testing.T) {
+	c := dhcp6cOffline(t)
+	c.unhinted = true
+	ctx := dhcp6cCanceled()
+	for _, want := range []time.Duration{5 * time.Minute, 10 * time.Minute, 20 * time.Minute, 40 * time.Minute, time.Hour, time.Hour} {
+		c.refusedWait(ctx, "test")
+		if c.refuseBackoff != want {
+			t.Fatalf("backoff %s, want %s", c.refuseBackoff, want)
+		}
+	}
+	if c.unhinted {
+		t.Fatal("after the backoff the hint is tried again")
+	}
+}
+
+// Nothing is released without a binding or a server, and a Release no server acknowledges keeps
+// the addresses.
+func TestDHCP6cReleaseUnacknowledged(t *testing.T) {
+	c := dhcp6cOffline(t)
+	c.release(nil)
+	l := &lease{prefixes: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8:100::/56")}}}
+	c.release(l) // no server
+	c.serverID = &dhcpv6.DUIDLL{HWType: iana.HWTypeEthernet, LinkLayerAddr: []byte{1, 2, 3, 4, 5, 6}}
+	a := netip.MustParseAddr("2001:db8::5")
+	c.naAddrs = []netip.Addr{a}
+	c.link <- linkEvent{Up: false}
+	c.release(l)
+	if len(c.naAddrs) != 1 {
+		t.Fatal("an unacknowledged Release cleared the binding")
+	}
+}
+
+func TestDHCP6cWaitDone(t *testing.T) {
+	c := &dhcpClient{done: make(chan struct{})}
+	close(c.done)
+	c.WaitDone()
+}
+
+// A link that stays down until the binding expires loses it.
+func TestDHCP6cRejoinExpires(t *testing.T) {
+	c := dhcp6cOffline(t)
+	c.linkUp = false
+	if l := c.rejoin(context.Background(), &lease{valid: time.Now().Add(30 * time.Millisecond)}); l != nil {
+		t.Fatal("the binding outlived its valid lifetime")
+	}
+}
+
+func TestDHCP6cAwaitDADCanceled(t *testing.T) {
+	c := dhcp6cOffline(t)
+	if failed := c.awaitDAD(dhcp6cCanceled(), []netip.Addr{netip.MustParseAddr("2001:db8::5")}); failed != nil {
+		t.Fatalf("canceled: %v", failed)
+	}
+}
+
+// waitLinkUp gives up when ctx ends, whether waiting for the link, the interface or the socket.
+func TestDHCP6cWaitLinkUpCanceled(t *testing.T) {
+	ctx := dhcp6cCanceled()
+	c := dhcp6cOffline(t)
+	c.linkUp = false
+	c.waitLinkUp(ctx)
+	c.cycle(ctx) // ends right after waitLinkUp
+
+	c.linkUp = true
+	c.waitLinkUp(ctx) // the interface is missing
+
+	// Linux gives the loopback no link-local address, so the socket cannot be opened
+	c.ifname = dhcp6cLoopback(t)
+	c.waitLinkUp(ctx)
+	if c.conn != nil {
+		c.conn.Close()
+	}
+}
+
+// exchange's retransmission and its ways out, with sends that fail and answers put straight into
+// the client's queue from build, which alone sees the transaction ID.
+func TestDHCP6cExchange(t *testing.T) {
+	ctx := context.Background()
+	msg := func(mt dhcpv6.MessageType, tid dhcpv6.TransactionID) *dhcpv6.Message {
+		m, _ := dhcpv6.NewMessage()
+		m.MessageType = mt
+		m.TransactionID = tid
+		return m
+	}
+	build := func(sent *int, answer func(int, dhcpv6.TransactionID)) func(time.Duration, dhcpv6.TransactionID) *dhcpv6.Message {
+		return func(_ time.Duration, tid dhcpv6.TransactionID) *dhcpv6.Message {
+			if answer != nil {
+				answer(*sent, tid)
+			}
+			*sent++
+			return msg(dhcpv6.MessageTypeRequest, tid)
+		}
+	}
+	isReply := func(m *dhcpv6.Message) (bool, bool) {
+		ok := m.MessageType == dhcpv6.MessageTypeReply
+		return ok, ok
+	}
+
+	c := dhcp6cOffline(t)
+	var sent int
+	if err := c.exchange(dhcp6cCanceled(), dhcpv6.MessageTypeSolicit, solParams, build(&sent, nil), isReply); !errors.Is(err, context.Canceled) || sent != 0 {
+		t.Fatalf("canceled before the first Solicit: %v, %d sent", err, sent)
+	}
+
+	if err := c.exchange(ctx, dhcpv6.MessageTypeRequest, retransParams{irt: 5 * time.Millisecond, mrc: 2}, build(&sent, nil), isReply); !errors.Is(err, errTimeout) || sent != 2 {
+		t.Fatalf("MRC 2: %v, %d sent", err, sent)
+	}
+
+	sent = 0
+	if err := c.exchange(ctx, dhcpv6.MessageTypeRequest, retransParams{irt: time.Hour, mrd: time.Nanosecond}, build(&sent, nil), isReply); !errors.Is(err, errTimeout) || sent != 1 {
+		t.Fatalf("MRD past at once: %v, %d sent", err, sent)
+	}
+
+	sent = 0
+	if err := c.exchange(ctx, dhcpv6.MessageTypeRequest, retransParams{irt: time.Hour, mrd: 20 * time.Millisecond}, build(&sent, nil), isReply); !errors.Is(err, errTimeout) || sent != 1 {
+		t.Fatalf("MRD: %v, %d sent", err, sent)
+	}
+
+	c.link <- linkEvent{Up: true}
+	c.link <- linkEvent{Up: false}
+	if err := c.exchange(ctx, dhcpv6.MessageTypeRequest, reqParams, build(&sent, nil), isReply); !errors.Is(err, errLinkDown) || c.linkUp {
+		t.Fatalf("link down: %v", err)
+	}
+
+	// another transaction's message, one of this transaction's that accept refuses, and the Reply
+	sent = 0
+	err := c.exchange(ctx, dhcpv6.MessageTypeRequest, reqParams, build(&sent, func(_ int, tid dhcpv6.TransactionID) {
+		other := tid
+		other[0]++
+		c.recv <- msg(dhcpv6.MessageTypeReply, other)
+		c.recv <- msg(dhcpv6.MessageTypeAdvertise, tid)
+		c.recv <- msg(dhcpv6.MessageTypeReply, tid)
+	}), isReply)
+	if err != nil || sent != 1 || len(c.recv) != 0 {
+		t.Fatalf("Reply: %v, %d sent", err, sent)
+	}
+
+	// a message matched but not done ends the exchange when the RT runs out
+	sent = 0
+	err = c.exchange(ctx, dhcpv6.MessageTypeRequest, retransParams{irt: 5 * time.Millisecond}, build(&sent, func(_ int, tid dhcpv6.TransactionID) {
+		c.recv <- msg(dhcpv6.MessageTypeAdvertise, tid)
+	}), func(*dhcpv6.Message) (bool, bool) { return true, false })
+	if err != nil || sent != 1 {
+		t.Fatalf("matched: %v, %d sent", err, sent)
+	}
+
+	// past the first RT, the first Advertise ends a Solicit at once
+	sent = 0
+	err = c.exchange(ctx, dhcpv6.MessageTypeSolicit, retransParams{irt: 5 * time.Millisecond}, build(&sent, func(n int, tid dhcpv6.TransactionID) {
+		if n == 1 {
+			c.recv <- msg(dhcpv6.MessageTypeAdvertise, tid)
+		}
+	}), func(*dhcpv6.Message) (bool, bool) { return true, false })
+	if err != nil || sent != 2 {
+		t.Fatalf("second Solicit: %v, %d sent", err, sent)
+	}
+}
+
+// send reports a socket it cannot open, and drops one it cannot write to.
+func TestDHCP6cSendFails(t *testing.T) {
+	c := dhcp6cOffline(t)
+	m, _ := dhcpv6.NewMessage()
+	if err := c.send(m); err == nil {
+		t.Fatal("no link-local address, no socket")
+	}
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	c.conn = conn
+	if err := c.send(m); err == nil || c.conn != nil {
+		t.Fatalf("a closed socket: %v, %v", err, c.conn)
+	}
+}
+
+// The reader skips what does not parse, dumps the rest when debugging, and reports the link down
+// when its socket fails.
+func TestDHCP6cReader(t *testing.T) {
+	old := logLevel.Level()
+	setDebug()
+	defer logLevel.Set(old)
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &dhcpClient{conn: conn, recv: make(chan *dhcpv6.Message, 1), link: make(chan linkEvent, 1)}
+	go c.reader(conn)
+
+	out, err := net.DialUDP("udp", nil, conn.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	rep, _ := dhcpv6.NewMessage()
+	rep.MessageType = dhcpv6.MessageTypeReply
+	rep.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionAFTRName, OptionData: []byte("\x04aftr\x07example\x00")})
+	rep.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionS46ContMapE})
+	for _, b := range [][]byte{{0xff}, rep.ToBytes()} {
+		if _, err := out.Write(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case m := <-c.recv:
+		if m.MessageType != dhcpv6.MessageTypeReply {
+			t.Fatalf("got %s", m.MessageType)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the Reply never came")
+	}
+	conn.Close()
+	select {
+	case ev := <-c.link:
+		if ev.Up {
+			t.Fatal("want link down")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a failed socket must report the link down")
+	}
+}
+
+// run gives up when ctx ends before the interface or the DUID is there, or before the RA; and
+// starts on the M and O flags of the RA.
+func TestDHCP6cRun(t *testing.T) {
+	old := dryRun
+	dryRun = false
+	defer func() { dryRun = old }()
+	lo := dhcp6cLoopback(t)
+	ctx := dhcp6cCanceled()
+	store := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	finished := func(c *dhcpClient) {
+		t.Helper()
+		select {
+		case <-c.done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("run did not return")
+		}
+	}
+
+	c := newDHCPClient("dhcp6c-none", store, t.TempDir(), 56, false)
+	c.run(ctx, false)
+	finished(c)
+
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c = newDHCPClient(lo, store, filepath.Join(file, "state"), 56, false)
+	c.run(ctx, false)
+	finished(c)
+
+	c = newDHCPClient(lo, store, t.TempDir(), 56, false)
+	c.run(ctx, true)
+	finished(c)
+
+	for _, f := range []raFlags{{managed: true}, {other: true}, {}} {
+		ctx, cancel := context.WithCancel(context.Background())
+		c := newDHCPClient(lo, store, t.TempDir(), 56, false)
+		c.linkUp = false // the cycle waits for the link, so the test sees only the start
+		c.start <- f
+		go c.run(ctx, true)
+		for deadline := time.Now().Add(2 * time.Second); len(c.start) > 0; {
+			if time.Now().After(deadline) {
+				t.Fatal("the RA flags were never taken")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+		finished(c)
+		if c.raOther != (f.other && !f.managed) {
+			t.Fatalf("%+v: raOther %v", f, c.raOther)
+		}
 	}
 }

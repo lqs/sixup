@@ -107,10 +107,8 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 				end()
 			}
 		case f := <-frames:
-			if cc == nil {
-				continue
-			}
 			cc.handleFrame(f)
+			// Decide as soon as any packet arrives: the type follows from the address format, so one packet suffices; ambiguous PSID lengths are exported as a candidate list
 			if g, ok := cc.any(); ok {
 				logInferred(g)
 				w.store.SetCaptured(&g)
@@ -118,13 +116,6 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 			}
 		case <-tick.C:
 			if sub == nil {
-				continue
-			}
-			// Decide as soon as any packet arrives: the type follows from the address format, so one packet suffices; ambiguous PSID lengths are exported as a candidate list
-			if g, ok := cc.any(); ok {
-				logInferred(g)
-				w.store.SetCaptured(&g)
-				end()
 				continue
 			}
 			if time.Since(started) > w.maxRun {
@@ -317,16 +308,28 @@ const (
 	bpfPass   = 0x40000
 )
 
-// captureFilter passes only IPv6 protocol 4 (IPv4-in-IPv6).
+// captureFilter passes IPv6 protocol 4 (IPv4-in-IPv6) for kindTunnel, and ICMPv6 Neighbor
+// Solicitations without extension headers for kindNS.
 // Offsets assume an untagged Ethernet frame: the kernel strips the 802.1Q tag before AF_PACKET runs the filter, so the IPv6 header always starts at 14.
-func captureFilter(frameKind) []bpfInsn {
+func captureFilter(kinds frameKind) []bpfInsn {
+	tunnel, ns := uint32(4), uint32(58)
+	// a next header that never matches leaves out a kind not asked for
+	if kinds&kindTunnel == 0 {
+		tunnel = 0x100
+	}
+	if kinds&kindNS == 0 {
+		ns = 0x100
+	}
 	return []bpfInsn{
 		{code: bpfLdhAbs, k: 12},                 // 0 ethertype
-		{code: bpfJeqK, k: 0x86dd, jt: 0, jf: 2}, // 1 not IPv6 -> 4
+		{code: bpfJeqK, k: 0x86dd, jt: 0, jf: 5}, // 1 not IPv6 -> 7
 		{code: bpfLdbAbs, k: 20},                 // 2 next header
-		{code: bpfJeqK, k: 4, jt: 1, jf: 0},      // 3 protocol 4 -> 5
-		{code: bpfRetK, k: 0},                    // 4 drop
-		{code: bpfRetK, k: bpfPass},              // 5 accept
+		{code: bpfJeqK, k: tunnel, jt: 4, jf: 0}, // 3 protocol 4 -> 8
+		{code: bpfJeqK, k: ns, jt: 0, jf: 2},     // 4 not ICMPv6 -> 7
+		{code: bpfLdbAbs, k: 54},                 // 5 ICMPv6 type
+		{code: bpfJeqK, k: 135, jt: 1, jf: 0},    // 6 Neighbor Solicitation -> 8
+		{code: bpfRetK, k: 0},                    // 7 drop
+		{code: bpfRetK, k: bpfPass},              // 8 accept
 	}
 }
 

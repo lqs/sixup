@@ -723,3 +723,156 @@ func TestStoreWANSubnet(t *testing.T) {
 		t.Fatalf("WAN subnet of a /64: %+v", s.WANSubnet)
 	}
 }
+
+// An expired prefix has no time left; without a WAN subnet the temporary addresses come from the
+// SLAAC prefix; and only a MAP-E CE is a tunnel endpoint to configure.
+func TestSnapshotHelpers(t *testing.T) {
+	now := time.Now()
+	if left := (Prefix{Valid: now.Add(-time.Second)}).validLeft(now); left != 0 {
+		t.Fatalf("expired prefix: %v left", left)
+	}
+	ra := Prefix{Prefix: netip.MustParsePrefix("2001:db8:1::/64"), Source: sourceRA, SLAAC: true, Valid: now.Add(time.Hour)}
+	s := Snapshot{WAN: []Prefix{ra}}
+	if !slices.Equal(s.wanTemp(), []Prefix{ra}) {
+		t.Fatalf("temporary addresses without a WAN subnet: %v", s.wanTemp())
+	}
+	if s.tunnelEndpoints() != nil {
+		t.Fatal("no tunnel, no endpoint")
+	}
+	ce := netip.MustParseAddr("2001:db8:1::ce")
+	s.Tunnel = &TunnelParams{RuleMAPE: &mapeResult{CE: ce}}
+	if !slices.Equal(s.tunnelEndpoints(), []netip.Addr{ce}) {
+		t.Fatalf("MAP-E endpoint: %v", s.tunnelEndpoints())
+	}
+}
+
+// The resolved AFTR addresses, the capture and the DAD conflicts of the tunnel endpoint all reach
+// the snapshot; a delegation already expired or deprecated derives no MAP-E.
+func TestStoreTunnelInputs(t *testing.T) {
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, true, 0, 0, "")
+	ch := st.Subscribe()
+	recv(t, ch)
+	now := time.Now()
+	expired := Prefix{Prefix: netip.MustParsePrefix("2001:db8:2::/56"), Preferred: now.Add(-time.Hour), Valid: now.Add(-time.Second), Source: sourcePD}
+	deprecated := Prefix{Prefix: netip.MustParsePrefix("2001:db8:1::/56"), Preferred: now.Add(-time.Second), Valid: now.Add(time.Hour), Source: sourcePD}
+	live := Prefix{Prefix: netip.MustParsePrefix("240b:10:1234:5600::/56"), Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: sourcePD}
+	st.Set(sourcePD, SourceUpdate{Prefixes: []Prefix{expired, deprecated, live}, Tunnel: &TunnelParams{AFTRName: "aftr.example"}})
+	s := recv(t, ch)
+	if s.Tunnel == nil || s.Tunnel.MAPESource != fromRules || s.Tunnel.AFTRName != "aftr.example" || len(s.WAN) != 2 {
+		t.Fatalf("the rule table answers for the live delegation only: %+v %+v", s.Tunnel, s.WAN)
+	}
+	ce := s.Tunnel.RuleMAPE.CE
+
+	aftr := []netip.Addr{netip.MustParseAddr("2001:db8::a")}
+	st.SetAFTRAddrs("aftr.example", aftr)
+	if s = recv(t, ch); !slices.Equal(s.Tunnel.AFTRAddrs, aftr) {
+		t.Fatalf("AFTR addresses: %v", s.Tunnel.AFTRAddrs)
+	}
+	st.SetCaptured(&tunnelGuess{Type: tunnelMAPE, Remote: netip.MustParseAddr("2001:db8::b")})
+	if s = recv(t, ch); s.Tunnel.Captured == nil || !strings.Contains(s.describe(now), "captured=") || !strings.Contains(s.describe(now), "AFTR=aftr.example") {
+		t.Fatalf("capture: %+v", s.Tunnel)
+	}
+	st.SetEndpointConflict(ce, true)
+	if s = recv(t, ch); !slices.Equal(s.Tunnel.Conflicts, []netip.Addr{ce}) {
+		t.Fatalf("conflict: %v", s.Tunnel.Conflicts)
+	}
+	st.SetEndpointConflict(ce, false)
+	if s = recv(t, ch); len(s.Tunnel.Conflicts) != 0 {
+		t.Fatalf("conflict cleared: %v", s.Tunnel.Conflicts)
+	}
+
+	// MAP-E delivered by DHCPv6 is computed for the first delegation still preferred.
+	r, ok := calcMAPE(live.Prefix)
+	if !ok {
+		t.Fatal("rule table")
+	}
+	st2 := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	ch2 := st2.Subscribe()
+	recv(t, ch2)
+	st2.Set(sourcePD, SourceUpdate{Prefixes: []Prefix{deprecated, live}, Tunnel: &TunnelParams{MAPE: r.s46()}})
+	if s = recv(t, ch2); s.Tunnel.MAPESource != fromDHCPv6 || s.Tunnel.RuleMAPE == nil {
+		t.Fatalf("DHCPv6 MAP-E: %+v", s.Tunnel)
+	}
+}
+
+// Segments a prefix cannot serve are reported: a ULA /64 has no second subnet, and an excluded /64
+// leaves no spare one. Prefixes that go are held no longer than their valid lifetime, and the WAN
+// prefix leaves the snapshot when its hold ends.
+func TestStoreShortAndRevokedPrefixes(t *testing.T) {
+	ula := netip.MustParsePrefix("fd00:1::/64")
+	st := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, time.Minute, []netip.Prefix{ula}, false, 0, 0, "")
+	ch := st.Subscribe()
+	if s := recv(t, ch); len(s.LAN["lan0"]) != 1 || len(s.LAN["lan1"]) != 0 {
+		t.Fatalf("the ULA /64 serves lan0 only: %+v", s.LAN)
+	}
+	now := time.Now()
+	p := netip.MustParsePrefix("2001:db8:5::/64")
+	st.Set(sourcePD, SourceUpdate{Prefixes: []Prefix{{Prefix: p, Exclude: p, Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: sourcePD}}})
+	if s := recv(t, ch); len(s.LAN["lan0"]) != 1 {
+		t.Fatalf("the excluded /64 goes to no LAN: %+v", s.LAN)
+	}
+
+	st2 := newStore("pd", []lanDef{{"lan0", 0}}, time.Minute, nil, false, 0, 0, "")
+	ch2 := st2.Subscribe()
+	recv(t, ch2)
+	valid := time.Now().Add(300 * time.Millisecond)
+	st2.Set(sourcePD, SourceUpdate{Prefixes: []Prefix{{Prefix: p, Preferred: valid, Valid: valid, Source: sourcePD}}})
+	recv(t, ch2)
+	st2.Set(sourcePD, SourceUpdate{})
+	s := recv(t, ch2)
+	if s.Change != changeRevoke || len(s.LAN["lan0"]) != 1 || !s.LAN["lan0"][0].Valid.Equal(valid) || len(s.WAN) != 1 || !s.WAN[0].Valid.Equal(valid) {
+		t.Fatalf("held until the valid lifetime: %+v", s)
+	}
+	if s = recv(t, ch2); s.Change != changeRevoke || len(s.LAN["lan0"]) != 0 || len(s.WAN) != 0 {
+		t.Fatalf("gone after the hold: %+v", s)
+	}
+}
+
+// A corrupt record is ignored, and one that cannot be written leaves the store running.
+func TestStoreAdvertisedFileErrors(t *testing.T) {
+	dir := t.TempDir()
+	corrupt := filepath.Join(dir, "corrupt")
+	if err := os.WriteFile(corrupt, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	busy := filepath.Join(dir, "busy") // a directory: written next to, but not renamed over
+	if err := os.MkdirAll(filepath.Join(busy, "x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	for _, file := range []string{corrupt, filepath.Join(dir, "missing", "file"), busy} {
+		st := newStore("pd", []lanDef{{"lan0", 0}}, time.Minute, nil, false, 0, 0, file)
+		if st.previous != nil {
+			t.Fatalf("%s: a corrupt record is ignored", file)
+		}
+		ch := st.Subscribe()
+		recv(t, ch)
+		st.Set(sourcePD, SourceUpdate{Prefixes: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8:7::/56"), Preferred: now.Add(time.Hour), Valid: now.Add(time.Hour), Source: sourcePD}}})
+		if s := recv(t, ch); len(s.LAN["lan0"]) != 1 {
+			t.Fatalf("%s: %+v", file, s.LAN)
+		}
+	}
+}
+
+func TestLoadULASpecs(t *testing.T) {
+	if got, err := loadULA("", ""); got != nil || err != nil {
+		t.Fatalf("empty: %v %v", got, err)
+	}
+	got, err := loadULA("", "fd00:1::/48, fd00:2:0:1::/64")
+	if err != nil || !slices.Equal(got, []netip.Prefix{netip.MustParsePrefix("fd00:1::/48"), netip.MustParsePrefix("fd00:2:0:1::/64")}) {
+		t.Fatalf("list: %v %v", got, err)
+	}
+	if _, err := loadULA("", "nonsense"); err == nil {
+		t.Fatal("nonsense must fail")
+	}
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadULA(file, "auto"); err == nil {
+		t.Fatal("a state directory that is a file must fail")
+	}
+	if got, err := parseWANPrefix("2001:db8:1::/48,,"); err != nil || len(got) != 1 {
+		t.Fatalf("empty fields are skipped: %v %v", got, err)
+	}
+}

@@ -21,8 +21,8 @@ import (
 const synLogGroup = 6092
 
 // synWait is how long a dropped SYN waits for the LAN to open the same connection before the
-// sender is told it is prohibited (RFC 6092 REC-34).
-const synWait = 6 * time.Second
+// sender is told it is prohibited (RFC 6092 REC-34). A variable only so tests need not wait.
+var synWait = 6 * time.Second
 
 // synSnaplen keeps of a SYN what an ICMPv6 error can carry back within the minimum MTU.
 const synSnaplen = 1280 - 40 - 8
@@ -155,10 +155,7 @@ func (r *synRejecter) due(flow synFlow, pkt []byte) {
 		return
 	}
 	msg := icmp.Message{Type: ipv6.ICMPTypeDestinationUnreachable, Code: icmpUnreachProhib, Body: &icmp.DstUnreach{Data: pkt}}
-	b, err := msg.Marshal(nil) // the kernel fills in the checksum
-	if err != nil {
-		return
-	}
+	b, _ := msg.Marshal(nil) // cannot fail for an ICMPv6 type and a body without extensions; the kernel fills in the checksum
 	if _, err := r.icmp.WriteTo(b, &net.IPAddr{IP: flow.from.Addr().AsSlice()}); err != nil {
 		debugf("[firewall] ICMPv6 error to %s: %v", flow.from.Addr(), err)
 		return
@@ -200,11 +197,7 @@ func nflogBind(group uint16, snaplen uint32) (*netlink.Conn, error) {
 	ae := netlink.NewAttributeEncoder()
 	ae.Bytes(nfulaCfgCmd, []byte{nfulnlCfgCmdBind})
 	ae.Bytes(nfulaCfgMode, append(binary.BigEndian.AppendUint32(nil, snaplen), nfulnlCopyPacket, 0))
-	attrs, err := ae.Encode()
-	if err != nil {
-		c.Close()
-		return nil, err
-	}
+	attrs, _ := ae.Encode() // fixed attributes, which always encode
 	_, err = c.Execute(netlink.Message{
 		Header: netlink.Header{Type: netlink.HeaderType(unix.NFNL_SUBSYS_ULOG<<nfnlSubsysShift | nfulnlMsgConfig), Flags: netlink.Request | netlink.Acknowledge},
 		Data:   append(nfgenmsg(unix.AF_UNSPEC, group), attrs...),
@@ -240,16 +233,43 @@ func conntrackHas(flow synFlow) (bool, error) {
 		})
 		return nil
 	})
-	attrs, err := ae.Encode()
-	if err != nil {
-		return false, err
-	}
-	_, err = c.Execute(netlink.Message{
+	attrs, _ := ae.Encode() // fixed attributes, which always encode
+	_, err = c.Send(netlink.Message{
 		Header: netlink.Header{Type: netlink.HeaderType(unix.NFNL_SUBSYS_CTNETLINK<<nfnlSubsysShift | ipctnlMsgCtGet), Flags: netlink.Request},
 		Data:   append(nfgenmsg(unix.AF_INET6, 0), attrs...),
 	})
-	if errors.Is(err, unix.ENOENT) {
-		return false, nil
+	if err != nil {
+		return false, err
 	}
-	return err == nil, err
+	// The kernel answers with a single message, the connection or an error. It marks the
+	// connection NLM_F_MULTI but sends no NLMSG_DONE after it, so Receive would wait for ever:
+	// read the one datagram straight from the socket.
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return false, err
+	}
+	buf := make([]byte, 4096)
+	var n int
+	var rerr error
+	if err := rc.Read(func(fd uintptr) bool {
+		n, _, rerr = unix.Recvfrom(int(fd), buf, 0)
+		return rerr != unix.EAGAIN
+	}); err != nil {
+		return false, err
+	}
+	if rerr != nil {
+		return false, rerr
+	}
+	if n < unix.NLMSG_HDRLEN+4 {
+		return false, errors.New("short conntrack reply")
+	}
+	if nativeEndian.Uint16(buf[4:6]) != unix.NLMSG_ERROR {
+		return true, nil
+	}
+	switch errno := unix.Errno(-int32(nativeEndian.Uint32(buf[unix.NLMSG_HDRLEN:]))); errno {
+	case unix.ENOENT:
+		return false, nil
+	default:
+		return false, errno
+	}
 }

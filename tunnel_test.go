@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv6"
 )
@@ -183,4 +186,186 @@ func TestAddr4Holder(t *testing.T) {
 	if got := addr4Holder("sixup-ipv4", netip.MustParseAddr("192.0.2.1")); got != "" {
 		t.Fatalf("no interface has that address, got %q", got)
 	}
+}
+
+// tunnelLW4o6 is a Lightweight 4over6 container: a binding with port parameters and a BR.
+func tunnelLW4o6() []byte {
+	bind := []byte{192, 0, 2, 1, 56, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x00} // 2001:db8:1::/56
+	bind = append(bind, tlv(94, []byte{1})...)                                 // not port parameters
+	bind = append(bind, tlv(93, []byte{1, 2, 3})...)                           // too short to be
+	bind = append(bind, tlv(93, []byte{6, 8, 0x34, 0x00})...)
+	br := netip.MustParseAddr("2001:db8::8").As16()
+	return append(tlv(92, bind), tlv(90, br[:])...)
+}
+
+// Each container is kept, and each one that fails is reported under its option number.
+func TestParseTunnelContainers(t *testing.T) {
+	msg, _ := dhcpv6.NewMessage()
+	msg.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionAFTRName, OptionData: []byte{4, 'a', 'f', 't', 'r', 0}})
+	msg.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionS46ContMapE, OptionData: sampleMAPE()})
+	msg.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionS46ContMapT, OptionData: sampleMAPE()})
+	msg.AddOption(&dhcpv6.OptionGeneric{OptionCode: dhcpv6.OptionS46ContLW, OptionData: tunnelLW4o6()})
+	tp := parseTunnel(msg)
+	if tp == nil || tp.AFTRName != "aftr" || tp.MAPE == nil || tp.MAPT == nil || tp.LW4o6 == nil || tp.Errors != nil || tp.RawMAPT == "" || tp.RawLW4o6 == "" {
+		t.Fatalf("%+v", tp)
+	}
+	b := tp.LW4o6.Bind
+	if b == nil || b.IPv4Addr != netip.MustParseAddr("192.0.2.1") || b.IPv6Prefix != netip.MustParsePrefix("2001:db8:1::/56") || *b.PSID != 0x34 || *b.PSIDLen != 8 || *b.PSIDOffset != 6 {
+		t.Fatalf("%+v", b)
+	}
+	if !tp.hasDelivered() {
+		t.Fatal("DHCPv6 delivered a tunnel")
+	}
+
+	msg, _ = dhcpv6.NewMessage()
+	for _, code := range []dhcpv6.OptionCode{dhcpv6.OptionS46ContMapE, dhcpv6.OptionS46ContMapT, dhcpv6.OptionS46ContLW} {
+		msg.AddOption(&dhcpv6.OptionGeneric{OptionCode: code, OptionData: []byte{0, 90, 0}})
+	}
+	if tp := parseTunnel(msg); tp == nil || len(tp.Errors) != 3 || tp.MAPE != nil || tp.MAPT != nil || tp.LW4o6 != nil {
+		t.Fatalf("%+v", tp)
+	}
+
+	msg, _ = dhcpv6.NewMessage()
+	if tp := parseTunnel(msg); tp != nil {
+		t.Fatalf("no tunnel options, no parameters: %+v", tp)
+	}
+}
+
+// Lengths come off the wire, so every one of them is checked.
+func TestParseS46Malformed(t *testing.T) {
+	v6 := []byte{0x20, 0x01, 0x0d, 0xb8, 0x00} // the first 40 bits of 2001:db8::
+	rule := func(tail ...byte) []byte {
+		return tlv(89, append([]byte{0, 16, 24, 192, 0, 2, 0, 40}, tail...))
+	}
+	for name, b := range map[string][]byte{
+		"too large":              make([]byte, 4097),
+		"truncated header":       {0, 90, 0},
+		"length out of bounds":   {0, 90, 0, 20, 1, 2},
+		"short rule":             tlv(89, []byte{1, 2, 3}),
+		"IPv4 prefix over 32":    tlv(89, []byte{0, 16, 33, 192, 0, 2, 0, 40, 0x20, 0x01, 0x0d, 0xb8, 0x00}),
+		"IPv6 prefix cut short":  rule(0x20),
+		"IPv6 prefix over 128":   tlv(89, append([]byte{0, 16, 24, 192, 0, 2, 0, 200}, make([]byte, 25)...)),
+		"short port params":      rule(append(append(append([]byte{}, v6...), tlv(1, nil)...), tlv(93, []byte{1, 2, 3})...)...),
+		"BR length":              tlv(90, []byte{192, 0, 2, 1}),
+		"empty DMR":              tlv(91, nil),
+		"long DMR":               tlv(91, make([]byte, 18)),
+		"DMR over 128":           tlv(91, []byte{200, 0x20}),
+		"short bind":             tlv(92, []byte{1, 2, 3}),
+		"bind prefix cut short":  tlv(92, []byte{192, 0, 2, 1, 56, 0x20}),
+		"bind prefix over 128":   tlv(92, append([]byte{192, 0, 2, 1, 200}, make([]byte, 25)...)),
+		"bind options cut short": tlv(92, []byte{192, 0, 2, 1, 0, 0, 93}),
+	} {
+		if c, err := parseS46Cont(b); err == nil {
+			t.Errorf("%s: parsed as %+v", name, c)
+		}
+	}
+
+	// Port parameters with a PSID length of 0, a DMR and an unknown sub-option are all fine.
+	c, err := parseS46Cont(slices.Concat(rule(append(append([]byte{}, v6...), tlv(93, []byte{0, 0, 0, 0})...)...),
+		tlv(91, []byte{64, 0x20, 0x01, 0x0d, 0xb8, 0, 0xff, 0, 0}), tlv(95, []byte{1})))
+	if err != nil || len(c.Rules) != 1 || *c.Rules[0].PSID != 0 || c.Rules[0].FMR || *c.DMR != netip.MustParsePrefix("2001:db8:ff::/64") {
+		t.Fatalf("%+v %v", c, err)
+	}
+
+	if _, err := parseFQDN(make([]byte, 256)); err == nil {
+		t.Fatal("a name over 255 bytes must fail")
+	}
+	if _, err := parseFQDN([]byte{0}); err == nil {
+		t.Fatal("the root alone is no AFTR name")
+	}
+}
+
+// The odhcp6c-style variables carry a DMR and a lw4o6 binding, and leave out what is unknown.
+func TestS46Env(t *testing.T) {
+	dmr := netip.MustParsePrefix("2001:db8:ff::/64")
+	c, err := parseS46Cont(tunnelLW4o6())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.DMR = &dmr
+	c.Rules = []S46Rule{{IPv4Prefix: netip.MustParsePrefix("192.0.2.0/24"), IPv6Prefix: netip.MustParsePrefix("2001:db8::/32")}}
+	want := "ealen=0,prefix4len=24,ipv4prefix=192.0.2.0,prefix6len=32,ipv6prefix=2001:db8::,br=2001:db8::8,dmr=2001:db8:ff::/64" +
+		" ipv4addr=192.0.2.1,prefix6len=56,ipv6prefix=2001:db8:1::,offset=6,psidlen=8,psid=52,br=2001:db8::8"
+	if got := s46Env(c); got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	bare := &S46Cont{Bind: &S46Bind{IPv4Addr: c.Bind.IPv4Addr, IPv6Prefix: c.Bind.IPv6Prefix}}
+	if got := s46Env(bare); got != "ipv4addr=192.0.2.1,prefix6len=56,ipv6prefix=2001:db8:1::" {
+		t.Fatal(got)
+	}
+}
+
+// Only the CE address the rule table computed has to be configured on the WAN.
+func TestTunnelEndpoints(t *testing.T) {
+	if e := (&TunnelParams{Captured: &tunnelGuess{Local: netip.MustParseAddr("2001:db8::1")}}).endpoints(); e != nil {
+		t.Fatalf("a captured local endpoint is already ours: %v", e)
+	}
+	ce := netip.MustParseAddr("2001:db8::c0a8:1:1234:0")
+	if e := (&TunnelParams{RuleMAPE: &mapeResult{CE: ce}}).endpoints(); len(e) != 1 || e[0] != ce {
+		t.Fatal(e)
+	}
+}
+
+// No name means no lookup, and a lookup that cannot finish returns nothing, a link-local server
+// included.
+func TestResolveAFTRFails(t *testing.T) {
+	if got := resolveAFTR(context.Background(), "", nil, "lo"); got != nil {
+		t.Fatal(got)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := resolveAFTR(ctx, "aftr.example", []netip.Addr{netip.MustParseAddr("fe80::53")}, "lo"); got != nil {
+		t.Fatal(got)
+	}
+}
+
+// tunnelAFTRSend hands the resolver a snapshot while draining what it stores meanwhile.
+func tunnelAFTRSend(ch chan<- Snapshot, st *Store, s Snapshot) {
+	for {
+		select {
+		case ch <- s:
+			return
+		case <-st.aftrIn:
+		}
+	}
+}
+
+// A name that does not resolve is retried; a new name is looked up at once and stored with its
+// addresses, after which nothing is retried.
+func TestAFTRResolverRetries(t *testing.T) {
+	r := &aftrResolver{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.run(ctx, nil)
+	if r.retry != 30*time.Second {
+		t.Fatalf("default retry %s", r.retry)
+	}
+
+	st := &Store{aftrIn: make(chan aftrUpdate)}
+	r = &aftrResolver{store: st, retry: 10 * time.Millisecond}
+	ctx, cancel = context.WithCancel(context.Background())
+	ch := make(chan Snapshot)
+	done := make(chan struct{})
+	go func() { r.run(ctx, ch); close(done) }()
+	bad := Snapshot{Tunnel: &TunnelParams{AFTRName: "bad!name.invalid"}}
+	tunnelAFTRSend(ch, st, Snapshot{})
+	tunnelAFTRSend(ch, st, bad)
+	for range 2 { // the first lookup and a retry
+		if u := <-st.aftrIn; u.name != "bad!name.invalid" || u.addrs != nil {
+			t.Fatalf("%+v", u)
+		}
+	}
+	tunnelAFTRSend(ch, st, bad) // the same name again starts nothing new
+	tunnelAFTRSend(ch, st, Snapshot{Tunnel: &TunnelParams{AFTRName: "localhost"}})
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		u := <-st.aftrIn
+		if u.name == "localhost" && slices.ContainsFunc(u.addrs, netip.Addr.IsLoopback) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("localhost never resolved: %+v", u)
+		}
+	}
+	cancel()
+	<-done
 }

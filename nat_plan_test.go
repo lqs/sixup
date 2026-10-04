@@ -80,3 +80,26 @@ func TestNATPlanDescribesItself(t *testing.T) {
 		t.Fatalf("a v6plus port set is 15 ranges of 16, got %d", n)
 	}
 }
+
+// The NAT and the filter take only the latest set: one still waiting when a newer one comes is
+// replaced, so the PCP server never blocks on a manager that has not caught up.
+func TestNATPlanHandsOverOnlyTheLatestSet(t *testing.T) {
+	m := &natManager{mapIn: make(chan []portMapping, 1)}
+	m.setMappings([]portMapping{{external: 1}})
+	m.setMappings([]portMapping{{external: 2}})
+	if got := <-m.mapIn; len(got) != 1 || got[0].external != 2 {
+		t.Fatalf("the unread mappings should give way to the latest, got %v", got)
+	}
+	f := &firewall{holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
+	f.setPinholes([]portMapping{{external: 1}})
+	f.setPinholes([]portMapping{{external: 2}})
+	if got := <-f.holeIn; len(got) != 1 || got[0].external != 2 {
+		t.Fatalf("the unread pinholes should give way to the latest, got %v", got)
+	}
+	latest := netip.MustParsePrefix("2001:db8:1:20::/60")
+	f.setDelegations([]netip.Prefix{netip.MustParsePrefix("2001:db8:1:10::/60")})
+	f.setDelegations([]netip.Prefix{latest})
+	if got := <-f.delegIn; len(got) != 1 || got[0] != latest {
+		t.Fatalf("the unread delegations should give way to the latest, got %v", got)
+	}
+}

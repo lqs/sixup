@@ -3,9 +3,12 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"log"
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
 
@@ -180,5 +183,49 @@ func TestJoolReplyError(t *testing.T) {
 	}
 	if joolReplyError([]byte("jool")) != nil {
 		t.Fatal("a reply too short for the header carries no report")
+	}
+	if err := joolReplyError(reply(joolFlagError, []byte{1, 0})); err == nil || !strings.Contains(err.Error(), "unreadable") {
+		t.Fatalf("a report that cannot be decoded is still a failure, got %v", err)
+	}
+}
+
+// Attributes that cannot be encoded leave the request empty rather than half built.
+func TestJoolEncodeAttrsFailure(t *testing.T) {
+	b := encodeAttrs(func(ae *netlink.AttributeEncoder) {
+		ae.Nested(jnlarOperand, func(*netlink.AttributeEncoder) error { return errors.New("broken") })
+	})
+	if b != nil {
+		t.Fatalf("want nothing, got %v", b)
+	}
+}
+
+// The same failure is logged once however many minutes it lasts, and again once it has cleared.
+func TestJoolReportLogsChangesOnly(t *testing.T) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
+	m := &joolManager{}
+	missing := errors.New("the jool module does not look loaded")
+	m.report(missing)
+	m.report(missing)
+	if n := bytes.Count(logged.Bytes(), []byte(missing.Error())); n != 1 {
+		t.Fatalf("the failure should be logged once, got %d times", n)
+	}
+	m.report(nil)
+	m.report(missing)
+	if n := bytes.Count(logged.Bytes(), []byte(missing.Error())); n != 2 {
+		t.Fatalf("a failure that comes back is logged again, got %d times", n)
+	}
+}
+
+// A descriptor that is no namespace is refused before fn runs.
+func TestJoolInNetnsRefusesABadDescriptor(t *testing.T) {
+	ran := false
+	err := inNetns(-1, func() error {
+		ran = true
+		return nil
+	})
+	if err == nil || ran {
+		t.Fatalf("want an error and fn not run, got %v, ran %v", err, ran)
 	}
 }
