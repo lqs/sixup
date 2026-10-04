@@ -26,6 +26,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with: { go-version-file: go.mod }
+      # The peers of the interoperability tests; dnsmasq-base and dhcpcd-base start no service.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends dnsmasq-base radvd kea-dhcp6-server dhcpcd-base
       - run: sudo -E env "PATH=$PATH" go test -tags integration -coverprofile=coverage.out ./...
       - uses: codecov/codecov-action@v7
         with:
