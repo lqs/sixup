@@ -54,7 +54,7 @@ var (
 	tGrace      = flag.Duration("tempaddr-drain-grace", 5*time.Second, "grace period between the two queries used to decide retirement")
 	stateDir    = flag.String("state-dir", "/var/lib/sixup", "directory where the DUID, the secret and the leases are persisted")
 	noSysctl    = flag.Bool("no-sysctl", false, "do not set forwarding / accept_ra and the other sysctls automatically, they are managed externally")
-	ulaSpec     = flag.String("lan-ula", "", "ULA prefix advertised together with the GUA: auto generates a random /48 and persists it, or give one such as fd12:3456:789a::/48, comma separated for several")
+	ulaSpec     = flag.String("ula", "", "ULA prefix of this site, either auto (a random /48, kept in -state-dir) or prefixes such as fd12:3456:789a::/48. Each LAN gets the /64 of its subnet id")
 	dryTO       = flag.Duration("dry-run-timeout", 0, "how long dry-run keeps running, 0 means until interrupted")
 	tunRules    = flag.Bool("tunnel-mape-rules", true, "when DHCPv6 sends no MAP-E option, infer the MAP-E parameters from the user prefix using the Japanese IPoE (v6plus / BIGLOBE / OCN / NURO) rule table")
 	tunDev      = flag.String("tunnel-dev", "sixup-ipv4", "name of the IPv4-in-IPv6 tunnel device to configure automatically: once the parameters are complete, create or modify the ip6tnl (equivalent to ip tunnel add/change), bring it up and assign the public IPv4; empty means no device. Not configured under dry-run")
@@ -168,7 +168,7 @@ var usageGroups = []struct {
 	title string
 	names []string
 }{
-	{"Interfaces and prefixes", []string{"wan", "lan", "lan-ula", "lan-iid", "lan-deprecate-hold"}},
+	{"Interfaces and prefixes", []string{"wan", "lan", "ula", "lan-iid", "lan-deprecate-hold"}},
 	{"WAN side: DHCPv6 client", []string{"dhcp6c-mode", "dhcp6c-pd-len", "dhcp6c-ia-na", "dhcp6c-pd-grace", "dhcp6c-release"}},
 	{"WAN side: upstream RA and addresses", []string{"wan-ra", "wan-slaac", "wan-iid", "wan-prefer", "wan-prefix", "wan-shared64"}},
 	{"LAN side: RA advertisement", []string{"ra-min", "ra-max", "ra-lifetime", "ra-slaac", "ra-onlink", "ra-mtu", "ra-dns", "ra-pref64", "ra-route"}},

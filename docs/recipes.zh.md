@@ -69,7 +69,7 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 线路只给一个 /64 时，只够一个网段，子网号 0 拿到它，其余网段没有全局前缀。这些网段之间需要互访，就给它们配一个 ULA。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1 -lan-ula auto
+sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1 -ula auto
 ```
 
 ## SoftBank 光
@@ -150,13 +150,13 @@ sudo sixup -wan eth0 -lan eth1 -tempaddr -tempaddr-regen 5m -tempaddr-max 32
 路由器上运行的解析器写作 `self`，也就是路由器在各个内网上的地址。用 ULA，运营商换前缀后这个地址仍然有效。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -lan-ula auto -lan-iid ::1 -ra-dns self
+sudo sixup -wan eth0 -lan eth1 -ula auto -lan-iid ::1 -ra-dns self
 ```
 
 内网中另一台主机上的解析器，直接写它的地址。出于同样的原因，给这台主机一个 ULA 中的固定地址。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -lan-ula fd12:3456:789a::/48 -ra-dns fd12:3456:789a::53
+sudo sixup -wan eth0 -lan eth1 -ula fd12:3456:789a::/48 -ra-dns fd12:3456:789a::53
 ```
 
 公共 DNS 同样直接写地址。

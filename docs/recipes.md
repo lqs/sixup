@@ -103,7 +103,7 @@ A line that gives only a /64 covers one segment. Subnet 0 gets it and the others
 prefix. Give the segments a ULA if they need to reach each other.
 
 ```sh
-sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1 -lan-ula auto
+sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1 -ula auto
 ```
 
 ## SoftBank Hikari
@@ -218,14 +218,14 @@ A resolver running on the router itself is `self`, the router's address on each 
 that address valid when the ISP renumbers.
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -lan-ula auto -lan-iid ::1 -ra-dns self
+sudo sixup -wan eth0 -lan eth1 -ula auto -lan-iid ::1 -ra-dns self
 ```
 
 A resolver on another host of the LAN is given by its address. Give that host a fixed address in
 the ULA, for the same reason.
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -lan-ula fd12:3456:789a::/48 -ra-dns fd12:3456:789a::53
+sudo sixup -wan eth0 -lan eth1 -ula fd12:3456:789a::/48 -ra-dns fd12:3456:789a::53
 ```
 
 Public resolvers are given by their addresses too.

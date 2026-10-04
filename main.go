@@ -147,7 +147,7 @@ func main() {
 	defer cancel()
 	ula, err := loadULA(*stateDir, *ulaSpec)
 	if err != nil {
-		fatalf("-lan-ula: %v", err)
+		fatalf("-ula: %v", err)
 	}
 	grace := *pdGrace
 	if !pdEnabled {

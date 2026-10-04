@@ -71,7 +71,7 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 /64 が一つだけの回線では、一つのセグメントにしか足りません。サブネット 0 がそれを使い、ほかのセグメントにはグローバルプレフィックスがありません。セグメント同士で通信する必要があれば、ULA を設定します。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1 -lan-ula auto
+sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1 -ula auto
 ```
 
 ## SoftBank 光
@@ -152,13 +152,13 @@ sudo sixup -wan eth0 -lan eth1 -tempaddr -tempaddr-regen 5m -tempaddr-max 32
 ルーター上で動くリゾルバは `self` と書き、各 LAN でのルーターのアドレスになります。ULA を使えば、プレフィックスが変わってもそのアドレスは有効なままです。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -lan-ula auto -lan-iid ::1 -ra-dns self
+sudo sixup -wan eth0 -lan eth1 -ula auto -lan-iid ::1 -ra-dns self
 ```
 
 LAN の別のホストで動くリゾルバは、そのアドレスで指定します。同じ理由で、そのホストには ULA の中の固定アドレスを与えてください。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -lan-ula fd12:3456:789a::/48 -ra-dns fd12:3456:789a::53
+sudo sixup -wan eth0 -lan eth1 -ula fd12:3456:789a::/48 -ra-dns fd12:3456:789a::53
 ```
 
 パブリック DNS もアドレスで指定します。

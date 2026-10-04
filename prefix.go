@@ -837,7 +837,7 @@ func (s *Store) warnShort(short []shortPrefix) {
 	}
 	for _, pf := range order {
 		warnf("[prefix-store] %s is too short to cover %s: that segment gets no address from it. "+
-			"A /64 holds one segment only; ask the ISP for a shorter delegation, or run -lan-ula for internal addresses",
+			"A /64 holds one segment only; ask the ISP for a shorter delegation, or run -ula for internal addresses",
 			pf, strings.Join(byPrefix[pf], " "))
 	}
 }

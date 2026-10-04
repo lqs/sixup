@@ -60,9 +60,9 @@ ULA, security (S) and the transition sections on top.
 | WPD-6 | Accept IA_PD in a reply without addresses (MUST) | 🟢 Done | `TestApplyReply`, `TestSixupBehindSixup` |
 | WPD-7 | Run no dynamic routing protocol on the WAN (MUST NOT) | 🟢 Done | None |
 | WPD-8 | Prefix Exclude, RFC 6603 (SHOULD) | 🟢 Done. The excluded part goes to no LAN and no downstream router, and a LAN on it is warned about | `TestParsePDExclude`, `TestStoreSkipsTheExcludedSubnet` |
-| ULA-1 | Be able to generate a ULA prefix (SHOULD) | 🟢 Done, `-lan-ula auto` | `TestStoreULA` |
+| ULA-1 | Be able to generate a ULA prefix (SHOULD) | 🟢 Done, `-ula auto` | `TestStoreULA` |
 | ULA-2 | Keep the ULA prefix across restarts and power loss (MUST, when generated) | 🟢 Done, stored in the state directory | `TestStoreULA` |
-| ULA-3 | The ULA prefix configurable (SHOULD) | 🟢 Done, `-lan-ula` takes a prefix | None |
+| ULA-3 | The ULA prefix configurable (SHOULD) | 🟢 Done, `-ula` takes a prefix | None |
 | ULA-4 | Act as a site border router for ULA by default (MUST) | 🟢 Done, in every `-unsolicited` mode. A ULA the upstream advertises is of the same site and crosses the WAN, as RFC 4193 section 4.3 allows; one of another site sent from the LAN is refused with ICMPv6 code 1. Other interfaces are checked after source NAT, so that the operator's NAT66 works, and a ULA left untranslated is dropped; what the operator's NAT forwards in, a published port or a reply, passes | `TestFirewallBorderAgainstKernel`, `TestFirewallSourceFilterOffAgainstKernel`, `TestFirewallOtherInterfaceAgainstKernel`, `TestRAClientReportsUpstreamULA` |
 | ULA-5 | No default router while only ULA prefixes are advertised (MUST NOT) | 🟢 Done | `TestRARouterLifetime` |
 | L-1 | Router behaviour of RFC 4861 (MUST) | 🟢 Done | None |
@@ -326,7 +326,7 @@ the Linux stack alone.
   downstream routers. When the prefix changes, clients with a Reconfigure key are told to renew.
 - **RFC 8987, routes for delegated prefixes.** A delegated prefix is routed to the router it went
   to for as long as the delegation lasts, as that RFC asks of a delegating relay.
-- **RFC 4193, ULA.** `-lan-ula auto` generates a random /48 and keeps it.
+- **RFC 4193, ULA.** `-ula auto` generates a random /48 and keeps it.
 - **RFC 7278, sharing a /64.** When the line gives only a /64, it moves to the LAN, and on an
   Ethernet WAN sixup answers Neighbor Discovery for the LAN hosts there, in the manner of the
   proxy of RFC 4389.

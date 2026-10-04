@@ -24,7 +24,7 @@ services:
       - eth1
       - -dhcp6s-mode
       - stateless
-      - -lan-ula
+      - -ula
       - auto
       - -state-dir
       - /var/lib/sixup

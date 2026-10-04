@@ -62,7 +62,7 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 ```
 
 Note: a single /64 covers one LAN segment. On a line that delegates nothing, subnet id 0
-gets the prefix and the other segments get none; give them a ULA with `-lan-ula auto` if
+gets the prefix and the other segments get none; give them a ULA with `-ula auto` if
 they need to reach each other.
 
 Note: on a MAP-E line the source port has to stay inside the port set the line was given,
@@ -90,7 +90,7 @@ For other needs, such as several LAN segments, fixed addresses, DNS servers or N
 |---|---|---|
 | `-wan` | | WAN interface. Required. If it is down at startup, sixup brings it up, as it does the `-lan` interfaces. |
 | `-lan` | | LAN interface, repeatable, as `name[:subnet-id]`. The subnet id, in decimal, picks which /64 of the delegated prefix goes to this interface; without one, the interfaces take 0, 1, 2 in the order given. Several LAN interfaces need a delegated prefix. |
-| `-lan-ula` | | ULA prefix advertised next to the global prefix. `auto` generates a random /48 and keeps it in the state directory; a prefix such as `fd12:3456:789a::/48` is used as given. Comma separated for several. |
+| `-ula` | | ULA prefix of this site. `auto` generates a random /48 and keeps it; prefixes such as `fd12:3456:789a::/48` are used as given, comma separated. Each LAN gets the /64 of its subnet id. |
 | `-lan-iid` | | Interface identifiers of the router's own addresses on each LAN prefix, comma separated, one address each, same syntax as `-wan-iid`. Empty means one RFC 7217 stable address. |
 | `-lan-deprecate-hold` | `1h30m` | How long a prefix the line took away is advertised with both lifetimes 0, so clients drop it (RFC 9096). The same goes after a restart for a prefix advertised before it that the line does not hand out again, since the LAN prefixes are recorded in the state directory. |
 
