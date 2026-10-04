@@ -213,7 +213,15 @@ func TestInteropKea(t *testing.T) {
 	"loggers": [{"name": "kea-dhcp6", "output_options": [{"output": "stderr"}], "severity": "INFO"}]
 }}
 `)
-	peerRun(t, ns, "env", "KEA_PIDFILE_DIR="+dir, "KEA_LOCKFILE_DIR="+dir, "kea-dhcp6", "-c", conf)
+	// Ubuntu confines /usr/sbin/kea-dhcp6 with AppArmor, which keeps it out of the test's
+	// directories; the profile is tied to that path, so a copy runs unconfined.
+	src, _ := exec.LookPath("kea-dhcp6")
+	bin, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kea := writeFile(t, "kea-dhcp6", string(bin))
+	peerRun(t, ns, "env", "KEA_PIDFILE_DIR="+dir, "KEA_LOCKFILE_DIR="+dir, kea, "-c", conf)
 	r := dryRunUntil(t, func(r dryReportOf) bool {
 		return len(r.WAN) > 0 && r.WANAddr != "invalid IP" && len(r.DNS) > 0
 	}, "-dhcp6c-mode", "on", "-wan-ra=false", "-dhcp6c-pd-len", "56")
