@@ -516,7 +516,7 @@ func strayAddrs(list []ifAddr, want map[netip.Addr]Prefix, managed []Prefix, tem
 outer:
 	for _, ia := range list {
 		a := ia.Addr
-		if a.IsLinkLocalUnicast() || !a.Is6() {
+		if a.IsLinkLocalUnicast() || !a.Is6() || handConfigured(ia) {
 			continue
 		}
 		if _, ok := want[a]; ok {

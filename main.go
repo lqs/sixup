@@ -66,16 +66,50 @@ func main() {
 		lans = multiFlag{"lan"}
 	}
 	lanDefs := parseLans(lans)
-	static, err := parseWANPrefix(*wanPrefix)
-	if err != nil {
+	// The addresses configured on the WAN by hand are left as they are, and the first one is the
+	// WAN address: no SLAAC or IA_NA address goes beside them
+	// The WAN may not exist yet, as ppp0 before it dials; then nothing is configured on it
+	configured, err := wanConfigured(*wan)
+	if err != nil && *wanPrefix == "auto" {
+		fatalf("-wan-prefix auto: %v", err)
+	}
+	var wanAddr netip.Addr
+	if len(configured) > 0 {
+		wanAddr = configured[0].Addr()
+		infof("[sixup] %s has %v configured by hand, using %s as the WAN address", *wan, configured, wanAddr)
+	}
+	slaac, wantNA := *wanSLAAC && !wanAddr.IsValid(), *wantNA && !wanAddr.IsValid()
+	var onLink []netip.Prefix
+	if *wanPrefix == "auto" {
+		if onLink = onLink64s(configured); len(onLink) == 0 {
+			fatalf("-wan-prefix auto: %s has no global /64 address configured by hand", *wan)
+		}
+	} else if onLink, err = parseWANPrefix(*wanPrefix); err != nil {
 		fatalf("-wan-prefix: %v", err)
+	}
+	routed, err := parsePrefixes(*routedPrefix)
+	if err != nil {
+		fatalf("-routed-prefix: %v", err)
+	}
+	static := slices.Concat(onLink, routed)
+	// A /64 configured by hand stays on the WAN with its on-link route, so the LAN cannot take the
+	// same /64 as well: one of -wan-prefix, or the upstream RA's when no static prefix stands before it
+	for _, p := range onLink64s(configured) {
+		if !slices.Contains(onLink, p) && (len(static) > 0 || !*upRA) {
+			continue
+		}
+		if !flagGiven("wan-shared64") {
+			*shared64 = "wan"
+		} else if *shared64 == "lan" {
+			fatalf("-wan-shared64 lan: %s holds an address configured by hand on %s, so it stays on the WAN and cannot go on the LAN as well; use wan or split", p, *wan)
+		}
 	}
 	// A prefix learned from RA is only a /64, which cannot be split across LANs.
 	mode := clientMode(*dhcpMode)
 	pdEnabled := mode != clientOff && *pdLen > 0 && len(static) == 0
-	splittable := slices.ContainsFunc(static, func(p netip.Prefix) bool { return p.Bits() < 64 })
+	splittable := slices.ContainsFunc(routed, func(p netip.Prefix) bool { return p.Bits() < 64 })
 	if len(lanDefs) > 1 && !splittable && (!pdEnabled || *prefer == "ra") {
-		fatalf("multiple LAN interfaces need a prefix shorter than /64; a /64 cannot be split, so enable PD and set -wan-prefer pd, or give a shorter -wan-prefix")
+		fatalf("multiple LAN interfaces need a prefix shorter than /64; a /64 cannot be split, so enable PD and set -wan-prefer pd, or give a shorter -routed-prefix")
 	}
 	srv := serverMode(*srvMode)
 	if srv != serverOff && srv != serverStateless && srv != serverStateful {
@@ -132,7 +166,7 @@ func main() {
 		fatalf("-ra-min must be at least 3 seconds and no larger than -ra-max")
 	}
 	if mode == clientOff && !*upRA && len(static) == 0 {
-		fatalf("at least one of the DHCPv6 client, the upstream RA and -wan-prefix must be enabled")
+		fatalf("at least one of the DHCPv6 client, the upstream RA, -wan-prefix and -routed-prefix must be enabled")
 	}
 	iids, err := parseIIDPolicies(*wanIID)
 	if err != nil {
@@ -154,8 +188,8 @@ func main() {
 		grace = 0
 	}
 	store := newStore(prefixSource(*prefer), lanDefs, *hold, ula, *tunRules, grace, *settle, filepath.Join(*stateDir, "lan-prefixes.json"))
-	if len(static) > 0 {
-		go keepStatic(ctx, store, static, *wanSLAAC)
+	if len(static) > 0 || wanAddr.IsValid() {
+		go keepStatic(ctx, store, onLink, routed, slaac, wanAddr)
 	}
 	if !dryRun {
 		names := []string{*wan}
@@ -183,7 +217,7 @@ func main() {
 	pkts := newPacketHub(ctx, *wan)
 
 	if dryRun {
-		runDry(ctx, store, hub, pkts, dryOpts{wan: *wan, dhcpMode: mode, stateDir: *stateDir, tunDev: *tunDev, upRA: *upRA, wantNA: *wantNA, infoOnly: len(static) > 0, pdLen: *pdLen, tunMTU: *tunMTU, metric4: uint32(*tunMetric4), iid: iids[0], timeout: *dryTO})
+		runDry(ctx, store, hub, pkts, dryOpts{wan: *wan, dhcpMode: mode, stateDir: *stateDir, tunDev: *tunDev, upRA: *upRA, wantNA: wantNA, infoOnly: len(static) > 0, pdLen: *pdLen, tunMTU: *tunMTU, metric4: uint32(*tunMetric4), iid: iids[0], timeout: *dryTO})
 		return
 	}
 
@@ -193,18 +227,18 @@ func main() {
 	secret := loadSecret(*stateDir)
 	var dhcp *dhcpClient
 	if mode != clientOff {
-		dhcp = newDHCPClient(*wan, store, *stateDir, *pdLen, *wantNA)
+		dhcp = newDHCPClient(*wan, store, *stateDir, *pdLen, wantNA)
 		dhcp.link = hub.Subscribe(*wan)
 		dhcp.releaseOn = *dhcpRel
 		// With the prefix given, the client asks only for DNS and the like, as the AFTR name
 		dhcp.infoOnly = len(static) > 0
 		go dhcp.run(ctx, mode == clientAuto && *upRA)
 	}
-	if pdEnabled || splittable {
+	if pdEnabled || len(routed) > 0 {
 		go holdDelegations(ctx, store.Subscribe())
 	}
 	if *upRA {
-		go (&raClient{ifname: *wan, store: store, dhcp: dhcp, slaac: *wanSLAAC, iid: iids[0], layout: layout, secret: secret}).run(ctx, hub)
+		go (&raClient{ifname: *wan, store: store, dhcp: dhcp, slaac: slaac, iid: iids[0], layout: layout, secret: secret}).run(ctx, hub)
 	} else {
 		// Without RA there is no source for a default route, so point it at the device on a point-to-point link.
 		go hub.supervise(ctx, *wan, func(cctx context.Context, ifi *net.Interface) {

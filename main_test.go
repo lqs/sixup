@@ -105,7 +105,10 @@ func TestMainRejectsBadOptions(t *testing.T) {
 		{nil, "-wan is required"},
 		{[]string{"-wan", "x"}, daemon},
 		{[]string{"-wan", "x", "-log-level", "loud"}, "-log-level must be"},
-		{[]string{"-dry-run", "-wan", "x", "-wan-prefix", "fd00::/48"}, "-wan-prefix:"},
+		{[]string{"-dry-run", "-wan", "x", "-wan-prefix", "fd00::/64"}, "-wan-prefix:"},
+		{[]string{"-dry-run", "-wan", "x", "-wan-prefix", "2001:db8::/48"}, "-routed-prefix"},
+		{[]string{"-dry-run", "-wan", "x", "-routed-prefix", "fd00::/48"}, "-routed-prefix:"},
+		{[]string{"-dry-run", "-wan", "x", "-wan-prefix", "auto"}, "-wan-prefix auto:"},
 		{[]string{"-dry-run", "-wan", "x", "-lan", "a", "-lan", "b", "-wan-prefer", "ra"}, "multiple LAN interfaces"},
 		{[]string{"-dry-run", "-wan", "x", "-dhcp6s-mode", "on"}, "-dhcp6s-mode must be"},
 		{[]string{"-dry-run", "-wan", "x", "-tunnel-nat", "on"}, "-tunnel-nat must be"},
@@ -135,7 +138,7 @@ func TestMainRejectsBadOptions(t *testing.T) {
 // A dry run with a static prefix needs no upstream: it reports the prefix and, at the deadline, the counters.
 func TestMainDryRunDeadline(t *testing.T) {
 	stdout, stderr, code := runMain(t, "-dry-run", "-wan", "sixup-none0", "-dry-run-timeout", "500ms", "-settle", "10ms", "-state-dir", t.TempDir(),
-		"-dhcp6c-mode", "off", "-wan-ra=false", "-wan-prefix", "2001:db8:1::/48", "-ula", "auto", "-nat64", "jool", "-ra-slaac=false")
+		"-dhcp6c-mode", "off", "-wan-ra=false", "-routed-prefix", "2001:db8:1::/48", "-ula", "auto", "-nat64", "jool", "-ra-slaac=false")
 	if code != 0 {
 		t.Fatalf("exit %d:\n%s", code, stderr)
 	}

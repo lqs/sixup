@@ -250,7 +250,7 @@ func TestInteropDhcpcd(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd, _, stderr := mainCmd(t, "-wan", "wan-test0", "-lan", "lan-test0", "-state-dir", t.TempDir(), "-settle", "10ms",
-		"-dhcp6c-mode", "off", "-wan-ra=false", "-wan-prefix", "2001:db8:1::/48", "-tunnel-dev", "",
+		"-dhcp6c-mode", "off", "-wan-ra=false", "-routed-prefix", "2001:db8:1::/48", "-tunnel-dev", "",
 		"-dhcp6s-mode", "stateful", "-dhcp6s-pd-len", "60", "-ra-dns", "self", "-ra-min", "3s", "-ra-max", "4s")
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

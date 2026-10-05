@@ -8,9 +8,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -26,13 +28,13 @@ const (
 	sourcePD  prefixSource = "pd"  // DHCPv6 prefix delegation
 	sourceRA  prefixSource = "ra"  // an on-link prefix from the upstream Router Advertisement
 	sourceULA prefixSource = "ula" // generated here, never routed by the ISP
-	// -wan-prefix, for an upstream whose prefix neither RA nor DHCPv6-PD tells. Its prefixes take
-	// the source they stand for: a /64 that of an RA, shared with the LAN; a shorter one that of a
-	// delegation
+	// -wan-prefix and -routed-prefix, for an upstream whose prefix neither RA nor DHCPv6-PD
+	// tells, and the WAN address configured by hand. Its prefixes take the source they stand for:
+	// an on-link /64 that of an RA, shared with the LAN; a routed one that of a delegation
 	sourceStatic prefixSource = "static"
 )
 
-// staticLifetime is what the prefixes of -wan-prefix are given, renewed well before it runs out.
+// staticLifetime is what the prefixes of -wan-prefix and -routed-prefix are given, renewed well before it runs out.
 const staticLifetime = 7 * 24 * time.Hour
 
 // changeKind is the strongest thing that happened to the prefix set, which decides whether
@@ -442,6 +444,10 @@ func (s *Store) recompute(now time.Time) {
 				next.WANMTU = o.MTU
 			}
 		}
+	}
+	// the WAN address configured by hand is the one in use, whatever else IA_NA or SLAAC offers
+	if a := s.sources[sourceStatic].WANAddr; a.IsValid() {
+		next.WANAddr = a
 	}
 	if pd, ok := s.sources[sourcePD]; ok {
 		next.Tunnel = pd.Tunnel
@@ -1041,15 +1047,26 @@ func loadULA(stateDir, spec string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
-// parseWANPrefix reads -wan-prefix: comma-separated global prefixes of /64 or shorter.
+// parseWANPrefix reads -wan-prefix: comma-separated on-link /64s of the WAN link.
 func parseWANPrefix(spec string) ([]netip.Prefix, error) {
+	ps, err := parsePrefixes(spec)
+	for _, p := range ps {
+		if p.Bits() != 64 {
+			return nil, fmt.Errorf("%s is not a /64; a prefix routed to this router goes in -routed-prefix", p)
+		}
+	}
+	return ps, err
+}
+
+// parsePrefixes reads a comma-separated list of global IPv6 prefixes of /64 or shorter.
+func parsePrefixes(spec string) ([]netip.Prefix, error) {
 	var out []netip.Prefix
 	for f := range strings.SplitSeq(spec, ",") {
 		if f = strings.TrimSpace(f); f == "" {
 			continue
 		}
 		pf, err := netip.ParsePrefix(f)
-		if err != nil || !pf.Addr().Is6() || pf.Addr().Is4In6() || pf.Bits() > 64 || !pf.Addr().IsGlobalUnicast() || netip.MustParsePrefix("fc00::/7").Contains(pf.Addr()) {
+		if err != nil || pf.Bits() > 64 || !globalAddr(pf.Addr()) {
 			return nil, fmt.Errorf("%q is not a global IPv6 prefix of /64 or shorter", f)
 		}
 		out = append(out, pf.Masked())
@@ -1057,20 +1074,79 @@ func parseWANPrefix(spec string) ([]netip.Prefix, error) {
 	return out, nil
 }
 
-// keepStatic hands the store the prefixes of -wan-prefix, again every day so that they never run
-// out: a /64 as an RA's on-link prefix, which the LAN shares (RFC 7278), with SLAAC on the WAN
-// as slaac says; a shorter one as a delegation.
-func keepStatic(ctx context.Context, store *Store, ps []netip.Prefix, slaac bool) {
+func globalAddr(a netip.Addr) bool {
+	return a.Is6() && !a.Is4In6() && a.IsGlobalUnicast() && !netip.MustParsePrefix("fc00::/7").Contains(a)
+}
+
+// wanConfigured lists the global addresses configured on the WAN interface by hand, each with its
+// prefix length.
+func wanConfigured(name string) ([]netip.Prefix, error) {
+	ifi, err := net.InterfaceByName(name)
+	if err != nil {
+		return nil, err
+	}
+	// a netlink failure is retried, as everywhere else; without netlink there is nothing to wait for
+	for warned := false; ; warned = true {
+		list, err := addrList(ifi.Index)
+		if err == nil {
+			return configuredAddrs(list), nil
+		}
+		if runtime.GOOS != "linux" {
+			return nil, err
+		}
+		if !warned {
+			warnf("[sixup] listing the addresses of %s failed: %v, retrying every 2s", name, err)
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// handConfigured reports whether an address was configured by hand: both its lifetimes are
+// infinite. sixup never gives an address an infinite preferred lifetime, so none of its own,
+// including those left by an earlier run, is taken for one.
+func handConfigured(ia ifAddr) bool {
+	return ia.Valid == infiniteLft && ia.Preferred == infiniteLft
+}
+
+// configuredAddrs picks the global addresses configured by hand.
+func configuredAddrs(list []ifAddr) []netip.Prefix {
+	var out []netip.Prefix
+	for _, ia := range list {
+		if handConfigured(ia) && globalAddr(ia.Addr) {
+			out = append(out, netip.PrefixFrom(ia.Addr, ia.PrefixLen))
+		}
+	}
+	return out
+}
+
+// onLink64s returns the /64s of the addresses, each once.
+func onLink64s(addrs []netip.Prefix) []netip.Prefix {
+	var out []netip.Prefix
+	for _, a := range addrs {
+		if p := a.Masked(); p.Bits() == 64 && !slices.Contains(out, p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// keepStatic hands the store the prefixes of -wan-prefix and -routed-prefix, again every day so
+// that they never run out: an on-link /64 as an RA's prefix, which the LAN shares (RFC 7278), with
+// SLAAC on the WAN as slaac says; a routed one as a delegation. wanAddr, when valid, is the WAN
+// address configured by hand, which stands before any other.
+func keepStatic(ctx context.Context, store *Store, onLink, routed []netip.Prefix, slaac bool, wanAddr netip.Addr) {
 	for {
 		now := time.Now()
-		var upd SourceUpdate
-		for _, p := range ps {
-			src := sourcePD
-			if p.Bits() == 64 {
-				src = sourceRA
-			}
+		upd := SourceUpdate{WANAddr: wanAddr}
+		add := func(p netip.Prefix, src prefixSource) {
 			upd.Prefixes = append(upd.Prefixes, Prefix{Prefix: p, Preferred: now.Add(staticLifetime), Valid: now.Add(staticLifetime),
 				Source: src, SLAAC: slaac && src == sourceRA})
+		}
+		for _, p := range onLink {
+			add(p, sourceRA)
+		}
+		for _, p := range routed {
+			add(p, sourcePD)
 		}
 		store.Set(sourceStatic, upd)
 		select {

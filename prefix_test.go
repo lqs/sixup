@@ -642,18 +642,69 @@ func TestStoreSkipsTheExcludedSubnet(t *testing.T) {
 }
 
 func TestParseWANPrefix(t *testing.T) {
-	got, err := parseWANPrefix("2001:db8:1:2::/64, 2001:db8:100::/56")
+	got, err := parseWANPrefix("2001:db8:1:2::/64, 2001:db8:1:3::/64")
+	if err != nil || !slices.Equal(got, []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2::/64"), netip.MustParsePrefix("2001:db8:1:3::/64")}) {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	if _, err := parseWANPrefix("2001:db8:100::/56"); err == nil {
+		t.Error("an on-link prefix is a /64")
+	}
+	got, err = parsePrefixes("2001:db8:1:2::/64, 2001:db8:100::/56")
 	if err != nil || !slices.Equal(got, []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2::/64"), netip.MustParsePrefix("2001:db8:100::/56")}) {
 		t.Fatalf("got %v, %v", got, err)
 	}
 	for _, bad := range []string{"2001:db8::/96", "fd00::/48", "fe80::/64", "192.0.2.0/24", "nonsense"} {
-		if _, err := parseWANPrefix(bad); err == nil {
+		if _, err := parsePrefixes(bad); err == nil {
 			t.Errorf("%q must be refused", bad)
 		}
 	}
 }
 
-// A /64 given with -wan-prefix is the WAN link's, shared with the LAN (RFC 7278); a shorter one is
+// The addresses configured by hand are those with both lifetimes infinite, of any length; one with
+// a finite preferred lifetime, as sixup gives each of its own, is passed over.
+func TestConfiguredAddrs(t *testing.T) {
+	const inf = infiniteLft
+	list := []ifAddr{
+		{Addr: netip.MustParseAddr("fe80::1"), PrefixLen: 64, Preferred: inf, Valid: inf},
+		{Addr: netip.MustParseAddr("2001:db8:9::5"), PrefixLen: 64, Preferred: 3600, Valid: 7200},
+		{Addr: netip.MustParseAddr("2001:db8:1:2::5"), PrefixLen: 64, Flags: ifaFDeprecated, Valid: inf},
+		{Addr: netip.MustParseAddr("2001:db8:1:2::6"), PrefixLen: 64, Preferred: 3600, Valid: inf},
+		{Addr: netip.MustParseAddr("fd00::1"), PrefixLen: 64, Preferred: inf, Valid: inf},
+		{Addr: netip.MustParseAddr("2:3:4:5:6:7:8:2"), PrefixLen: 126, Preferred: inf, Valid: inf},
+		{Addr: netip.MustParseAddr("2001:db8:1:2::1"), PrefixLen: 64, Preferred: inf, Valid: inf},
+		{Addr: netip.MustParseAddr("2001:db8:1:2::2"), PrefixLen: 64, Preferred: inf, Valid: inf},
+	}
+	got := configuredAddrs(list)
+	want := []netip.Prefix{netip.MustParsePrefix("2:3:4:5:6:7:8:2/126"), netip.MustParsePrefix("2001:db8:1:2::1/64"), netip.MustParsePrefix("2001:db8:1:2::2/64")}
+	if !slices.Equal(got, want) {
+		t.Fatalf("got %v", got)
+	}
+	if got := onLink64s(got); !slices.Equal(got, []netip.Prefix{netip.MustParsePrefix("2001:db8:1:2::/64")}) {
+		t.Fatalf("on-link /64s: %v", got)
+	}
+}
+
+// With the WAN address configured by hand, sixup adds none of its own to the WAN, and reports
+// that one.
+func TestStoreConfiguredWAN(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	ch := st.Subscribe()
+	recv(t, ch)
+	vps := netip.MustParsePrefix("2001:db8:1:2::/64")
+	wanAddr := netip.MustParseAddr("2001:db8:1:2::1")
+	go keepStatic(ctx, st, []netip.Prefix{vps}, nil, false, wanAddr)
+	s := recv(t, ch)
+	if len(s.LAN["lan0"]) != 1 || !s.sharedWith(vps) || len(s.wanStatic()) != 0 || len(s.wanTemp()) != 0 || s.WANAddr != wanAddr {
+		t.Fatalf("the WAN keeps only the address configured by hand: %+v", s)
+	}
+	if shared64Layout("wan").plen(sideLAN, true) != 128 {
+		t.Fatal("the LAN takes a /128 in the shared /64")
+	}
+}
+
+// A /64 given with -wan-prefix is the WAN link's, shared with the LAN (RFC 7278); one of -routed-prefix is
 // split across the LANs as a delegation; and either stands before what DHCPv6-PD says.
 func TestStoreStaticPrefix(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -662,7 +713,7 @@ func TestStoreStaticPrefix(t *testing.T) {
 	ch := st.Subscribe()
 	recv(t, ch)
 	vps := netip.MustParsePrefix("2001:db8:1:2::/64")
-	go keepStatic(ctx, st, []netip.Prefix{vps}, true)
+	go keepStatic(ctx, st, []netip.Prefix{vps}, nil, true, netip.Addr{})
 	s := recv(t, ch)
 	if len(s.LAN["lan0"]) != 1 || s.LAN["lan0"][0].Prefix != vps || !s.sharedWith(vps) || len(s.wanSLAAC()) != 1 {
 		t.Fatalf("a /64 is the WAN link's, shared with the LAN: %+v", s)
@@ -680,7 +731,7 @@ func TestStoreStaticPrefix(t *testing.T) {
 	st2 := newStore("pd", []lanDef{{"lan0", 0}, {"lan1", 1}}, time.Second, nil, false, 0, 0, "")
 	ch2 := st2.Subscribe()
 	recv(t, ch2)
-	go keepStatic(ctx, st2, []netip.Prefix{netip.MustParsePrefix("2001:db8:100::/56")}, true)
+	go keepStatic(ctx, st2, nil, []netip.Prefix{netip.MustParsePrefix("2001:db8:100::/56")}, true, netip.Addr{})
 	s = recv(t, ch2)
 	if len(s.LAN["lan1"]) != 1 || s.LAN["lan1"][0].Prefix != netip.MustParsePrefix("2001:db8:100:1::/64") || s.WAN[0].Source != sourcePD {
 		t.Fatalf("a /56 is split as a delegation: %+v", s)
@@ -872,7 +923,7 @@ func TestLoadULASpecs(t *testing.T) {
 	if _, err := loadULA(file, "auto"); err == nil {
 		t.Fatal("a state directory that is a file must fail")
 	}
-	if got, err := parseWANPrefix("2001:db8:1::/48,,"); err != nil || len(got) != 1 {
+	if got, err := parsePrefixes("2001:db8:1::/48,,"); err != nil || len(got) != 1 {
 		t.Fatalf("empty fields are skipped: %v %v", got, err)
 	}
 }

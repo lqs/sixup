@@ -19,7 +19,7 @@ both.
 | [Reaching LAN hosts from the Internet](#reaching-lan-hosts-from-the-internet) | `-unsolicited allow`, or `deny` to close it further |
 | [Several LAN segments](#several-lan-segments) | `-lan eth1:0 -lan eth2:1` |
 | [SoftBank Hikari](#softbank-hikari) | `-wan-iid ::1111:1111:1111:1111` |
-| [A prefix nobody announces](#a-prefix-nobody-announces) | `-wan-prefix 2001:db8:100::/48` |
+| [A prefix nobody announces](#a-prefix-nobody-announces) | `-routed-prefix 2001:db8:100::/48` |
 | [Your own firewall rules for the tunnel](#your-own-firewall-rules-for-the-tunnel) | `-tunnel-nat off` |
 | [Fixed addresses for the router](#fixed-addresses-for-the-router) | `-wan-iid ::1 -lan-iid ::1` |
 | [Rotating addresses for the router's own traffic](#rotating-addresses-for-the-routers-own-traffic) | `-tempaddr` |
@@ -125,22 +125,30 @@ sixup then takes the place of the BB Unit.
 ## A prefix nobody announces
 
 Some upstreams route a prefix to the router without saying so by RA or DHCPv6-PD, such as a
-static prefix an ISP routes to the line by contract, or the single /64 of a VPS. Give it by hand.
+dedicated line or a data center's transit, which routes a static prefix to the WAN address.
+Configure the WAN address and the default route in the system's network configuration first, such
+as 2001:db8:ffff::2/126 with the gateway 2001:db8:ffff::1, then give the prefix. The provider
+gives these values when it hands the line over:
 
 ```sh
-sudo sixup -wan eth0 -wan-prefix 2001:db8:100::/48 -lan eth1
+sudo sixup -wan eth0 -routed-prefix 2001:db8:100::/48 -lan eth1
 ```
 
-The DHCPv6 client then asks only for DNS servers and the like. Without an RA on the line, the
-default route is set up otherwise, as a VPS usually has it, and the DNS servers are given with
-`-ra-dns` if DHCPv6 gives none.
+sixup leaves the address on the WAN as it is and adds none of its own there. The prefix is split
+across the LAN segments and delegated to downstream routers, as a delegation is. The DHCPv6
+client then asks only for DNS servers and the like; if it gets none, give them with `-ra-dns`.
 
-A /64, such as that of a VPS, is shared with the LAN as when an RA gives one. The router keeps a
-/128 of it on the WAN and answers Neighbor Discovery there for the LAN hosts. A shorter prefix is split across the LAN
-segments and delegated to downstream routers, as a delegation is.
+A /64 that is on the WAN link rather than routed, such as that of a VPS, goes in `-wan-prefix`
+instead and is shared with the LAN as when an RA gives one. When the address in it is already
+configured by hand, `-wan-prefix auto` reads the /64 from it; the /64 then stays on the WAN, and
+the router takes a /128 of it on the LAN and answers Neighbor Discovery on the WAN for the LAN
+hosts.
+
+An upstream that puts a prefix shorter than /64 on the link is not supported: ask it to route the
+prefix to the WAN address instead.
 
 To give the /64 of a VPS to a LAN at home through WireGuard, which carries no Neighbor Discovery,
-put a GRETAP tunnel over it, run this command on the VPS with the GRETAP device as the LAN, and
+put a GRETAP tunnel over it, run sixup on the VPS with `-wan-prefix` and the GRETAP device as the LAN, and
 run sixup at home with that device as the WAN.
 
 ## Your own firewall rules for the tunnel

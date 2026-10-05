@@ -106,13 +106,16 @@ For other needs, such as several LAN segments, fixed addresses, DNS servers or N
 
 ### WAN side: upstream RA and addresses
 
+Global addresses configured on the WAN by hand, such as the /126 of a point-to-point link, are left as they are, and the first one is the WAN address; sixup then adds no SLAAC or IA_NA address beside them. An address counts as configured by hand when both its lifetimes are infinite. When it is in a /64 the LAN would share, that /64 stays on the WAN: `-wan-shared64` defaults to `wan`, and `lan` is refused.
+
 | Option | Default | Description |
 |---|---|---|
 | `-wan-ra` | `true` | Listen to upstream RAs as a second prefix source, and maintain the default route from them. |
 | `-wan-slaac` | `true` | Configure SLAAC addresses on the WAN interface for RA prefixes with the A flag set. |
 | `-wan-iid` | | Interface identifiers of the static SLAAC addresses on the WAN interface, comma separated, one address each. Each is `stable` or empty for an RFC 7217 stable address, `eui64` to derive it from the MAC address, or a fixed suffix such as `::1` or `::1111:2222:3333:4444`. The first one is reported as the WAN address. |
 | `-wan-prefer` | `pd` | Which prefix wins when both a delegated prefix and an RA prefix are available: `pd` or `ra`. |
-| `-wan-prefix` | (empty) | Prefixes the upstream routes to this router when neither RA nor DHCPv6-PD tells it, such as a static prefix the ISP routes to the line by contract, or the /64 of a VPS, comma-separated; the DHCPv6 client then asks only for DNS and the like. A /64 is taken as the WAN link's on-link prefix and shared with the LAN (RFC 7278); a shorter one as a delegation. |
+| `-wan-prefix` | (empty) | On-link /64s of the WAN link that neither RA nor DHCPv6-PD tells, such as that of a VPS, comma-separated; shared with the LAN (RFC 7278). `auto` takes those of the addresses configured on the WAN by hand. |
+| `-routed-prefix` | (empty) | Prefixes of /64 or shorter the upstream routes to this router without RA or DHCPv6-PD telling it, such as that of a dedicated line or a data center's transit, comma-separated; split across the LANs as a delegation. |
 | `-wan-shared64` | `lan` | Layout when the upstream gives only one /64. `lan`: the /64 goes to the LAN, and hosts on the WAN link get /128 routes (RFC 7278). `wan`: the /64 stays on the WAN, and each LAN host gets a /128 route. `split`: /128 routes on both sides; the router itself cannot reach a host it has not learned yet. The /128 routes are added as the NDP proxy finds the hosts. |
 
 ### LAN side: RA advertisement

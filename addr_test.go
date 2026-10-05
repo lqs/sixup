@@ -18,13 +18,14 @@ func TestStrayAddrs(t *testing.T) {
 	temps := []*tempAddr{{addr: netip.MustParseAddr("2001:db8:1::aa")}}
 	endpoints := map[netip.Addr]string{netip.MustParseAddr("2001:db8:1::1111:1111:1111:1111"): "ok"}
 	list := []ifAddr{
-		{Addr: netip.MustParseAddr("2001:db8:1::1"), PrefixLen: 64},                    // computed this round
-		{Addr: netip.MustParseAddr("2001:db8:1::aa"), PrefixLen: 64},                   // already in the temp address table
-		{Addr: netip.MustParseAddr("2001:db8:1::1111:1111:1111:1111"), PrefixLen: 128}, // tunnel endpoint
-		{Addr: netip.MustParseAddr("2001:db8:1::dead"), PrefixLen: 64},                 // stray, must be taken over
-		{Addr: netip.MustParseAddr("2001:db8:2::1"), PrefixLen: 64},                    // outside managed prefixes
-		{Addr: netip.MustParseAddr("fe80::1"), PrefixLen: 64},                          // link-local
-		{Addr: netip.MustParseAddr("fd00::1"), PrefixLen: 64},                          // different prefix
+		{Addr: netip.MustParseAddr("2001:db8:1::1"), PrefixLen: 64},                                             // computed this round
+		{Addr: netip.MustParseAddr("2001:db8:1::aa"), PrefixLen: 64},                                            // already in the temp address table
+		{Addr: netip.MustParseAddr("2001:db8:1::1111:1111:1111:1111"), PrefixLen: 128},                          // tunnel endpoint
+		{Addr: netip.MustParseAddr("2001:db8:1::dead"), PrefixLen: 64},                                          // stray, must be taken over
+		{Addr: netip.MustParseAddr("2001:db8:1::2"), PrefixLen: 64, Preferred: infiniteLft, Valid: infiniteLft}, // configured by hand
+		{Addr: netip.MustParseAddr("2001:db8:2::1"), PrefixLen: 64},                                             // outside managed prefixes
+		{Addr: netip.MustParseAddr("fe80::1"), PrefixLen: 64},                                                   // link-local
+		{Addr: netip.MustParseAddr("fd00::1"), PrefixLen: 64},                                                   // different prefix
 	}
 	got := strayAddrs(list, want, managed, temps, endpoints)
 	if len(got) != 1 || got[0].Addr != netip.MustParseAddr("2001:db8:1::dead") {
