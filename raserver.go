@@ -40,7 +40,6 @@ type raServer struct {
 	noSLAAC   bool           // -ra-slaac off: the A flag clear
 	offLink   bool           // -ra-onlink off: the L flag clear
 	routes    []netip.Prefix // extra RIOs
-	ula       []netip.Prefix // the ULA prefixes, advertised as routes with the delegated ones
 	pref64    netip.Prefix   // -ra-pref64 naming a NAT64 elsewhere
 	pref64Off bool           // -ra-pref64 off
 	dns       lanDNS
@@ -353,10 +352,19 @@ func (r *raServer) build() *ndp.RouterAdvertisement {
 			})
 		}
 	}
-	for _, p := range r.ula {
-		if p.Bits() < 64 && !slices.Contains(r.routes, p) && !slices.Contains(own, p) {
+	// A router without a ULA of its own is a part of the upstream's site, whose ULA is reached
+	// through here as well: with a part of it delegated, or its /64 shared with the LAN
+	ulas := slices.Clone(r.snap.ULA)
+	if !slices.ContainsFunc(ulas, func(p Prefix) bool { return !p.Delegated }) {
+		for _, u := range r.snap.UpstreamULA {
+			ulas = append(ulas, Prefix{Prefix: u, Valid: now.Add(ndValidLimit)})
+		}
+	}
+	for _, p := range ulas {
+		if p.Prefix.Bits() < 64 && !slices.Contains(r.routes, p.Prefix) && !slices.Contains(own, p.Prefix) {
+			own = append(own, p.Prefix)
 			ra.Options = append(ra.Options, &ndp.RouteInformation{
-				PrefixLength: uint8(p.Bits()), Preference: ndp.Medium, RouteLifetime: ndValidLimit, Prefix: p.Masked().Addr(),
+				PrefixLength: uint8(p.Prefix.Bits()), Preference: ndp.Medium, RouteLifetime: min(p.validLeft(now), ndValidLimit), Prefix: p.Prefix.Masked().Addr(),
 			})
 		}
 	}
@@ -432,14 +440,15 @@ func ifCM(ifi *net.Interface) *ipv6.ControlMessage {
 // lanDNS is -ra-dns: the DNS servers announced on a LAN, in order.
 type lanDNS struct {
 	list   []dnsEntry
-	iid    iidPolicy // the first -lan-iid, which self is built from
+	wanIID iidPolicy // the first -wan-iid, which self is built from on the WAN
+	wan    string
 	secret []byte
 }
 
 // dnsEntry is one -ra-dns entry: a fixed address, self, or upstream.
 type dnsEntry struct {
 	addr     netip.Addr
-	self     bool // this router's address on the LAN
+	self     bool // this router's address in the LAN's ULA, else on the WAN
 	upstream bool // the routable servers the upstream hands out
 }
 
@@ -467,8 +476,9 @@ func parseLANDNS(spec string) ([]dnsEntry, error) {
 }
 
 // resolve returns the DNS servers for the LAN on ifi. self takes the router's address in the
-// LAN's ULA when it has one, which renumbering leaves valid, else in its global prefix; it is
-// left out while the LAN has neither.
+// LAN's ULA when it has one, which renumbering leaves valid and the LAN reaches without a default
+// router, else its global address on the WAN, since the LAN holds none; it is left out while
+// there is neither.
 func (d lanDNS) resolve(s Snapshot, ifi *net.Interface) []netip.Addr {
 	var out []netip.Addr
 	for _, e := range d.list {
@@ -477,7 +487,9 @@ func (d lanDNS) resolve(s Snapshot, ifi *net.Interface) []netip.Addr {
 			out = append(out, routableDNS(s.DNS)...)
 		case e.self:
 			if p, ok := selfPrefix(s.LAN[ifi.Name]); ok {
-				out = append(out, d.iid.addr(d.secret, p, ifi, 0))
+				out = append(out, lanIID.addr(d.secret, p, ifi, 0))
+			} else if a, ok := s.wanSelf(d.wanIID, d.secret, d.wanIfi()); ok {
+				out = append(out, a)
 			}
 		default:
 			out = append(out, e.addr)
@@ -487,17 +499,21 @@ func (d lanDNS) resolve(s Snapshot, ifi *net.Interface) []netip.Addr {
 }
 
 func selfPrefix(ps []Prefix) (netip.Prefix, bool) {
-	var gua netip.Prefix
 	for _, p := range ps {
-		switch {
-		case p.Deprecated:
-		case p.Source == sourceULA:
+		if p.Source == sourceULA && !p.Deprecated {
 			return p.Prefix, true
-		case !gua.IsValid():
-			gua = p.Prefix
 		}
 	}
-	return gua, gua.IsValid()
+	return netip.Prefix{}, false
+}
+
+// wanIfi looks the WAN up for its MAC, which an eui64 -wan-iid needs; without it the name alone
+// gives the stable address.
+func (d lanDNS) wanIfi() *net.Interface {
+	if ifi, err := net.InterfaceByName(d.wan); err == nil {
+		return ifi
+	}
+	return &net.Interface{Name: d.wan}
 }
 
 // parseNAT64Prefix accepts a prefix that RFC 6052 can embed an IPv4 address in and RFC 8781 can

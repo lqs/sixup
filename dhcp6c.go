@@ -474,10 +474,10 @@ func (c *dhcpClient) cycle(ctx context.Context) {
 			return
 		}
 		c.fallbackInfo()
-		warnf("[dhcpv6-client] server gave no binding, retrying in 10s")
+		warnf("[dhcpv6-client] server gave no binding, retrying in %s", noBindingRetry)
 		select {
 		case <-ctx.Done():
-		case <-time.After(10 * time.Second):
+		case <-time.After(noBindingRetry):
 		}
 		return
 	}
@@ -796,6 +796,10 @@ func (c *dhcpClient) retryUnhinted() bool {
 	infof("[dhcpv6-client] request with a /%d hint refused, asking again without a length hint", c.pdLen)
 	return true
 }
+
+// noBindingRetry is how long a cycle waits after a Reply that binds nothing and refuses nothing;
+// tests shorten it.
+var noBindingRetry = 10 * time.Second
 
 func (c *dhcpClient) refusedWait(ctx context.Context, why string) {
 	c.unhinted = false // after the backoff, try the hint again

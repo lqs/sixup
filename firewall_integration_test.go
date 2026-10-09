@@ -662,7 +662,7 @@ func TestFirewallRunAgainstKernel(t *testing.T) {
 	f.run(ctx, ch)
 
 	for name, want := range map[string][]netip.Prefix{
-		"ours":         {shared, pd, deleg},
+		"ours":         {shared, pd, deleg, ula}, // the ULA too, which the ULA border keeps in when it is this router's own
 		"wan_link":     {shared},
 		"upstream_ula": {upULA},
 		"delegated":    {deleg},

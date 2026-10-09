@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv6"
@@ -680,6 +681,64 @@ func TestDHCP6cWaitDone(t *testing.T) {
 	c := &dhcpClient{done: make(chan struct{})}
 	close(c.done)
 	c.WaitDone()
+}
+
+// The waits of seconds to hours, on the fake clock of a synctest bubble: the backoff after a
+// refusal, the wait for a RELEASE that never finishes, and the retries of a DUID that cannot be
+// written yet and of a socket that cannot be opened yet. The store stays outside the bubble,
+// whose goroutines must all end.
+func TestDHCP6cTimers(t *testing.T) {
+	store := newStore("pd", []lanDef{{"lan0", 0}}, time.Second, nil, false, 0, 0, "")
+	lo := dhcp6cLoopback(t)
+	file := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	synctest.Test(t, func(t *testing.T) {
+		c := newDHCPClient("dhcp6c-none", store, t.TempDir(), 56, false)
+		start := time.Now()
+		c.refusedWait(context.Background(), "test")
+		if d := time.Since(start); d != 5*time.Minute {
+			t.Fatalf("the first backoff took %s", d)
+		}
+		start = time.Now()
+		c.WaitDone()
+		if d := time.Since(start); d != 4*time.Second {
+			t.Fatalf("waiting for a client that never finishes took %s", d)
+		}
+
+		// the state directory is under a file until that goes
+		ctx, cancel := context.WithCancel(context.Background())
+		c = newDHCPClient(lo, store, filepath.Join(file, "state"), 56, false)
+		go c.run(ctx, true)
+		synctest.Wait()
+		if err := os.Remove(file); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(5 * time.Second)
+		synctest.Wait()
+		if _, err := os.Stat(filepath.Join(file, "state")); err != nil {
+			t.Fatalf("the DUID is not written once it can be: %v", err)
+		}
+		cancel()
+		<-c.done
+
+		// Linux gives the loopback no link-local address, so the socket is retried until ctx ends
+		ctx, cancel = context.WithCancel(context.Background())
+		c = newDHCPClient(lo, store, t.TempDir(), 56, false)
+		c.linkUp = true
+		done := make(chan struct{})
+		go func() {
+			c.waitLinkUp(ctx)
+			close(done)
+		}()
+		time.Sleep(3 * time.Second)
+		cancel()
+		<-done
+		if c.conn != nil {
+			c.conn.Close()
+		}
+	})
 }
 
 // A link that stays down until the binding expires loses it.

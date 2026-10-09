@@ -26,6 +26,7 @@ func TestMainChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Args = append([]string{"sixup"}, args...)
+	settle = 100 * time.Millisecond
 	main()
 	os.Exit(0) // keep the test runner's PASS out of the output
 }
@@ -121,10 +122,11 @@ func TestMainRejectsBadOptions(t *testing.T) {
 		{[]string{"-dry-run", "-wan", "x", "-wan-shared64", "both"}, "-wan-shared64 must be"},
 		{[]string{"-dry-run", "-wan", "x", "-ndproxy-mode", "on"}, "-ndproxy-mode must be"},
 		{[]string{"-dry-run", "-wan", "x", "-dhcp6s-pd-len", "65"}, "-dhcp6s-pd-len must be"},
+		{[]string{"-dry-run", "-wan", "x", "-dhcp6s-pd-len", "half"}, "-dhcp6s-pd-len must be auto"},
 		{[]string{"-dry-run", "-wan", "x", "-ra-min", "1s"}, "-ra-min must be"},
 		{[]string{"-dry-run", "-wan", "x", "-dhcp6c-mode", "off", "-wan-ra=false"}, "at least one of the DHCPv6 client"},
 		{[]string{"-dry-run", "-wan", "x", "-wan-iid", "::1:2:3:4:5"}, "-wan-iid:"},
-		{[]string{"-dry-run", "-wan", "x", "-lan-iid", "::1:2:3:4:5"}, "-lan-iid:"},
+		{[]string{"-dry-run", "-wan", "x", "-ula", "fc00:aaaa::2/48"}, "give only the prefix such as fc00:aaaa::/48"},
 		{[]string{"-dry-run", "-wan", "x", "-ula", "2001:db8::/48"}, "-ula:"},
 		{[]string{"-dry-run", "-wan", "x", "-lan", "eth1:x"}, `-lan "eth1:x" has an invalid subnet id`},
 	} {
@@ -137,7 +139,7 @@ func TestMainRejectsBadOptions(t *testing.T) {
 
 // A dry run with a static prefix needs no upstream: it reports the prefix and, at the deadline, the counters.
 func TestMainDryRunDeadline(t *testing.T) {
-	stdout, stderr, code := runMain(t, "-dry-run", "-wan", "sixup-none0", "-dry-run-timeout", "500ms", "-settle", "10ms", "-state-dir", t.TempDir(),
+	stdout, stderr, code := runMain(t, "-dry-run", "-wan", "sixup-none0", "-dry-run-timeout", "500ms", "-state-dir", t.TempDir(),
 		"-dhcp6c-mode", "off", "-wan-ra=false", "-routed-prefix", "2001:db8:1::/48", "-ula", "auto", "-nat64", "jool", "-ra-slaac=false")
 	if code != 0 {
 		t.Fatalf("exit %d:\n%s", code, stderr)

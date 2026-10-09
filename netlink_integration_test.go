@@ -4,6 +4,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"net"
 	"net/netip"
@@ -58,11 +59,16 @@ func TestNetlinkWithoutFDsAgainstKernel(t *testing.T) {
 			"addrDel":       addrDel(1, a, 64),
 			"routeSet":      routeSet(1, netip.MustParsePrefix("2001:db8::/64"), netip.Addr{}, 0, 0),
 			"neighProxySet": neighProxySet(1, a, false),
+			"lanRouteSet":   lanRouteSet(1, netip.MustParsePrefix("2001:db8::/64"), a, 0),
+			"lanRouteDel":   lanRouteDel(1, netip.MustParsePrefix("2001:db8::/64")),
+			"addrWatch":     addrWatch(context.Background(), make(chan struct{})),
 			"linkWatch":     linkWatch(make(chan linkEvent)),
 			"tunnelSet":     tunnelSet("tnl0", 1, a, a, 1460),
 			"addr4Set":      addr4Set("lo", netip.MustParsePrefix("192.0.2.1/32")),
 		}
 		_, errs["addrList"] = addrList(1)
+		_, errs["lanRouteList"] = lanRouteList(1)
+		_, errs["neighProxyList"] = neighProxyList(1)
 		_, errs["localListeners"] = localListeners(unix.IPPROTO_TCP, a)
 		_, errs["sockDiagInUse"] = sockDiagInUse(a)
 		_, errs["packetCapture"] = packetCapture(1, make(chan []byte), kindTunnel, func() {})
@@ -77,6 +83,12 @@ func TestNetlinkWithoutFDsAgainstKernel(t *testing.T) {
 		if defaultRouteVia(1) {
 			t.Error("defaultRouteVia: a default route without a socket")
 		}
+		// a LAN whose tables cannot be read is left alone, and one whose address changes cannot be
+		// followed still runs, here until its context, already over, ends
+		(&lanRoutes{ifname: "lo"}).apply(&net.Interface{Index: 1, Name: "lo"})
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		(&lanRoutes{ifname: "lo"}).run(ctx, newLinkHub(ctx), nil, nil)
 	})
 }
 
@@ -116,6 +128,9 @@ func TestNetlinkMiscAgainstKernel(t *testing.T) {
 	}
 	if err := neighProxySet(9999, a, false); err == nil {
 		t.Error("a proxy entry on a missing interface")
+	}
+	if err := lanRouteDel(1, netip.MustParsePrefix("2001:db8:5::/64")); err != nil {
+		t.Errorf("deleting a LAN route already gone: %v", err)
 	}
 }
 

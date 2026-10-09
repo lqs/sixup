@@ -24,7 +24,7 @@ sudo sixup -wan eth0 -lan eth1 -dry-run
 - 在 MAP-E、DS-Lite 或 4in6 线路上，sixup 找到了隧道，隧道类型正确。
 - 没有错误，并且你理解每一条警告。
 
-如果有与预期不符的地方，请到此为止，不要继续后面的步骤。此时路由器仍然没有任何改变。请查看 README 中的参数说明，或者附上试运行的输出[提交 issue](https://github.com/lqs/sixup/issues)。
+如果有与预期不符的地方，请到此为止，不要继续后面的步骤。此时路由器仍然没有任何改变。请查看 [recipes](recipes.zh.md) 和 `sixup -h` 的参数说明，或者附上试运行的输出[提交 issue](https://github.com/lqs/sixup/issues)。
 
 ## 2. 列出清单
 
@@ -173,7 +173,7 @@ tail -f /var/log/sixup.log
 
 然后在路由器和内网主机上检查以下几点。
 
-- 日志中显示了前缀和内网地址。在隧道线路上，还显示了隧道。
+- 日志中显示了前缀和内网路由。在隧道线路上，还显示了隧道。
 - 内网主机获得了新前缀中的地址，并且能访问 IPv6 网站。test-ipv6.com 可以同时测试 IPv4 和 IPv6。
 - 在 MAP-E 或 DS-Lite 线路上，IPv4 能通过隧道正常工作。
 - `nft list table inet sixup-filter` 显示了过滤规则，并且计数器在增加。

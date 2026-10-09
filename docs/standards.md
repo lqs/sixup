@@ -305,7 +305,7 @@ the Linux stack alone.
   reads it. The RA MTU sets the link's IPv6 MTU, not the interface MTU (§6.3.4).
 - **RFC 7217, stable interface identifiers.** Addresses sixup configures are stable per network
   and unlinkable across networks, from a secret kept in the state directory, unless
-  `-wan-iid` or `-lan-iid` fixes them.
+  `-wan-iid` fixes them; the router's address in a LAN's ULA is always `::1`.
 - **RFC 8981, temporary addresses.** `-tempaddr` adds rotating WAN addresses for the
   router's own traffic, in the first LAN's delegated /64 when there is one, so that the upstream
   router keeps no neighbor entry for each. The kernel does not accept the temporary flag from userspace, so RFC 6724
@@ -326,7 +326,13 @@ the Linux stack alone.
   downstream routers. When the prefix changes, clients with a Reconfigure key are told to renew.
 - **RFC 8987, routes for delegated prefixes.** A delegated prefix is routed to the router it went
   to for as long as the delegation lasts, as that RFC asks of a delegating relay.
-- **RFC 4193, ULA.** `-ula auto` generates a random /48 and keeps it.
+- **RFC 4193, ULA.** `-ula auto` generates a random /48 and keeps it. A downstream router gets a
+  part of it with its delegation and, without `-ula` of its own, joins the site.
+- **RFC 7404, link-local addressing only.** A LAN holds an on-link route for each of its prefixes
+  and no global address of the router, whose addresses stay on the WAN; one that falls in a LAN
+  prefix is answered for on that LAN. The router's address in a LAN's ULA is deprecated, and only
+  the route of that ULA names it as the source (RFC 6724 rule 3 keeps it out otherwise), so a peer
+  the router reaches learns its routable address.
 - **RFC 7278, sharing a /64.** When the line gives only a /64, it moves to the LAN, and on an
   Ethernet WAN sixup answers Neighbor Discovery for the LAN hosts there, in the manner of the
   proxy of RFC 4389.

@@ -12,8 +12,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Every upstream delegation shorter than /64 gets an unreachable route for as long as it lasts,
-// which goes with it and when holding stops.
+// Every upstream delegation shorter than /64, and the ULA, gets an unreachable route for as long
+// as it lasts, which goes with it and when holding stops.
 func TestPDHoldDelegationsAgainstKernel(t *testing.T) {
 	enterNetNS(t)
 	loUp(t)
@@ -39,8 +39,15 @@ func TestPDHoldDelegationsAgainstKernel(t *testing.T) {
 		{Prefix: netip.MustParsePrefix("2001:db8:200::/64"), Valid: now.Add(time.Hour), Source: sourcePD},
 		{Prefix: netip.MustParsePrefix("2001:db8:300::/56"), Valid: now.Add(time.Hour), Source: sourceRA},
 		{Valid: now.Add(time.Hour), Source: sourcePD}, // no prefix: the kernel refuses its route
-	}}
-	unreachable := func() bool { return slices.Contains(routeTypes(t, up), unix.RTN_UNREACHABLE) }
+	}, ULA: []Prefix{{Prefix: netip.MustParsePrefix("fd00:1::/48"), Valid: now.Add(time.Hour), Source: sourceULA}}}
+	ula := held.ULA[0].Prefix
+	unreachable := func() bool {
+		u, l := slices.Contains(routeTypes(t, up), unix.RTN_UNREACHABLE), slices.Contains(routeTypes(t, ula), unix.RTN_UNREACHABLE)
+		if u != l {
+			t.Fatalf("%s unreachable %v, %s %v", up, u, ula, l)
+		}
+		return u
+	}
 	ch <- held
 	ch <- held // taken once the first is done
 	if !unreachable() {

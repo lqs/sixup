@@ -79,7 +79,7 @@ type firewall struct {
 	shared  *nftables.Set  // the /64 shared with the WAN link, which has hosts on both sides
 	upULA   *nftables.Set  // the ULA prefixes the upstream advertises, of the same site
 	upULAs  []netip.Prefix // what upULA holds
-	lan     []netip.Prefix // the live LAN prefixes other than the ULA
+	lan     []netip.Prefix // the live LAN prefixes
 	wanLink []netip.Prefix // what shared holds
 	delegs  []netip.Prefix
 	applied []netip.Prefix // what ours holds
@@ -104,7 +104,9 @@ func (f *firewall) run(ctx context.Context, ch <-chan Snapshot) {
 			var shared []netip.Prefix
 			for _, ps := range s.LAN {
 				for _, p := range ps {
-					if !p.Stale && p.Source != sourceULA {
+					// the ULA too, for one delegated by the upstream crosses the WAN; this
+					// router's own is kept in by the ULA border before it gets this far
+					if !p.Stale {
 						f.lan = append(f.lan, p.Prefix)
 						if s.sharedWith(p.Prefix) {
 							shared = append(shared, p.Prefix)

@@ -79,6 +79,9 @@ func TestDHCP6ServerAgainstKernel(t *testing.T) {
 	s := newTestServer(true)
 	s.ifname = "d6s-lan0"
 	s.leaseFile = filepath.Join(t.TempDir(), "leases.json")
+	old := leaseSweep
+	leaseSweep = 10 * time.Millisecond
+	defer func() { leaseSweep = old }()
 
 	// A port taken by a socket that does not share it, and a group that cannot be joined
 	held, err := net.ListenPacket("udp6", "[::]:547")
@@ -146,6 +149,22 @@ func TestDHCP6ServerAgainstKernel(t *testing.T) {
 	ch <- Snapshot{Change: "add"}
 	if m := dhcp6sRead(t, cli); m.MessageType != dhcpv6.MessageTypeReconfigure {
 		t.Fatalf("want a Reconfigure, got %v", m)
+	}
+
+	// an expired lease goes at the next sweep
+	s.mu.Lock()
+	s.leases["expired"] = &Lease{DUID: "00", IAID: 2, Addr: netip.MustParseAddr("2001:db8:9::1001"), Expires: time.Now().Add(-time.Second)}
+	s.mu.Unlock()
+	for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		s.mu.Lock()
+		_, left := s.leases["expired"]
+		s.mu.Unlock()
+		if !left {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the expired lease was not swept")
+		}
 	}
 	cancel()
 	<-done

@@ -430,9 +430,11 @@ func (n *ndProxy) onSolicit(side side, target, from netip.Addr) {
 	}
 	self := !from.IsValid()
 	now := time.Now()
-	// a LAN host's NS carries the address it is actually using, so learn it here instead of waiting for the upstream to ask for the wan-layout /128 route
-	if side == sideLAN && !self && n.effectiveMode() == proxyForward && !from.IsUnspecified() && from != target && n.covered(from) {
-		n.learn(sideLAN, from, now)
+	// an NS carries the address its sender is actually using, so learn it here instead of waiting
+	// to be asked for it: the reply goes to that address, and on the side the layout gives no
+	// on-link route, such as the WAN under lan, it would otherwise leave by the default route
+	if !self && n.effectiveMode() == proxyForward && !from.IsUnspecified() && from != target && n.covered(from) {
+		n.learn(side, from, now)
 	}
 	// prefix mode replies unconditionally on the WAN side for LAN hosts only, never the reverse
 	if n.effectiveMode() == proxyPrefix {

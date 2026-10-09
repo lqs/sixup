@@ -63,6 +63,9 @@ type Prefix struct {
 	// Exclude is the part of a delegation the ISP keeps for the WAN link (RFC 6603), which goes
 	// neither to a LAN nor to a downstream router.
 	Exclude netip.Prefix `json:"exclude,omitzero"`
+	// Delegated marks a ULA the upstream delegated, which renews and expires like a delegation
+	// instead of being this router's own.
+	Delegated bool `json:"delegated,omitempty"`
 }
 
 func (p Prefix) preferredLeft(now time.Time) time.Duration {
@@ -125,6 +128,9 @@ type Snapshot struct {
 	// ULA prefixes the upstream RA advertises, which make the WAN link part of the same site: they
 	// may cross the WAN (RFC 4193 section 4.3)
 	UpstreamULA []netip.Prefix `json:"upstream_ula,omitempty"`
+	// ULA is the site's ULA this router splits among its LANs and delegates from: its own from
+	// -ula, else the part of the upstream's that came with the delegation
+	ULA []Prefix `json:"ula,omitempty"`
 }
 
 // wanSLAAC returns the SLAAC-capable /64s from the upstream RA, including deprecated ones so addresses can be retired.
@@ -149,6 +155,31 @@ func (s Snapshot) wanStatic() []Prefix {
 	return []Prefix{s.WANSubnet}
 }
 
+// lanULA returns the ULA prefixes of a LAN, the only ones this router takes an address in there.
+func (s Snapshot) lanULA(iface string) []Prefix {
+	var out []Prefix
+	for _, p := range s.LAN[iface] {
+		if p.Source == sourceULA {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// wanSelf returns the global address of this router on the WAN: the one configured by hand or
+// from IA_NA, else the static address of the first policy in the first live prefix of wanStatic.
+func (s Snapshot) wanSelf(iid iidPolicy, secret []byte, ifi *net.Interface) (netip.Addr, bool) {
+	if s.WANAddr.IsValid() {
+		return s.WANAddr, true
+	}
+	for _, p := range s.wanStatic() {
+		if !p.Deprecated {
+			return iid.addr(secret, p.Prefix, ifi, 0), true
+		}
+	}
+	return netip.Addr{}, false
+}
+
 // wanTemp returns the prefixes for temporary WAN addresses: WANSubnet, else SLAAC. In an on-link
 // prefix each one is a neighbor entry upstream, which some ISPs limit.
 func (s Snapshot) wanTemp() []Prefix {
@@ -171,6 +202,7 @@ type Store struct {
 	curReq   chan chan Snapshot
 	prefer   prefixSource
 	ula      []netip.Prefix // optional ULA, advertised alongside the GUA
+	ulaPD    []Prefix       // the ULA the upstream delegated, used without -ula
 	lans     []lanDef
 	hold     time.Duration // how long a revoked prefix is advertised with preferred=0
 	mapeRule bool          // derive MAP-E from the Japanese IPoE rule table when DHCPv6 gives none
@@ -214,7 +246,9 @@ const wanRevokeHold = 10 * time.Minute
 type advertisedPrefix struct {
 	Iface  string       `json:"iface"`
 	Prefix netip.Prefix `json:"prefix"`
-	Valid  time.Time    `json:"valid_until"`
+	Valid  time.Time    `json:"valid_until,omitzero"` // zero for a ULA still given
+	// a ULA the upstream delegated, which waits for the line like the other delegations
+	Delegated bool `json:"delegated,omitempty"`
 }
 
 type revokedLAN struct {
@@ -253,7 +287,8 @@ func newStore(prefer prefixSource, lans []lanDef, hold time.Duration, ula []neti
 		s.pdGrace = time.Now().Add(pdGrace)
 	}
 	s.loadAdvertised()
-	if len(ula) > 0 {
+	s.withdrawULA(time.Now())
+	if len(ula) > 0 || len(s.revoked) > 0 {
 		// ULA needs no source, so compute it now so the first snapshot carries it
 		s.recompute(time.Now())
 	}
@@ -320,6 +355,17 @@ func (s *Store) loop() {
 		case ch := <-s.curReq:
 			ch <- s.cur
 		case m := <-s.in:
+			// a ULA delegated with the prefixes is a part of the upstream's site, not of its line
+			if m.source == sourcePD {
+				s.ulaPD = nil
+				m.upd.Prefixes = slices.DeleteFunc(slices.Clone(m.upd.Prefixes), func(p Prefix) bool {
+					if p.Prefix.Addr().IsPrivate() {
+						s.ulaPD = append(s.ulaPD, p)
+						return true
+					}
+					return false
+				})
+			}
 			s.sources[m.source] = m.upd
 			s.recompute(time.Now())
 			expire = s.nextExpiry()
@@ -572,16 +618,32 @@ func (s *Store) recompute(now time.Time) {
 		}
 	}
 
-	// ULA coexists with the GUA, is never revoked and takes no part in source selection; fixed 7d preferred / 30d valid, refreshed on every recompute
+	// ULA coexists with the GUA and takes no part in source selection. This router's own is never
+	// revoked, fixed 7d preferred / 30d valid, refreshed on every recompute; one the upstream
+	// delegated lasts as long as the delegation
 	for _, up := range s.ula {
+		next.ULA = append(next.ULA, Prefix{Prefix: up, Preferred: now.Add(7 * 24 * time.Hour), Valid: now.Add(30 * 24 * time.Hour), Source: sourceULA})
+	}
+	if len(s.ula) == 0 {
+		for _, p := range s.ulaPD {
+			if p.validLeft(now) > 0 {
+				p.Source, p.Delegated, p.Deprecated = sourceULA, true, p.preferredLeft(now) == 0
+				next.ULA = append(next.ULA, p)
+			}
+		}
+	}
+	for _, up := range next.ULA {
 		for _, l := range s.lans {
-			sub, ok := splitLAN(up, l.index)
+			sub, ok := splitLAN(up.Prefix, l.index)
 			if !ok {
-				short = append(short, shortPrefix{up, l})
+				short = append(short, shortPrefix{up.Prefix, l})
 				continue
 			}
-			next.LAN[l.iface] = append(next.LAN[l.iface], Prefix{Prefix: sub, Preferred: now.Add(7 * 24 * time.Hour), Valid: now.Add(30 * 24 * time.Hour), Source: "ula"})
+			lp := up
+			lp.Prefix = sub
+			next.LAN[l.iface] = append(next.LAN[l.iface], lp)
 			active[sub] = true
+			delete(s.revoked, sub)
 		}
 	}
 
@@ -609,7 +671,11 @@ func (s *Store) recompute(now time.Time) {
 			}
 			if until.After(now) {
 				change = changeRevoke
-				s.revoked[a.Prefix] = revokedLAN{a.Iface, Prefix{Prefix: a.Prefix, Preferred: now, Valid: until, Source: sourcePD, Deprecated: true, Stale: true}}
+				src := sourcePD
+				if a.Prefix.Addr().IsPrivate() {
+					src = sourceULA
+				}
+				s.revoked[a.Prefix] = revokedLAN{a.Iface, Prefix{Prefix: a.Prefix, Preferred: now, Valid: until, Source: src, Deprecated: true, Stale: true}}
 				infof("[prefix-store] %s on %s was advertised before the restart, advertising lifetimes 0 until %s", a.Prefix, a.Iface, until.Format(time.TimeOnly))
 			}
 		}
@@ -668,7 +734,7 @@ func (s *Store) recompute(now time.Time) {
 		}
 		for _, ps := range next.LAN {
 			for _, p := range ps {
-				if p.Source == "ula" {
+				if p.Source == sourceULA && !p.Delegated {
 					if _, ok := oldSet[p.Prefix]; !ok {
 						change = changeAdd
 					}
@@ -773,7 +839,37 @@ func (s *Store) loadAdvertised() {
 	s.saved = b
 }
 
-// saveAdvertised records the LAN prefixes other than the ULA, when they changed. The record from
+// withdrawULA withdraws the ULA prefixes recorded before a restart that -ula no longer gives
+// (RFC 9096 section 3.5). Unlike the line's, they are known at once, so there is nothing to wait
+// for; they leave the record from before, which then holds only what the line has to answer,
+// a ULA the upstream delegated among it.
+func (s *Store) withdrawULA(now time.Time) {
+	var keep []advertisedPrefix
+	for _, a := range s.previous {
+		if !a.Prefix.Addr().IsPrivate() || a.Delegated {
+			keep = append(keep, a)
+			continue
+		}
+		l := slices.IndexFunc(s.lans, func(l lanDef) bool { return l.iface == a.Iface })
+		if l < 0 || slices.ContainsFunc(s.ula, func(u netip.Prefix) bool {
+			sub, ok := splitLAN(u, s.lans[l].index)
+			return ok && sub == a.Prefix
+		}) {
+			continue
+		}
+		until := now.Add(s.hold)
+		if !a.Valid.IsZero() && a.Valid.Before(until) {
+			until = a.Valid
+		}
+		if until.After(now) {
+			s.revoked[a.Prefix] = revokedLAN{a.Iface, Prefix{Prefix: a.Prefix, Preferred: now, Valid: until, Source: sourceULA, Deprecated: true, Stale: true}}
+			infof("[prefix-store] ULA %s on %s is no longer given, advertising lifetimes 0 until %s", a.Prefix, a.Iface, until.Format(time.TimeOnly))
+		}
+	}
+	s.previous = keep
+}
+
+// saveAdvertised records the LAN prefixes, when they changed. The record from
 // before a restart is kept until it has been compared with what the line hands out.
 func (s *Store) saveAdvertised() {
 	if s.file == "" || s.previous != nil {
@@ -782,9 +878,13 @@ func (s *Store) saveAdvertised() {
 	list := []advertisedPrefix{}
 	for iface, ps := range s.cur.LAN {
 		for _, p := range ps {
-			if p.Source != sourceULA {
-				list = append(list, advertisedPrefix{iface, p.Prefix, p.Valid})
+			// a live ULA of this router's is renewed on every recompute; its expiry would only
+			// rewrite the file
+			valid := p.Valid
+			if p.Source == sourceULA && !p.Stale && !p.Delegated {
+				valid = time.Time{}
 			}
+			list = append(list, advertisedPrefix{iface, p.Prefix, valid, p.Delegated})
 		}
 	}
 	slices.SortFunc(list, func(a, b advertisedPrefix) int {
@@ -1042,7 +1142,10 @@ func loadULA(stateDir, spec string) ([]netip.Prefix, error) {
 		if pf.Bits() > 64 || pf.Addr().As16()[0]&0xfe != 0xfc {
 			return nil, fmt.Errorf("%s is not a ULA within fc00::/7 of length /64 or shorter", pf)
 		}
-		out = append(out, pf.Masked())
+		if pf != pf.Masked() {
+			return nil, fmt.Errorf("%s has bits set past the prefix, give only the prefix such as %s; the router takes ::1 in each LAN", pf, pf.Masked())
+		}
+		out = append(out, pf)
 	}
 	return out, nil
 }

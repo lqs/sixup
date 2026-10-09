@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"slices"
 	"testing"
 	"time"
 
@@ -163,7 +164,7 @@ func TestRAAdvertisesTheDelegationAndULA(t *testing.T) {
 	now := time.Now()
 	r := newTestRA(lanSnap(now))
 	ula := netip.MustParsePrefix("fd00:1:2::/48")
-	r.ula = []netip.Prefix{ula}
+	r.snap.ULA = []Prefix{{Prefix: ula, Valid: now.Add(30 * 24 * time.Hour), Source: sourceULA}}
 	ra := r.build()
 	if ri, ok := rio(ra, netip.MustParsePrefix("2001:db8::/56")); !ok || ri.RouteLifetime != ndValidLimit {
 		t.Fatalf("delegation RIO: %+v", ri)
@@ -174,6 +175,34 @@ func TestRAAdvertisesTheDelegationAndULA(t *testing.T) {
 	r.snap.WAN[0].Stale, r.snap.WAN[0].Deprecated = true, true
 	if ri, ok := rio(r.build(), netip.MustParsePrefix("2001:db8::/56")); !ok || ri.RouteLifetime != 0 {
 		t.Fatalf("a delegation gone is withdrawn: %+v", ri)
+	}
+
+	// with a ULA of its own, the upstream's is not passed on
+	site := netip.MustParsePrefix("fd00:1::/48")
+	r.snap.UpstreamULA = []netip.Prefix{site, netip.MustParsePrefix("fd00:1::/64")}
+	if _, ok := rio(r.build(), site); ok {
+		t.Fatal("a site of its own keeps the upstream's out")
+	}
+	// A ULA delegated by the upstream lasts as long as the delegation, and the upstream's site
+	// is reached through here too, as it is with no ULA at all, the upstream's /64 shared
+	r.snap.ULA = []Prefix{{Prefix: netip.MustParsePrefix("fd00:1:0:10::/60"), Valid: now.Add(10 * time.Minute), Source: sourceULA, Delegated: true}}
+	ra = r.build()
+	if ri, ok := rio(ra, r.snap.ULA[0].Prefix); !ok || ri.RouteLifetime > 10*time.Minute || ri.RouteLifetime < 9*time.Minute {
+		t.Fatalf("delegated ULA RIO: %+v", ri)
+	}
+	if ri, ok := rio(ra, site); !ok || ri.RouteLifetime != ndValidLimit {
+		t.Fatalf("site RIO: %+v", ri)
+	}
+	r.snap.ULA = nil
+	if ri, ok := rio(r.build(), site); !ok || ri.RouteLifetime != ndValidLimit {
+		t.Fatalf("site RIO without a ULA: %+v", ri)
+	}
+	ra = r.build()
+	if _, ok := rio(ra, netip.MustParsePrefix("fd00:1::/64")); ok {
+		t.Fatal("the upstream's LAN is reached through its site prefix")
+	}
+	if _, ok := rio(ra, ula); ok {
+		t.Fatal("the own ULA is gone")
 	}
 }
 
@@ -242,14 +271,14 @@ func TestParseLANDNS(t *testing.T) {
 	}
 }
 
-// self is the router's own address on the LAN the RA goes out on, in the ULA when there is one,
-// and follows the prefix; upstream passes the routable upstream servers through, in place.
+// self is the router's address in the LAN's ULA when there is one, else its global address on
+// the WAN, since the LAN holds none; upstream passes the routable upstream servers through, in place.
 func TestLANDNS(t *testing.T) {
 	now := time.Now()
 	snap := lanSnap(now)
 	ifi := &net.Interface{Index: 3, Name: "lan0"}
 	fixed, _ := parseIIDPolicy("::1")
-	d := lanDNS{iid: fixed}
+	d := lanDNS{wanIID: fixed, wan: "sixup-none0"}
 	resolve := func(spec string, s Snapshot) []netip.Addr {
 		d.list, _ = parseLANDNS(spec)
 		return d.resolve(s, ifi)
@@ -261,15 +290,44 @@ func TestLANDNS(t *testing.T) {
 	if got := resolve("off", snap); len(got) != 0 {
 		t.Fatalf("off: %v", got)
 	}
+	if got := resolve("self,upstream,2001:db8::53", snap); !slices.Equal(got, []netip.Addr{google, netip.MustParseAddr("2001:db8::53")}) {
+		t.Fatalf("self is left out while the router has no address the LAN reaches: %v", got)
+	}
+	// the WAN's /128 in the delegation, which the LAN reaches through the proxy entry
+	snap.WANSubnet = Prefix{Prefix: netip.MustParsePrefix("2001:db8:1::/64"), Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: "pd", OffLink: true}
 	if got := resolve("self,upstream,2001:db8::53", snap); len(got) != 3 || got[0] != netip.MustParseAddr("2001:db8:1::1") || got[1] != google || got[2] != netip.MustParseAddr("2001:db8::53") {
-		t.Fatalf("self in the global prefix, in order: %v", got)
+		t.Fatalf("self on the WAN, in order: %v", got)
+	}
+	snap.WANAddr = netip.MustParseAddr("2001:db8::99")
+	if got := resolve("self", snap); len(got) != 1 || got[0] != snap.WANAddr {
+		t.Fatalf("self is the WAN address from IA_NA or configured by hand: %v", got)
 	}
 	snap.LAN["lan0"] = append(snap.LAN["lan0"], Prefix{Prefix: netip.MustParsePrefix("fd00:1::/64"), Source: "ula"})
 	if got := resolve("self", snap); len(got) != 1 || got[0] != netip.MustParseAddr("fd00:1::1") {
 		t.Fatalf("self prefers the ULA: %v", got)
 	}
-	if got := resolve("self", Snapshot{DNS: snap.DNS}); len(got) != 0 {
-		t.Fatalf("self with no LAN prefix is left out: %v", got)
+	snap.LAN["lan0"][1].Deprecated = true
+	if got := resolve("self", snap); len(got) != 1 || got[0] != snap.WANAddr {
+		t.Fatalf("a ULA being withdrawn is passed over: %v", got)
+	}
+	gone := Snapshot{DNS: snap.DNS, WAN: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8:2::/64"), Source: "ra", SLAAC: true, Deprecated: true}}}
+	if got := resolve("self", gone); len(got) != 0 {
+		t.Fatalf("self with no LAN prefix and only a deprecated WAN prefix is left out: %v", got)
+	}
+}
+
+// The WAN is looked up for the MAC an eui64 -wan-iid needs; a WAN that is not there yet still
+// gives the stable address, by its name.
+func TestLANDNSWANInterface(t *testing.T) {
+	ifs, err := net.Interfaces()
+	if err != nil || len(ifs) == 0 {
+		t.Skip("no interface to look up")
+	}
+	if got := (lanDNS{wan: ifs[0].Name}).wanIfi(); got.Index != ifs[0].Index {
+		t.Fatalf("%s: %+v", ifs[0].Name, got)
+	}
+	if got := (lanDNS{wan: "sixup-none0"}).wanIfi(); got.Name != "sixup-none0" || got.Index != 0 {
+		t.Fatalf("missing WAN: %+v", got)
 	}
 }
 

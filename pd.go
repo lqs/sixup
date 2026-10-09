@@ -28,7 +28,7 @@ type PDLease struct {
 // every LAN interface, so delegations never overlap each other or a LAN prefix. Callers hold mu
 // across a pick and the commit that follows it.
 type pdPool struct {
-	plen   int // the shortest prefix length delegated, -dhcp6s-pd-len
+	plen   int // the shortest prefix length delegated, -dhcp6s-pd-len; 0 for auto, see shortest
 	file   string
 	fw     *firewall // told of the delegations, which it leaves to the downstream routers; may be nil
 	mu     sync.Mutex
@@ -58,7 +58,7 @@ func (p *pdPool) load() {
 	now := time.Now()
 	for _, l := range list {
 		if now.Before(l.Expires) {
-			p.leases[leaseKey(l.DUID, l.IAID)] = l
+			p.leases[pdKey(l.DUID, l.IAID, l.Prefix.Addr().IsPrivate())] = l
 		}
 	}
 	infof("[dhcpv6-server] loaded %d delegations", len(p.leases))
@@ -100,9 +100,26 @@ func (p *pdPool) publish() {
 	p.fw.setDelegations(ps)
 }
 
-// delegable returns the upstream delegations a downstream prefix can be carved from.
-func delegable(s Snapshot) []Prefix {
+// pdKey keys a delegation: an IA_PD takes one prefix of the upstream delegation and one of the ULA.
+func pdKey(duid string, iaid uint32, ula bool) string {
+	if ula {
+		return leaseKey(duid, iaid) + "/ula"
+	}
+	return leaseKey(duid, iaid)
+}
+
+// delegable returns the upstream delegations a downstream prefix can be carved from, or with ula
+// the ULA prefixes.
+func delegable(s Snapshot, ula bool) []Prefix {
 	var out []Prefix
+	if ula {
+		for _, u := range s.ULA {
+			if !u.Deprecated && u.Prefix.Bits() < 64 {
+				out = append(out, u)
+			}
+		}
+		return out
+	}
 	for _, w := range s.WAN {
 		if w.Source == sourcePD && !w.Deprecated && w.Prefix.Bits() < 64 {
 			out = append(out, w)
@@ -111,19 +128,33 @@ func delegable(s Snapshot) []Prefix {
 	return out
 }
 
+// shortest is the shortest prefix length delegated out of an upstream delegation of length up.
+// auto takes the next of the usual sizes, /48 for a site, /56, /60 and /64, that is longer than
+// the upstream's, so each level leaves room for the ones behind it.
+func (p *pdPool) shortest(up int) int {
+	switch {
+	case p.plen > 0:
+		return p.plen
+	case up < 48:
+		return 48
+	case up < 56:
+		return 56
+	case up < 60:
+		return 60
+	}
+	return 64
+}
+
 // pick returns the prefix for the IA key and the upstream delegation it lies in: the current
 // delegation while it is still usable, else the prefix the router asked for when free, else a
-// free block. The block is the router's hinted length when that is longer than p.plen, and grows
-// towards /64 until one is free, so a hint for more space is cut down, never refused.
-func (p *pdPool) pick(s Snapshot, key string, want netip.Prefix) (netip.Prefix, Prefix, bool) {
-	ups := delegable(s)
+// free block. The block is the router's hinted length when that is longer than shortest, and
+// grows towards /64 until one is free, so a hint for more space is cut down, never refused.
+func (p *pdPool) pick(s Snapshot, key string, want netip.Prefix, ula bool) (netip.Prefix, Prefix, bool) {
+	ups := delegable(s, ula)
 	usable := func(pf netip.Prefix) (Prefix, bool) {
-		if pf.Bits() < p.plen || pf.Bits() > 64 || !p.free(s, pf, key) {
-			return Prefix{}, false
-		}
 		for _, u := range ups {
 			if u.Prefix.Bits() < pf.Bits() && u.Prefix.Contains(pf.Addr()) {
-				return u, true
+				return u, pf.Bits() >= p.shortest(u.Prefix.Bits()) && pf.Bits() <= 64 && p.free(s, pf, key)
 			}
 		}
 		return Prefix{}, false
@@ -139,7 +170,7 @@ func (p *pdPool) pick(s Snapshot, key string, want netip.Prefix) (netip.Prefix, 
 		}
 	}
 	for _, u := range ups {
-		for n := max(p.plen, min(want.Bits(), 64), u.Prefix.Bits()+1); n <= 64; n++ {
+		for n := max(p.shortest(u.Prefix.Bits()), min(want.Bits(), 64), u.Prefix.Bits()+1); n <= 64; n++ {
 			if pf, ok := p.block(s, u.Prefix, n, key); ok {
 				return pf, u, true
 			}
@@ -211,9 +242,10 @@ func (p *pdPool) drop(iface string, match func(*PDLease) bool) []*PDLease {
 	return out
 }
 
-// holdDelegations keeps an unreachable route for every upstream delegation (RFC 7084 WPD-5). The
-// LAN and downstream routes are more specific, so only traffic for a part assigned to neither
-// reaches it, and that is dropped here instead of looping between this router and the ISP.
+// holdDelegations keeps an unreachable route for every upstream delegation (RFC 7084 WPD-5), and
+// for the ULA. The LAN and downstream routes are more specific, so only traffic for a part
+// assigned to neither reaches it, and that is dropped here instead of looping between this router
+// and the upstream one.
 func holdDelegations(ctx context.Context, ch <-chan Snapshot) {
 	held := map[netip.Prefix]bool{}
 	defer func() {
@@ -228,8 +260,8 @@ func holdDelegations(ctx context.Context, ch <-chan Snapshot) {
 		case s := <-ch:
 			now := time.Now()
 			want := map[netip.Prefix]time.Duration{}
-			for _, w := range s.WAN {
-				if w.Source == sourcePD && w.Prefix.Bits() < 64 {
+			for _, w := range slices.Concat(s.WAN, s.ULA) {
+				if (w.Source == sourcePD || w.Source == sourceULA) && w.Prefix.Bits() < 64 {
 					if v := w.validLeft(now); v > want[w.Prefix] {
 						want[w.Prefix] = v
 					}

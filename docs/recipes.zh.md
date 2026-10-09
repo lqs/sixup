@@ -14,15 +14,23 @@ sudo sixup -wan eth0 -lan eth1
 |---|---|
 | [让外部访问内网主机](#让外部访问内网主机) | `-unsolicited allow`，更严格时用 `deny` |
 | [多个内网网段](#多个内网网段) | `-lan eth1:0 -lan eth2:1` |
+| [线路只给一个 /64](#线路只给一个-64) | `-wan-shared64 wan`、`-ndproxy-mode` |
+| [调整前缀获取方式](#调整前缀获取方式) | `-dhcp6c-pd-len 60`、`-wan-prefer ra` |
 | [SoftBank 光](#softbank-光) | `-wan-iid ::1111:1111:1111:1111` |
 | [上游不通告前缀，手动指定](#上游不通告前缀手动指定) | `-routed-prefix 2001:db8:100::/48` |
 | [自己管理隧道的防火墙规则](#自己管理隧道的防火墙规则) | `-tunnel-nat off` |
-| [给路由器固定地址](#给路由器固定地址) | `-wan-iid ::1 -lan-iid ::1` |
+| [调整 IPv4 隧道](#调整-ipv4-隧道) | `-tunnel-mtu 1460`、`-tunnel-dev ""` |
+| [给路由器固定 WAN 地址](#给路由器固定-wan-地址) | `-wan-iid ::1` |
+| [创建内网 ULA](#创建内网-ula) | `-ula auto` |
 | [路由器自己的流量使用轮换地址](#路由器自己的流量使用轮换地址) | `-tempaddr` |
 | [指定 DNS 服务器](#指定-dns-服务器) | `-ra-dns self`，或服务器的地址 |
 | [用 DHCPv6 分配地址](#用-dhcpv6-分配地址) | `-dhcp6s-mode stateful` |
 | [下级路由器](#下级路由器) | 上级路由器加 `-dhcp6s-mode stateless` |
 | [IPv6 单栈或 IPv6-mostly 内网](#ipv6-单栈或-ipv6-mostly-内网) | `-nat64 jool` |
+| [内网主机后面的另一个网络](#内网主机后面的另一个网络) | `-ra-route`、`-source-filter=false` |
+| [在容器里运行](#在容器里运行) | `-no-sysctl`、`-state-dir` |
+
+每个参数及其默认值都可以用 `sixup -h` 查看，本页按需求介绍它们的用法。
 
 在一条新线路上，先做一次试运行。它会与运营商交互，打印线路提供的参数，不改动系统。
 
@@ -34,8 +42,10 @@ sudo sixup -wan eth0 -dry-run
 
 - **内网的防火墙。** 由外部发起的连接到达内网之前就会被丢弃（RFC 6092）。回复内网自己发起的连接的流量照常通过，发往 5 分钟内向外发过包的内网端点的流量也会通过，所以 Tailscale 等点对点程序照常可用。按照 RFC 6092 的要求，IPsec（AH、ESP 和 IKE）和 HIP 也会通过。需要开放端口的程序可以用 PCP 申请，IPv4 也可以用 NAT-PMP，在 IPv4 上，PCP 还会把隧道地址的一个端口转发给这台主机。
 - **线路委派前缀。** sixup 用 DHCPv6-PD 请求一个 /56，把其中一个 /64 放到内网上，由内置的 RA 通告。委派前缀中其余的部分由一条 unreachable 路由兜住，发往未分配部分的流量在这里丢弃，不会再回到运营商那里形成环路。
+- **内网上没有路由器的地址。** 内网上每个前缀只有一条 on-link 路由（`ip -6 route` 中显示为 `proto 66`）；路由器的全局地址都在 WAN 上，其中落在内网前缀里的地址，由内网代为应答邻居请求。主机通过链路本地地址访问路由器，有 ULA 时也可以用其中的 `::1`。
+- **线路收回的前缀。** 内网会立即得知，sixup 以两个生存期都为 0 的方式通告它 90 分钟（`-lan-deprecate-hold`），主机随之丢弃这个前缀。内网前缀记录在状态目录里，所以重启前通告过、重启后线路没有再分配的前缀，也按同样的方式处理。
 - **只有一个 /64。** 线路不做委派时，上游 RA 中的 /64 移到内网上（RFC 7278）。在以太网 WAN 上，上游路由器仍会在 WAN 链路上解析内网地址，所以 sixup 在 WAN 上替它们应答邻居发现，并打出一条警告，说明应该向运营商申请什么。
-- **PPPoE。** 把 PPP 设备作为 WAN，即 `-wan ppp0`。点对点的 WAN 没有地址解析，共享的 /64 不需要代理；收不到 RA 时，默认路由直接指向这个设备。
+- **PPPoE。** 把 PPP 设备作为 WAN，即 `-wan ppp0`。点对点的 WAN 没有地址解析，共享的 /64 不需要代理；收不到 RA 时，默认路由直接指向这个设备。RA 会把线路较小的 MTU 1492 告诉内网，主机不必依赖路径 MTU 发现；`-ra-mtu` 可以指定其他值。
 - **MAP-E。** DHCPv6 带有 MAP-E 选项，或者前缀符合日本 IPoE 运营商（v6plus、BIGLOBE、OCN、NURO）的规则表时，sixup 建立隧道 `sixup-ipv4`，配置共享的 IPv4 地址，经隧道添加一条 metric 较高的 IPv4 默认路由，并维护 nftables 表 `inet sixup`，把源端口限制在线路分到的端口集内，同时钳制 TCP MSS。
 - **DS-Lite。** DHCPv6 给出 AFTR 名称时，sixup 解析它并建立隧道。转换由 AFTR 完成，这里只设置 MSS 钳制。
 - **DHCPv6 没有描述的隧道**，例如固定的 4in6 隧道。隧道流量到达 WAN 时，sixup 抓包推断出两端地址和 IPv4 地址。
@@ -72,6 +82,43 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1 -ula auto
 ```
 
+## 线路只给一个 /64
+
+线路不做委派时，上游 RA 中的 /64 移到内网上，路由器在 WAN 上替内网主机应答邻居发现（RFC 7278）。这就是默认的 `-wan-shared64 lan`。其他布局把 /64 放在别处：
+
+- `wan` 把 /64 留在 WAN 上，每台内网主机各有一条 /128 路由。内网将要共享的 /64 中有手动配置的地址时，会自动选用这种布局。
+- `split` 在两侧都使用 /128 路由，路由器自己访问不到尚未学到的主机。
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -wan-shared64 wan
+```
+
+代理的行为由 `-ndproxy-mode` 决定。`auto` 在广播型 WAN 上共享 /64 时开启 `forward`，先在另一侧探测再应答，两个方向都是这样。`prefix` 对 WAN 上询问内网前缀中任何地址的邻居请求都直接应答，不做探测；`static` 只把 `-ndproxy-static` 列出的条目放进内核的代理表；`off` 不应答。`-ndproxy-exclude` 把某个前缀排除在代理之外。
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -ndproxy-mode static -ndproxy-static 2001:db8:1:1::100
+```
+
+多台路由器逐级串联时，每一台都可以再把这个 /64 共享下去，各自替自己后面的主机应答。
+
+## 调整前缀获取方式
+
+sixup 请求 /56，运营商委派多长就用多长；提示长度被拒绝时，会不带提示再请求一次。要请求其他长度，比如合同上写的长度，就直接指定。
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -dhcp6c-pd-len 60
+```
+
+RA 设置了 M 或 O 时，DHCPv6 客户端启动；两者都没设置时，也会尝试 PD。`-dhcp6c-mode on` 总是运行客户端，`off` 从不运行，适用于全部参数都由 RA 给出的线路。客户端还会为 WAN 接口自身请求地址（IA_NA），`-dhcp6c-ia-na=false` 不再请求。`-dhcp6c-pd-len 0` 不请求前缀。
+
+委派前缀和 RA 前缀都有时，内网使用委派前缀。`-wan-prefer ra` 改为使用 RA 前缀。`-wan-slaac=false` 不在 WAN 上配置 SLAAC 地址，`-wan-ra=false` 完全忽略上游 RA，适用于手动配置的 WAN。
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -wan-prefer ra
+```
+
+前缀在重启前后保持不变：DUID 保存在状态目录里，退出时也不释放，所以运营商续租的仍是同一个前缀。`-dhcp6c-release` 改为在退出时归还。
+
 ## SoftBank 光
 
 SoftBank 光（ソフトバンク光）给内网的前缀来自 RA 或 DHCPv6-PD，取决于这项服务下面的 NTT 线路给的是哪一种；IPv4 走一条 DHCPv6 没有描述的 4in6 隧道。边界中继把这条隧道发往租用的 Hikari BB Unit 在 WAN 上使用的地址。sixup 能从这些流量中找出隧道，但自己没有这个地址时，不会为它应答邻居发现，隧道也就建立不起来。用 `-wan-iid` 指定 BB Unit 的接口标识。1G 的服务通常是 `::1111:1111:1111:1111`；如果不是，BB Unit 的状态页面上应该能看到这个地址。
@@ -90,7 +137,7 @@ sudo sixup -wan eth0 -wan-iid ::1111:1111:1111:1111 -lan eth1
 sudo sixup -wan eth0 -routed-prefix 2001:db8:100::/48 -lan eth1
 ```
 
-sixup 不改动 WAN 上的这个地址，也不在 WAN 上添加自己的地址。前缀按委派前缀处理，切分给各个内网网段，也委派给下级路由器。这时 DHCPv6 客户端只请求 DNS 服务器等配置；拿不到 DNS 服务器时，用 `-ra-dns` 指定。
+sixup 不改动 WAN 上的这个地址，也不在它旁边添加 SLAAC 或 IA_NA 地址；两个生存期都是无限的地址视为手动配置，其中第一个就是 WAN 地址。前缀按委派前缀处理，切分给各个内网网段，也委派给下级路由器。这时 DHCPv6 客户端只请求 DNS 服务器等配置；拿不到 DNS 服务器时，用 `-ra-dns` 指定。
 
 不是路由过来、而是在 WAN 链路上的 /64，比如 VPS 的 /64，改用 `-wan-prefix`，处理方式和 RA 给出的一样，与内网共享。如果其中的地址已经手动配置好，用 `-wan-prefix auto` 从这个地址读取 /64；这时 /64 留在 WAN 上，路由器在内网上取其中一个 /128，并在 WAN 上替内网主机应答邻居发现。
 
@@ -106,6 +153,22 @@ sixup 不改动 WAN 上的这个地址，也不在 WAN 上添加自己的地址�
 sudo sixup -wan eth0 -lan eth1 -tunnel-nat off
 ```
 
+## 调整 IPv4 隧道
+
+DS-Lite、MAP-E 或 IPIP6 隧道是设备 `sixup-ipv4`，MTU 为 WAN 的 MTU 减 40。线路路径更窄时，需要更小的 MTU。
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -tunnel-mtu 1460
+```
+
+`-tunnel-dev` 指定设备名，`-tunnel-dev ""` 不建立设备，适用于根据 sixup 打印的参数自己建立隧道的情况。经隧道的 IPv4 默认路由 metric 为 4096，已有的 IPv4 默认路由仍然优先；`-tunnel-route4-metric` 修改这个值，`0` 不添加路由。
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -tunnel-route4-metric 100
+```
+
+DHCPv6 没有给出 MAP-E 选项时，sixup 按日本 IPoE 运营商的规则表推算参数；规则表对某条线路不适用时，用 `-tunnel-mape-rules=false` 关闭。DHCPv6 完全没有给出隧道时，sixup 在 WAN 上寻找隧道流量；`-tunnel-capture=false` 关闭这一功能。
+
 ## 给容器做 NAT66
 
 Docker 给容器分配固定地址，跟不上会变的前缀，所以给 Docker 网络配 ULA，再自己做 NAT66，是实际可行的做法。sixup 拒绝从它的 LAN 接口发出的 ULA，但对其他接口发出的流量，要等源地址转换之后才检查：经过你的 NAT 转换的可以出去，没有转换、仍带着 ULA 的会被丢弃。同样，用目的地址转换发布的端口可以从外网访问，不管规则是 Docker 写的还是你自己写的。
@@ -119,12 +182,20 @@ table ip6 docker-nat {
 }
 ```
 
-## 给路由器固定地址
+## 给路由器固定 WAN 地址
 
-运营商换前缀时接口标识不变，路由器就容易找到。WAN 的第一个接口标识对应的地址，就是 sixup 报告的 WAN 地址。
+运营商换前缀时接口标识不变，路由器就容易找到。WAN 的第一个接口标识对应的地址，就是 sixup 报告的 WAN 地址。SLAAC 和 IA_NA 都没有给 WAN 分配地址时，它的静态地址放在第一个内网的 /64 里，所以 `-wan-iid` 要避开内网主机的地址。
 
 ```sh
-sudo sixup -wan eth0 -wan-iid ::1 -lan eth1 -lan-iid ::1
+sudo sixup -wan eth0 -wan-iid ::1 -lan eth1
+```
+
+## 创建内网 ULA
+
+ULA 在运营商的前缀之外，给内网一组自己的地址。每个内网分到其中一个 /64，主机在里面取的地址不随运营商换前缀而变，WAN 断开时也能使用。路由器在每个这样的 /64 中取 `::1`，这是它在内网上除 link-local 之外唯一的地址。`auto` 随机生成一个 /48，保存在 `/var/lib/sixup/ula`。
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -ula auto
 ```
 
 ## 路由器自己的流量使用轮换地址
@@ -149,10 +220,10 @@ sudo sixup -wan eth0 -lan eth1 -tempaddr -tempaddr-regen 5m -tempaddr-max 32
 
 默认情况下，内网拿到的是上游下发的 DNS 服务器。`-ra-dns` 在 RA 和 DHCPv6 服务器中替换它们，按顺序列出各项。
 
-路由器上运行的解析器写作 `self`，也就是路由器在各个内网上的地址。用 ULA，运营商换前缀后这个地址仍然有效。
+路由器上运行的解析器写作 `self`，也就是路由器在各个内网 ULA 中的地址，运营商换前缀或 WAN 断开时仍可访问。没有 ULA 时，`self` 是路由器的 WAN 地址。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -ula auto -lan-iid ::1 -ra-dns self
+sudo sixup -wan eth0 -lan eth1 -ula auto -ra-dns self
 ```
 
 内网中另一台主机上的解析器，直接写它的地址。出于同样的原因，给这台主机一个 ULA 中的固定地址。
@@ -178,11 +249,11 @@ sudo sixup -wan eth0 -lan eth1 -dhcp6s-mode stateful \
   -dhcp6s-static mac=aa:bb:cc:00:00:01,addr=::100
 ```
 
-RA 会设置 M 标志，主机因此向 DHCPv6 请求地址。`-dhcp6s-mode stateless` 不分配地址，只回答 DNS 等选项，并向下级路由器委派前缀。
+RA 会设置 M 标志，主机因此向 DHCPv6 请求地址。地址的接口标识取自 `1000` 到 `ffff`；`-dhcp6s-pool 100-1ff` 指定其他范围。`-dhcp6s-mode stateless` 不分配地址，只回答 DNS 等选项，并向下级路由器委派前缀。
 
 ## 下级路由器
 
-DHCPv6 服务器从上游委派的前缀中划出前缀，避开内网子网，委派给下级路由器，默认是 /60。在这台 sixup 下面再接一台 sixup，不需要任何配置。
+DHCPv6 服务器从上游委派的前缀中划出前缀，避开内网子网，委派给下级路由器，长度默认按上游委派的大小自动决定。在这台 sixup 下面再接一台 sixup，不需要任何配置。
 
 ```sh
 # 上级路由器
@@ -191,7 +262,9 @@ sudo sixup -wan eth0 -lan eth1 -dhcp6s-mode stateless
 sudo sixup -wan eth0 -lan eth1
 ```
 
-下级路由器请求 /56，拿到一个 /60，再切分给自己的内网。这要求上游委派的前缀短于 /64，因为一个 /64 分给内网以后，就没有剩余的空间了。`-dhcp6s-pd-len 0` 关闭下游委派。
+下级路由器请求 /56，最多拿到上级能分出的大小，例如从 /56 中拿到一个 /60，再切分给自己的内网。`-dhcp6s-pd-len` 可以指定这个长度。这要求上游委派的前缀短于 /64，因为一个 /64 分给内网以后，就没有剩余的空间了。`-dhcp6s-pd-len 0` 关闭下游委派。
+
+上级路由器有 ULA 时，每台下级路由器在同一次委派中也会分到它的一部分。下级路由器没有自己的 `-ula` 时就使用这一部分。这样同一站点内所有路由器后面的主机，都能用 ULA 互相访问，也能访问每台路由器；其他站点的 ULA 则进不来。
 
 上级路由器的防火墙放行发往委派前缀的流量，交给下级路由器自己的防火墙处理，所以在下级路由器上用 PCP 打开的端口可以从外部访问。
 
@@ -199,7 +272,7 @@ sudo sixup -wan eth0 -lan eth1
 
 内网可以只用 IPv6，没有 IPv4 地址，没有 DHCPv4，也不用同时维护两套协议。客户端仍然可以通过 NAT64 访问 IPv4 互联网，由路由器把它们的 IPv6 包转换成 IPv4。改用 IPv6 单栈，是一个网络能为 IPv6 做的最有意义的事情之一，因为每多一个这样的网络，大家继续保留 IPv4 的理由就少一个。如果你打算这样做，这一节就是为你写的。
 
-安装 Jool 模块，再启用 NAT64。如果模块没有加载，sixup 会用 `/sbin/modprobe jool` 加载它。
+安装 Jool 模块，再启用 NAT64。如果模块没有加载，sixup 会用 `/sbin/modprobe jool` 加载它。与命名空间之间通过 IPv4 /31 `192.168.255.254/31` 相连；它与本机的地址或路由重叠时，sixup 拒绝启动，用 `-jool-ipv4` 指定另一个。
 
 ```sh
 sudo sixup -wan eth0 -lan eth1 -nat64 jool
@@ -233,4 +306,25 @@ sudo sixup -wan eth0 -lan eth1 -nat64 jool -nat64-prefix fd00:64::/96
 
 ```sh
 sudo sixup -wan eth0 -lan eth1 -nat64 jool -ra-pref64 off
+```
+
+## 内网主机后面的另一个网络
+
+内网中的主机可能自己路由一个网络，比如给客户端分配前缀的 VPN 服务器。`-ra-route` 让内网主机把发往这个前缀的流量交给路由器，路由器自己需要一条到这台主机的路由，源地址过滤也要放行这个前缀。
+
+```sh
+sudo ip -6 route add 2001:db8:200::/64 via fe80::1234 dev eth1
+sudo sixup -wan eth0 -lan eth1 -ra-route 2001:db8:200::/64 -source-filter=false
+```
+
+源地址过滤只让内网用自己的前缀和委派出去的前缀向外发包，其他源地址会收到 ICMPv6 code 5（BCP 38）。关闭它，这个路由过来的前缀就能出去；此时上游也要把这个前缀路由到本路由器。`-ra-onlink=false` 则是另一个方向的做法：主机之间的流量也都经过路由器。
+
+## 在容器里运行
+
+sixup 需要使用主机网络，并自己设置 `forwarding`、`accept_ra`、`proxy_ndp` 和 `proxy_delay`。`/proc/sys` 只读时，比如容器没有 `privileged`，就在主机上设置这些值并加上 `-no-sysctl`：forwarding 为 1，内网的 `accept_ra` 为 0，内网的 `proxy_ndp` 为 1、`proxy_delay` 为 0。状态目录要放在卷上，否则新容器会得到新的 DUID，运营商可能分配另一个前缀。[`docker-compose.yml`](../docker-compose.yml) 演示了这两点。
+
+```sh
+docker run -d --network host --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+  -v sixup-state:/var/lib/sixup ghcr.io/lqs/sixup -wan eth0 -lan eth1 -no-sysctl \
+  -state-dir /var/lib/sixup
 ```

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -119,6 +120,7 @@ func addrDel(ifi int, addr netip.Addr, plen int) error {
 }
 
 type ifAddr struct {
+	Index     int
 	Addr      netip.Addr
 	PrefixLen int
 	Flags     uint32
@@ -126,7 +128,7 @@ type ifAddr struct {
 	Valid     uint32
 }
 
-// addrList lists the IPv6 addresses on an interface.
+// addrList lists the IPv6 addresses on an interface, or on every interface when ifi is 0.
 func addrList(ifi int) ([]ifAddr, error) {
 	c, err := rtDial()
 	if err != nil {
@@ -147,14 +149,15 @@ func addrList(ifi int) ([]ifAddr, error) {
 		if len(m.Data) < 8 {
 			continue
 		}
-		if int(nativeEndian.Uint32(m.Data[4:8])) != ifi {
+		index := int(nativeEndian.Uint32(m.Data[4:8]))
+		if ifi != 0 && index != ifi {
 			continue
 		}
 		ad, err := netlink.NewAttributeDecoder(m.Data[8:])
 		if err != nil {
 			continue
 		}
-		ia := ifAddr{PrefixLen: int(m.Data[1]), Flags: uint32(m.Data[2])}
+		ia := ifAddr{Index: index, PrefixLen: int(m.Data[1]), Flags: uint32(m.Data[2])}
 		for ad.Next() {
 			switch ad.Type() {
 			case unix.IFA_ADDRESS:
@@ -179,7 +182,7 @@ func addrList(ifi int) ([]ifAddr, error) {
 
 // routeSet adds or replaces a route; an invalid gw means a directly connected route.
 func routeSet(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires time.Duration) error {
-	return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNICAST, 0, ifi, dst, gw, metric, expires)
+	return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNICAST, 0, ifi, dst, gw, netip.Addr{}, metric, expires)
 }
 
 // defaultRouteVia reports whether the main table has an IPv6 default route through ifi, such as one
@@ -221,7 +224,7 @@ func defaultRouteVia(ifi int) bool {
 }
 
 func routeDel(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32) error {
-	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, 0, ifi, dst, gw, metric, 0)
+	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, 0, ifi, dst, gw, netip.Addr{}, metric, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return nil
 	}
@@ -232,9 +235,9 @@ func routeDel(ifi int, dst netip.Prefix, gw netip.Addr, metric uint32) error {
 // Destination Unreachable.
 func routeUnreachable(dst netip.Prefix, expires time.Duration, del bool) error {
 	if !del {
-		return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNREACHABLE, 0, 0, dst, netip.Addr{}, 0, expires)
+		return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNREACHABLE, 0, 0, dst, netip.Addr{}, netip.Addr{}, 0, expires)
 	}
-	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNREACHABLE, 0, 0, dst, netip.Addr{}, 0, 0)
+	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNREACHABLE, 0, 0, dst, netip.Addr{}, netip.Addr{}, 0, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return nil
 	}
@@ -246,15 +249,70 @@ func routeUnreachable(dst netip.Prefix, expires time.Duration, del bool) error {
 // that clean it up only for permanent addresses, so an address that stops covering its prefix
 // needs its route taken away by hand.
 func prefixRouteDel(ifi int, dst netip.Prefix) error {
-	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, unix.RTPROT_KERNEL, ifi, dst, netip.Addr{}, 0, 0)
+	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, unix.RTPROT_KERNEL, ifi, dst, netip.Addr{}, netip.Addr{}, 0, 0)
 	if errors.Is(err, unix.ESRCH) {
 		return nil
 	}
 	return err
 }
 
+// rtprotSixup marks the on-link routes sixup puts on a LAN, so that a restart finds the ones it
+// no longer wants without touching anyone else's; ip -6 route shows it as proto 66.
+const rtprotSixup = 66
+
+// lanRouteSet adds or replaces the on-link route of a LAN prefix, with src as the preferred
+// source when valid. Metric 256 is that of the route the kernel adds with an address, which an
+// address left by an earlier run may still hold, so this replaces it instead of standing beside it.
+func lanRouteSet(ifi int, dst netip.Prefix, src netip.Addr, expires time.Duration) error {
+	return routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create|netlink.Replace, unix.RTN_UNICAST, rtprotSixup, ifi, dst, netip.Addr{}, src, 256, expires)
+}
+
+func lanRouteDel(ifi int, dst netip.Prefix) error {
+	err := routeOp(unix.RTM_DELROUTE, netlink.Request|netlink.Acknowledge, unix.RTN_UNICAST, rtprotSixup, ifi, dst, netip.Addr{}, netip.Addr{}, 0, 0)
+	if errors.Is(err, unix.ESRCH) {
+		return nil
+	}
+	return err
+}
+
+// lanRouteList returns the destinations of the routes on ifi that lanRouteSet added.
+func lanRouteList(ifi int) ([]netip.Prefix, error) {
+	c, err := rtDial()
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	// a failed dump returns no messages, so the error is all that comes back
+	msgs, err := c.Execute(netlink.Message{Header: netlink.Header{Type: unix.RTM_GETROUTE, Flags: netlink.Request | netlink.Dump}, Data: []byte{unix.AF_INET6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}})
+	var out []netip.Prefix
+	for _, m := range msgs {
+		// rtmsg: family, dst_len, src_len, tos, table, protocol, scope, type, flags
+		if len(m.Data) < 12 || m.Data[5] != rtprotSixup {
+			continue
+		}
+		ad, derr := netlink.NewAttributeDecoder(m.Data[12:])
+		var dst netip.Addr
+		oif := 0
+		for derr == nil && ad.Next() {
+			switch ad.Type() {
+			case unix.RTA_DST:
+				if b := ad.Bytes(); len(b) == 16 {
+					dst = netip.AddrFrom16([16]byte(b))
+				}
+			case unix.RTA_OIF:
+				oif = int(ad.Uint32())
+			}
+		}
+		if oif == ifi && dst.IsValid() {
+			out = append(out, netip.PrefixFrom(dst, int(m.Data[1])))
+		}
+	}
+	return out, err
+}
+
 // routeOp sends one route request; proto 0 means ours, RTPROT_RA for IPv6 and RTPROT_STATIC for IPv4.
-func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, rtn, proto uint8, ifi int, dst netip.Prefix, gw netip.Addr, metric uint32, expires time.Duration) error {
+// A valid src is the preferred source address of the route.
+func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, rtn, proto uint8, ifi int, dst netip.Prefix, gw, src netip.Addr, metric uint32, expires time.Duration) error {
 	if dryRun {
 		debugf("[dry-run] skip route %s -> %s dev %d", dst, gw, ifi)
 		return nil
@@ -290,6 +348,9 @@ func routeOp(typ netlink.HeaderType, flags netlink.HeaderFlags, rtn, proto uint8
 	}
 	if gw.IsValid() {
 		ae.Bytes(unix.RTA_GATEWAY, addrBytes(gw))
+	}
+	if src.IsValid() {
+		ae.Bytes(unix.RTA_PREFSRC, addrBytes(src))
 	}
 	if metric != 0 {
 		ae.Uint32(unix.RTA_PRIORITY, metric)
@@ -341,6 +402,59 @@ func neighProxySet(ifi int, addr netip.Addr, del bool) error {
 		return nil
 	}
 	return err
+}
+
+// neighProxyList returns the addresses the kernel proxy neighbor table answers for on ifi.
+func neighProxyList(ifi int) ([]netip.Addr, error) {
+	c, err := rtDial()
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	// ndmsg: family, pad(3), ifindex(4), state(2), flags, type; NTF_PROXY asks for the proxy table
+	hdr := make([]byte, 12)
+	hdr[0] = unix.AF_INET6
+	hdr[10] = unix.NTF_PROXY
+	// a failed dump returns no messages, so the error is all that comes back
+	msgs, err := c.Execute(netlink.Message{Header: netlink.Header{Type: unix.RTM_GETNEIGH, Flags: netlink.Request | netlink.Dump}, Data: hdr})
+	var out []netip.Addr
+	for _, m := range msgs {
+		if len(m.Data) < 12 || int(nativeEndian.Uint32(m.Data[4:8])) != ifi {
+			continue
+		}
+		ad, derr := netlink.NewAttributeDecoder(m.Data[12:])
+		for derr == nil && ad.Next() {
+			if b := ad.Bytes(); ad.Type() == unix.NDA_DST && len(b) == 16 {
+				out = append(out, netip.AddrFrom16([16]byte(b)))
+			}
+		}
+	}
+	return out, err
+}
+
+// addrWatch reports, through a non-blocking send on ch, that IPv6 addresses changed on some
+// interface, until ctx ends.
+func addrWatch(ctx context.Context, ch chan<- struct{}) error {
+	c, err := netlink.Dial(unix.NETLINK_ROUTE, &netlink.Config{Groups: unix.RTMGRP_IPV6_IFADDR})
+	if err != nil {
+		return err
+	}
+	go func() {
+		<-ctx.Done()
+		c.Close()
+	}()
+	go func() {
+		for {
+			if _, err := c.Receive(); err != nil {
+				return
+			}
+			select {
+			case ch <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	return nil
 }
 
 // linkWatch subscribes to link state changes and reports (ifindex, up) events.

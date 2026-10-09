@@ -47,7 +47,7 @@ type tunnelGuess struct {
 
 // tunnelWatcher is the daemon-mode fallback: if a DHCPv6 binding carries no tunnel options it starts a capture,
 // stores the result and stops once inference is confident, and restarts from scratch when the WAN prefix or address
-// changes. It is capped by -tunnel-capture-max so it does not keep consuming every IPv6 frame indefinitely.
+// changes. It is capped by tunCapMax so it does not keep consuming every IPv6 frame indefinitely.
 type tunnelWatcher struct {
 	ifname string
 	store  *Store

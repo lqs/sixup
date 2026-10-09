@@ -90,6 +90,9 @@ func (s *dhcpServer) run(ctx context.Context, hub *linkHub, store *Store, ch <-c
 	})
 }
 
+// leaseSweep is how often expired leases and delegations are dropped; tests shorten it.
+var leaseSweep = time.Minute
+
 func (s *dhcpServer) serve(ctx context.Context, ch <-chan Snapshot) {
 	lc := net.ListenConfig{Control: reusePort}
 	pconn, err := lc.ListenPacket(ctx, "udp6", "[::]:547")
@@ -110,7 +113,7 @@ func (s *dhcpServer) serve(ctx context.Context, ch <-chan Snapshot) {
 	s.mu.Unlock()
 	s.restoreRoutes()
 	go s.reader(pc)
-	tick := time.NewTicker(time.Minute)
+	tick := time.NewTicker(leaseSweep)
 	defer tick.Stop()
 	for {
 		select {
@@ -310,13 +313,13 @@ func (s *dhcpServer) handle(msg *dhcpv6.Message, peer netip.Addr) *dhcpv6.Messag
 			delete(s.leases, key)
 		}
 		for _, ia := range msg.Options.IAPD() {
-			key := leaseKey(duidHex, binary.BigEndian.Uint32(ia.IaId[:]))
-			if s.pd == nil || !s.pd.has(key) {
+			iaid := binary.BigEndian.Uint32(ia.IaId[:])
+			if s.pd == nil || !s.pd.has(pdKey(duidHex, iaid, false)) && !s.pd.has(pdKey(duidHex, iaid, true)) {
 				pd := &dhcpv6.OptIAPD{IaId: ia.IaId}
 				pd.Options.Add(&dhcpv6.OptStatusCode{StatusCode: iana.StatusNoBinding, StatusMessage: "no binding"})
 				resp.AddOption(pd)
 			}
-			s.undelegate(key)
+			s.undelegate(duidHex, iaid)
 		}
 		resp.AddOption(&dhcpv6.OptStatusCode{StatusCode: iana.StatusSuccess, StatusMessage: "released"})
 		s.saveLeases()
@@ -444,77 +447,93 @@ func (s *dhcpServer) lifetimes(p Prefix, now time.Time) (pref, valid time.Durati
 	return min(pref, valid), valid
 }
 
-// delegate answers one IA_PD out of the downstream pool; prefixes the router holds that it no
-// longer gets are returned with lifetime 0, as RFC 9096 L-13 asks stale ones to be signalled.
+// delegate answers one IA_PD out of the downstream pool: a prefix of the upstream delegation and
+// one of the ULA, each when there is one. Prefixes the router holds that it no longer gets are
+// returned with lifetime 0, as RFC 9096 L-13 asks stale ones to be signalled.
 func (s *dhcpServer) delegate(duidHex string, ia *dhcpv6.OptIAPD, peer netip.Addr, commit, wantsReconf bool) *dhcpv6.OptIAPD {
 	out := &dhcpv6.OptIAPD{IaId: ia.IaId}
 	if s.pd == nil {
 		out.Options.Add(&dhcpv6.OptStatusCode{StatusCode: iana.StatusNoPrefixAvail, StatusMessage: "downstream PD disabled"})
 		return out
 	}
+	// a hint for the length alone stands for either; a prefix, for the one it lies in
 	var held []netip.Prefix
+	var want [2]netip.Prefix
 	for _, ip := range ia.Options.Prefixes() {
 		if ip.Prefix == nil {
 			continue
 		}
 		a, _ := netip.AddrFromSlice(ip.Prefix.IP)
 		ones, _ := ip.Prefix.Mask.Size()
-		held = append(held, netip.PrefixFrom(a.Unmap(), ones))
+		h := netip.PrefixFrom(a.Unmap(), ones)
+		held = append(held, h)
+		for i := range want {
+			if !want[i].IsValid() && (h.Addr().IsUnspecified() || h.Addr().IsPrivate() == (i == 1)) {
+				want[i] = h
+			}
+		}
 	}
-	var want netip.Prefix
-	if len(held) > 0 {
-		want = held[0]
-	}
-	key := leaseKey(duidHex, binary.BigEndian.Uint32(ia.IaId[:]))
+	iaid := binary.BigEndian.Uint32(ia.IaId[:])
 	now := time.Now()
 	s.pd.mu.Lock()
 	defer s.pd.mu.Unlock()
-	pf, up, ok := s.pd.pick(s.snap, key, want)
+	var got []netip.Prefix
+	for i, ula := range []bool{false, true} {
+		key := pdKey(duidHex, iaid, ula)
+		pf, up, ok := s.pd.pick(s.snap, key, want[i], ula)
+		if !ok {
+			continue
+		}
+		got = append(got, pf)
+		pref, valid := s.lifetimes(up, now)
+		if len(got) == 1 || pref/2 < out.T1 {
+			out.T1, out.T2 = pref/2, pref*8/10
+		}
+		out.Options.Add(&dhcpv6.OptIAPrefix{Prefix: prefixToIPNet(pf), PreferredLifetime: pref, ValidLifetime: valid})
+		if !commit {
+			continue
+		}
+		l := &PDLease{DUID: duidHex, IAID: iaid, Prefix: pf, Iface: s.ifname, Peer: peer, Expires: now.Add(valid)}
+		old := s.pd.leases[key]
+		if wantsReconf {
+			l.ReconfKey = s.reconfKey(duidHex, true)
+		}
+		if old == nil || old.Prefix != pf {
+			infof("[dhcpv6-server %s] delegated %s to %s", s.ifname, pf, peer)
+		}
+		if old != nil && (old.Prefix != pf || old.Peer != peer || old.Iface != s.ifname) {
+			s.pdRoute(old, true)
+		}
+		s.pd.leases[key] = l
+		s.pd.save()
+		s.pdRoute(l, false)
+	}
 	for _, h := range held {
-		if !h.Addr().IsUnspecified() && h.Masked() != pf {
+		if !h.Addr().IsUnspecified() && !slices.Contains(got, h.Masked()) {
 			out.Options.Add(&dhcpv6.OptIAPrefix{Prefix: prefixToIPNet(h.Masked())})
 		}
 	}
-	if !ok {
+	if len(got) == 0 {
 		out.Options.Add(&dhcpv6.OptStatusCode{StatusCode: iana.StatusNoPrefixAvail, StatusMessage: "no prefix to delegate"})
-		return out
 	}
-	pref, valid := s.lifetimes(up, now)
-	out.T1 = pref / 2
-	out.T2 = pref * 8 / 10
-	out.Options.Add(&dhcpv6.OptIAPrefix{Prefix: prefixToIPNet(pf), PreferredLifetime: pref, ValidLifetime: valid})
-	if !commit {
-		return out
-	}
-	l := &PDLease{DUID: duidHex, IAID: binary.BigEndian.Uint32(ia.IaId[:]), Prefix: pf, Iface: s.ifname, Peer: peer, Expires: now.Add(valid)}
-	old := s.pd.leases[key]
-	if wantsReconf {
-		l.ReconfKey = s.reconfKey(duidHex, true)
-	}
-	if old == nil || old.Prefix != pf {
-		infof("[dhcpv6-server %s] delegated %s to %s", s.ifname, pf, peer)
-	}
-	if old != nil && (old.Prefix != pf || old.Peer != peer || old.Iface != s.ifname) {
-		s.pdRoute(old, true)
-	}
-	s.pd.leases[key] = l
-	s.pd.save()
-	s.pdRoute(l, false)
 	return out
 }
 
-// undelegate ends the delegation of key, as on RELEASE.
-func (s *dhcpServer) undelegate(key string) {
+// undelegate ends the delegations of an IA_PD, as on RELEASE.
+func (s *dhcpServer) undelegate(duidHex string, iaid uint32) {
 	if s.pd == nil {
 		return
 	}
 	s.pd.mu.Lock()
 	defer s.pd.mu.Unlock()
-	if l := s.pd.leases[key]; l != nil {
-		delete(s.pd.leases, key)
-		s.pd.save()
-		s.pdRoute(l, true)
-		infof("[dhcpv6-server %s] %s released by %s", s.ifname, l.Prefix, l.Peer)
+	for _, ula := range []bool{false, true} {
+		key := pdKey(duidHex, iaid, ula)
+		if l := s.pd.leases[key]; l != nil {
+			delete(s.pd.leases, key)
+			s.pd.save()
+			s.pdRoute(l, true)
+			infof("[dhcpv6-server %s] %s released by %s", s.ifname, l.Prefix, l.Peer)
+		}
 	}
 }
 
@@ -695,7 +714,8 @@ func (s *dhcpServer) onPrefixChange(old Snapshot) {
 	s.saveLeases()
 	// A delegation no longer inside the upstream one goes; the router learns it at its next renewal.
 	s.dropDelegations(func(l *PDLease) bool {
-		pf, _, _ := s.pd.pick(s.snap, leaseKey(l.DUID, l.IAID), netip.Prefix{})
+		ula := l.Prefix.Addr().IsPrivate()
+		pf, _, _ := s.pd.pick(s.snap, pdKey(l.DUID, l.IAID, ula), netip.Prefix{}, ula)
 		return pf != l.Prefix
 	})
 }

@@ -22,11 +22,12 @@ import (
 
 // IFA_F_* address flags (linux/if_addr.h)
 const (
-	ifaFNodad      = 0x02
-	ifaFOptimistic = 0x04
-	ifaFDeprecated = 0x20
-	ifaFTentative  = 0x40
-	ifaFDadFailed  = 0x08
+	ifaFNodad         = 0x02
+	ifaFOptimistic    = 0x04
+	ifaFDeprecated    = 0x20
+	ifaFTentative     = 0x40
+	ifaFDadFailed     = 0x08
+	ifaFNoprefixroute = 0x200
 )
 
 // stableIID derives an RFC 7217 interface identifier: stable per network, unlinkable across networks.
@@ -81,9 +82,8 @@ type tempConfig struct {
 	enabled       bool
 	regenInterval time.Duration
 	preferredLft  time.Duration
-	validLft      time.Duration
 	maxConcurrent int
-	skipDAD       bool
+	skipDAD       bool // tests only
 	grace         time.Duration
 }
 
@@ -96,8 +96,10 @@ type tempAddr struct {
 	emptyCnt int
 }
 
-// addrManager owns this host's global addresses on one LAN interface:
-// prefix addresses (one per -lan-iid / -wan-iid policy) follow the snapshot; temporary addresses rotate periodically and retire once no longer in use.
+// addrManager owns this host's global addresses on one interface:
+// prefix addresses (one per -wan-iid policy, ::1 in a LAN's ULA) follow the snapshot; temporary addresses rotate periodically and retire once no longer in use.
+// A LAN gets addresses only in its ULA prefixes, deprecated and without a prefix route: lanRoutes
+// routes every LAN prefix and names them as the source for their own prefix only.
 type addrManager struct {
 	ifname   string
 	ifi      *net.Interface
@@ -406,6 +408,10 @@ func (m *addrManager) applyPrefixAddrs() {
 	added := false
 	for a, p := range want {
 		pref, valid := p.preferredLeft(now), p.validLeft(now)
+		flags := uint32(0)
+		if m.side == sideLAN {
+			pref, flags = 0, ifaFNoprefixroute
+		}
 		plen := m.plen(p)
 		_, had := m.applied[a]
 		if old, ok := m.plens[a]; ok && old != plen {
@@ -421,7 +427,7 @@ func (m *addrManager) applyPrefixAddrs() {
 			}
 			had = false
 		}
-		if err := addrSet(m.ifi.Index, a, plen, pref, valid, false, 0); err != nil {
+		if err := addrSet(m.ifi.Index, a, plen, pref, valid, false, flags); err != nil {
 			errorf("[address %s] failed to configure %s: %v", m.ifname, a, err)
 			continue
 		}
@@ -484,12 +490,18 @@ func (m *addrManager) slotOf(a netip.Addr, prefix netip.Prefix) iidSlot {
 // usually left by a previous run (restart, changed IID policy), possibly set by another tool.
 // Addresses carry no ownership marker, but nothing else should live inside a managed prefix,
 // so deprecate them (preferred=0) and let drain reclaim them once unused, without cutting existing connections.
+// They give up their prefix route too: the kernel's own SLAAC on the WAN, before sixup set
+// forwarding, leaves a /64 that the layout may route to the LAN instead.
 func (m *addrManager) adoptStrays(want map[netip.Addr]Prefix) {
 	if dryRun {
 		return
 	}
 	list, err := addrList(m.ifi.Index)
 	if err != nil {
+		return
+	}
+	if m.side == sideLAN {
+		m.dropStrays(list, want)
 		return
 	}
 	managed := slices.Concat(m.pick(m.snap), m.tempPrefixes())
@@ -501,12 +513,26 @@ func (m *addrManager) adoptStrays(want map[netip.Addr]Prefix) {
 				break
 			}
 		}
-		if err := addrSet(m.ifi.Index, ia.Addr, ia.PrefixLen, 0, 0, true, ifaFNodad); err != nil {
+		if err := addrSet(m.ifi.Index, ia.Addr, ia.PrefixLen, 0, 0, true, ifaFNodad|ifaFNoprefixroute); err != nil {
 			warnf("[address %s] failed to deprecate stray address %s: %v", m.ifname, ia.Addr, err)
 			continue
 		}
 		infof("[address %s] adopted stray address %s/%d, will reclaim once no longer in use", m.ifname, ia.Addr, ia.PrefixLen)
 		m.temps = append(m.temps, &tempAddr{addr: ia.Addr, prefix: prefix, plen: ia.PrefixLen, created: time.Now(), state: "deprecated"})
+	}
+}
+
+// dropStrays deletes at once the addresses of an earlier run in a prefix of the LAN: those in
+// its GUA prefixes, where the LAN holds no address of this router any more, and those of an
+// interface identifier or a ULA prefix given up. An address configured by hand stays. The kernel
+// keeps the prefix route of a deleted address with a finite lifetime, which lanRoutes replaces.
+func (m *addrManager) dropStrays(list []ifAddr, want map[netip.Addr]Prefix) {
+	for _, ia := range strayAddrs(list, want, m.snap.LAN[m.ifname], nil, nil) {
+		if err := addrDel(m.ifi.Index, ia.Addr, ia.PrefixLen); err != nil {
+			warnf("[address %s] failed to delete %s left by an earlier run: %v", m.ifname, ia.Addr, err)
+			continue
+		}
+		infof("[address %s] deleted %s/%d left by an earlier run", m.ifname, ia.Addr, ia.PrefixLen)
 	}
 }
 
@@ -714,6 +740,10 @@ func (m *addrManager) inUse(a netip.Addr) int {
 //   - empty: RFC 7217 stable address
 //   - "eui64": derived from the MAC
 //   - an address like ::1 / ::1111:2222:3333:4444: high 64 bits must be zero, low 64 bits used as a fixed IID
+//
+// lanIID is the suffix of this router's address in each LAN's ULA: ::1, as is customary for a gateway.
+var lanIID = iidPolicy{mode: iidFixed, fixed: [8]byte{7: 1}}
+
 type iidPolicy struct {
 	mode  iidMode
 	fixed [8]byte

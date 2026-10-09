@@ -269,7 +269,8 @@ func TestAddressDrainAgainstKernel(t *testing.T) {
 	}
 }
 
-// An address inside a managed prefix left by someone else is deprecated and drained.
+// An address inside a managed prefix of the WAN left by someone else is deprecated and drained,
+// and gives up its prefix route, which the layout may give to the LAN.
 func TestAddressAdoptStrayAgainstKernel(t *testing.T) {
 	enterNetNS(t)
 	loUp(t)
@@ -279,7 +280,7 @@ func TestAddressAdoptStrayAgainstKernel(t *testing.T) {
 	}
 	stray := netip.MustParseAddr("2001:db8:1::dead")
 	addrMust(t, lo.Index, stray, 64, false)
-	m := addrTestManager(sideLAN, addrLive("2001:db8:1::/64"))
+	m := addrTestManager(sideWAN, addrLive("2001:db8:1::/64"))
 	m.ifname, m.ifi = "lo", lo
 	m.applyPrefixAddrs()
 	tm := m.tempOf(stray)
@@ -291,8 +292,8 @@ func TestAddressAdoptStrayAgainstKernel(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, ia := range list {
-		if ia.Addr == stray && ia.Preferred != 0 {
-			t.Fatalf("the stray address is still preferred for %ds", ia.Preferred)
+		if ia.Addr == stray && (ia.Preferred != 0 || ia.Flags&ifaFNoprefixroute == 0) {
+			t.Fatalf("the stray address is still preferred for %ds, or keeps its prefix route: %#x", ia.Preferred, ia.Flags)
 		}
 	}
 }

@@ -700,12 +700,22 @@ func TestDHCPv6ClientScriptedAgainstKernel(t *testing.T) {
 			t.Fatal("no Information-Request after the refusal")
 		}
 
+		// a Reply that binds nothing ends the cycle once the retry wait is over, or ctx before
 		r.c.infoOnly, r.c.raOther = false, false
-		r.cycle()
-		r.advertise(pd(300*time.Second, 300*time.Second))
-		r.answer(r.expect(dhcpv6.MessageTypeRequest), dhcpv6.MessageTypeReply, gone)
-		r.settled()
+		bindNothing := func() {
+			t.Helper()
+			r.cycle()
+			r.advertise(pd(300*time.Second, 300*time.Second))
+			r.answer(r.expect(dhcpv6.MessageTypeRequest), dhcpv6.MessageTypeReply, gone)
+			r.settled()
+		}
+		bindNothing()
 		r.stop()
+		old := noBindingRetry
+		noBindingRetry = 10 * time.Millisecond
+		defer func() { noBindingRetry = old }()
+		bindNothing()
+		r.wait()
 	})
 
 	t.Run("Renew and Rebind", func(t *testing.T) {

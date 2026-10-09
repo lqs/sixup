@@ -78,128 +78,17 @@ For other needs, such as several LAN segments, fixed addresses, DNS servers or N
 > [!WARNING]
 > sixup has not been released yet, so options may be renamed or removed without notice.
 
-`sixup -h` lists every option in the groups below.
+`sixup -h` lists every option with its default, and the [recipes](docs/recipes.md) show them by
+need. Only the options for running sixup itself are listed here.
 
 - A boolean option is turned off with `=false`, for example `-wan-ra=false`.
 - A duration takes Go syntax: `30s`, `10m`, `1h30m`.
 - A repeatable option is given once per value: `-lan eth1 -lan eth2`.
 
-### Interfaces and prefixes
-
-| Option | Default | Description |
-|---|---|---|
-| `-wan` | | WAN interface. Required. If it is down at startup, sixup brings it up, as it does the `-lan` interfaces. |
-| `-lan` | | LAN interface, repeatable, as `name[:subnet-id]`. The subnet id, in decimal, picks which /64 of the delegated prefix goes to this interface; without one, the interfaces take 0, 1, 2 in the order given. Several LAN interfaces need a delegated prefix. |
-| `-ula` | | ULA prefix of this site. `auto` generates a random /48 and keeps it; prefixes such as `fd12:3456:789a::/48` are used as given, comma separated. Each LAN gets the /64 of its subnet id. |
-| `-lan-iid` | | Interface identifiers of the router's own addresses on each LAN prefix, comma separated, one address each, same syntax as `-wan-iid`. Empty means one RFC 7217 stable address. |
-| `-lan-deprecate-hold` | `1h30m` | How long a prefix the line took away is advertised with both lifetimes 0, so clients drop it (RFC 9096). The same goes after a restart for a prefix advertised before it that the line does not hand out again, since the LAN prefixes are recorded in the state directory. |
-
-### WAN side: DHCPv6 client
-
-| Option | Default | Description |
-|---|---|---|
-| `-dhcp6c-mode` | `auto` | `auto` follows the M and O flags of the upstream RA, `on` always runs the client, `off` never does. |
-| `-dhcp6c-pd-len` | `56` | Prefix length hinted when requesting a delegated prefix (IA_PD). The server decides the length it delegates; if it refuses the hint, sixup asks once more without one. `0` requests none. |
-| `-dhcp6c-ia-na` | `true` | Also request an address for the WAN interface itself (IA_NA). |
-| `-dhcp6c-pd-grace` | `10s` | Longest wait for a delegated prefix after startup; it ends as soon as PD succeeds or is refused, usually within a few seconds. Until then an RA prefix is not handed to the LAN, so it never has to be withdrawn again. When the RA sets M or O, the WAN also takes no address in it yet, since whether the LAN will share the /64 decides the address's prefix length. |
-| `-dhcp6c-release` | `false` | Send RELEASE on exit to give back the prefix and addresses. Off by default: the DUID is kept, so a restart renews the same prefix. A dry run always releases. |
-
-### WAN side: upstream RA and addresses
-
-Global addresses configured on the WAN by hand, such as the /126 of a point-to-point link, are left as they are, and the first one is the WAN address; sixup then adds no SLAAC or IA_NA address beside them. An address counts as configured by hand when both its lifetimes are infinite. When it is in a /64 the LAN would share, that /64 stays on the WAN: `-wan-shared64` defaults to `wan`, and `lan` is refused.
-
-| Option | Default | Description |
-|---|---|---|
-| `-wan-ra` | `true` | Listen to upstream RAs as a second prefix source, and maintain the default route from them. |
-| `-wan-slaac` | `true` | Configure SLAAC addresses on the WAN interface for RA prefixes with the A flag set. |
-| `-wan-iid` | | Interface identifiers of the static SLAAC addresses on the WAN interface, comma separated, one address each. Each is `stable` or empty for an RFC 7217 stable address, `eui64` to derive it from the MAC address, or a fixed suffix such as `::1` or `::1111:2222:3333:4444`. The first one is reported as the WAN address. |
-| `-wan-prefer` | `pd` | Which prefix wins when both a delegated prefix and an RA prefix are available: `pd` or `ra`. |
-| `-wan-prefix` | (empty) | On-link /64s of the WAN link that neither RA nor DHCPv6-PD tells, such as that of a VPS, comma-separated; shared with the LAN (RFC 7278). `auto` takes those of the addresses configured on the WAN by hand. |
-| `-routed-prefix` | (empty) | Prefixes of /64 or shorter the upstream routes to this router without RA or DHCPv6-PD telling it, such as that of a dedicated line or a data center's transit, comma-separated; split across the LANs as a delegation. |
-| `-wan-shared64` | `lan` | Layout when the upstream gives only one /64. `lan`: the /64 goes to the LAN, and hosts on the WAN link get /128 routes (RFC 7278). `wan`: the /64 stays on the WAN, and each LAN host gets a /128 route. `split`: /128 routes on both sides; the router itself cannot reach a host it has not learned yet. The /128 routes are added as the NDP proxy finds the hosts. |
-
-### LAN side: RA advertisement
-
-| Option | Default | Description |
-|---|---|---|
-| `-ra-min` | `3m20s` | Minimum interval between unsolicited RAs (MinRtrAdvInterval). |
-| `-ra-max` | `10m` | Maximum interval between unsolicited RAs (MaxRtrAdvInterval). |
-| `-ra-lifetime` | `45m` | Router lifetime carried in the RA (RFC 9096); 0 while the WAN has no default router. |
-| `-ra-slaac` | `true` | Set the A flag in the prefixes of the RA, so hosts form addresses by SLAAC. With `-dhcp6s-mode stateful`, turning it off hands out addresses by DHCPv6 only. |
-| `-ra-onlink` | `true` | Set the L flag in the prefixes of the RA, so hosts reach each other directly. Turned off, all their traffic goes through the router. |
-| `-ra-mtu` | `0` | MTU advertised in the RA. `0` advertises the WAN path MTU when it is smaller than the LAN interface MTU, taken from the upstream RA or the WAN interface, so a PPPoE line with 1492 no longer depends on path MTU discovery. |
-| `-ra-dns` | `upstream` | DNS servers announced on the LAN, by the RA and the DHCPv6 server. `off` announces none; otherwise a comma-separated list, in order, of `upstream` (the servers the upstream hands out), `self` (this router's address on that LAN, in its ULA when there is one, so renumbering leaves it valid) and IPv6 addresses. For example `self,upstream`. |
-| `-ra-pref64` | `auto` | NAT64 prefix advertised in the RA (RFC 8781). `auto` advertises this router's own, `-nat64-prefix`, while it translates, and otherwise passes on the one from the upstream RA. `off` advertises none. A prefix advertises that one, for a NAT64 elsewhere; it cannot be combined with `-nat64`. |
-| `-ra-route` | | Prefix to advertise as a Route Information option, repeatable. |
-
-### LAN side: DHCPv6 server
-
-| Option | Default | Description |
-|---|---|---|
-| `-dhcp6s-mode` | `off` | `stateless` assigns no addresses and answers with options such as DNS; `stateful` also assigns addresses; both delegate prefixes to downstream routers (`-dhcp6s-pd-len`); `off` runs no server. The RA flags follow this choice. |
-| `-dhcp6s-pool` | `1000-ffff` | Range of interface identifiers to assign from, in hexadecimal, as the low 64 bits. |
-| `-dhcp6s-static` | | Fixed assignment, repeatable: `mac=<MAC>,addr=::100`, or `duid=<hex>,addr=2001:db8::5`. |
-| `-dhcp6s-lease-preferred` | `45m` | Preferred lifetime of an assigned address or delegated prefix, never longer than what is left upstream. The default is the limit RFC 9096 recommends. |
-| `-dhcp6s-lease-valid` | `90m` | Valid lifetime of an assigned address or delegated prefix, capped the same way. |
-| `-dhcp6s-pd-len` | `60` | Largest prefix delegated to a downstream router, as a prefix length. A router hinting a longer one gets it; one hinting a shorter one gets this, or a longer one when space runs short. Delegations come from the upstream delegation, clear of the LAN subnets, in both server modes. `0` disables downstream PD. |
-
-### NDP proxy
-
-| Option | Default | Description |
-|---|---|---|
-| `-ndproxy-mode` | `auto` | `auto` turns `forward` on when a LAN /64 is also the on-link /64 of a broadcast WAN, and stays off otherwise, since a delegated prefix or a point-to-point WAN needs no proxy. `forward` probes the other side before answering, in both directions, so hosts on the WAN link and on the LAN reach each other too. `prefix` answers every WAN solicitation for an address in the LAN prefix without probing. `static` only puts the `-ndproxy-static` entries into the kernel proxy table. `off` disables the proxy. |
-| `-ndproxy-static` | | Address or prefix to proxy in `static` mode, repeatable. |
-| `-ndproxy-exclude` | | Prefix never proxied, repeatable. |
-| `-ndproxy-ttl` | `30s` | How long a learned proxy entry lives. |
-
-### Temporary addresses
-
-`-tempaddr` turns temporary addresses on, and the other options set how they rotate. They serve only traffic the router itself starts, such as its own DNS queries or a proxy running on it. Traffic forwarded from the LAN keeps the source address of the device that sent it. The router's LAN addresses are always static. With a delegation, the temporary addresses are /128s in the first LAN's /64, which the upstream router does not have to resolve; without one, they go in the SLAAC prefix. When neither SLAAC nor IA_NA gives the WAN an address, its static addresses go in that /64 too, so keep `-wan-iid` clear of the addresses of LAN hosts; the same suffix as `-lan-iid` is fine, since that address is the router's own.
-
-| Option | Default | Description |
-|---|---|---|
-| `-tempaddr` | `false` | Besides the static addresses, rotate temporary addresses (RFC 8981) on the WAN interface. |
-| `-tempaddr-regen` | `1h` | How often a new temporary address is created. Each rotation comes up to 40% of it earlier at random (RFC 8981). |
-| `-tempaddr-preferred` | `1h` | Preferred lifetime of a temporary address. |
-| `-tempaddr-valid` | `24h` | Upper limit of the valid lifetime of a temporary address. An address still in use is kept up to this limit, an unused one is removed earlier. |
-| `-tempaddr-max` | `8` | Maximum number of temporary addresses at once. |
-| `-tempaddr-skip-dad` | `false` | Skip duplicate address detection. Only for links known to be free of conflicts. |
-| `-tempaddr-drain-grace` | `5s` | Interval between the two checks that decide an address is no longer in use. |
-
-### Tunnel
-
-| Option | Default | Description |
-|---|---|---|
-| `-tunnel-dev` | `sixup-ipv4` | Name of the IPv4-in-IPv6 tunnel device. Once the tunnel parameters are known, sixup creates or updates it, brings it up and assigns the IPv4 address. Empty creates no device. |
-| `-tunnel-mtu` | `0` | MTU of the tunnel device. `0` means the WAN interface MTU minus 40. |
-| `-tunnel-route4-metric` | `4096` | Metric of the IPv4 default route through the tunnel. It is high on purpose: an existing IPv4 default route keeps winning, and the tunnel takes over only when there is none. `0` adds no route. |
-| `-tunnel-nat` | `auto` | Maintain the nftables table `inet sixup` for traffic leaving the tunnel. `auto` configures the port-restricted source NAT required on MAP-E (RFC 7597), an ordinary source NAT on a line with its own IPv4 address, and none on DS-Lite, where the provider translates; in every case it clamps the TCP MSS to the tunnel MTU. `off` writes no rules. Nothing outside the table is touched, and the table is removed on exit. |
-| `-tunnel-mape-rules` | `true` | When DHCPv6 carries no MAP-E option, derive the MAP-E parameters from the delegated prefix using the rule tables of the Japanese IPoE providers (v6plus, BIGLOBE, OCN, NURO). |
-| `-tunnel-capture` | `true` | When DHCPv6 carries no tunnel option, capture tunnel traffic to find the parameters. Needs `-dhcp6c-mode` other than `off`, and is not done in a dry run. |
-| `-tunnel-capture-max` | `2m` | How long the capture waits. It ends at the first tunnel packet; if none arrives, it gives up and tries again when the prefix or the address changes. |
-
-### NAT64
-
-| Option | Default | Description |
-|---|---|---|
-| `-nat64` | `off` | `jool` configures NAT64 with the [Jool](https://jool.mx) kernel module (4.1 or later; when it is not loaded, sixup runs `/sbin/modprobe jool` once). Jool runs in a network namespace of its own behind the veth `sixup-nat64` and translates `-nat64-prefix` for the LAN and for this router alike. The namespace exists, and the prefix is advertised in the RA unless `-ra-pref64` is `off`, only while the module is loaded; sixup checks every minute, so loading, unloading and reloading it need no restart. The IPv4 output leaves by this host's IPv4 route: through the tunnel it goes through the source NAT above, so the ports of a MAP-E line have one owner, and without a tunnel it takes whatever IPv4 uplink is configured. A firewall has to let traffic through `sixup-nat64`, both the LAN's, which is forwarded, and the answers to this router's own, which arrive on it. The namespace goes away with sixup. `off` configures none. DNS64 is left to a resolver of your choice. |
-| `-nat64-prefix` | `64:ff9b::/96` | Prefix the NAT64 translates (RFC 6052); the length must be 32, 40, 48, 56, 64 or 96. Reaching private IPv4 addresses through NAT64 needs a network-specific prefix, such as the ULA `fd00:64::/96`; one carved from the delegated prefix would change with it. |
-| `-jool-ipv4` | `192.168.255.254/31` | IPv4 /31 between this namespace and Jool's. The lower address is the gateway on this side, the upper one Jool's pool4. sixup refuses to start when it overlaps an address or a route of this host. |
-
-### Unsolicited traffic
-
-| Option | Default | Description |
-|---|---|---|
-| `-unsolicited` | `request` | Unsolicited traffic from the WAN to the LAN (RFC 6092), that is, connections the Internet starts rather than replies to the LAN's own. `request` filters IPv6 from the WAN as RFC 6092 describes: it lets through flows the LAN started, the ICMPv6 RFC 4890 needs, IPsec (AH, ESP and IKE) and HIP, traffic to an endpoint that sent something out in the last 5 minutes (endpoint-independent filtering, which keeps peer-to-peer programs such as Tailscale working) and ports a LAN program opened with PCP (RFC 6887, UDP 5351), and drops the rest, leaving a prefix delegated to a downstream router to that router's own firewall. `deny` does the same without PCP. `allow` lets unsolicited traffic in, and PCP then tells an IPv6 host that it is already reachable. In every mode, nothing from or to a ULA crosses the WAN, the LAN sends out only from its own and the delegated prefixes (other sources get ICMPv6 code 5), and the WAN reaches only those prefixes, none before the line hands one out, and never from them (RFC 7084 ULA-4, S-2, L-14, G-3, RFC 6092 REC-6). Only forwarded traffic is filtered, in the table `inet sixup-filter`; the router's own services are left to you. Under `allow` and `request`, PCP also forwards a TCP or UDP port of the tunnel's IPv4 to a LAN host, and so does NAT-PMP (RFC 6886) for programs that know only it while sixup does the tunnel's NAT (`-tunnel-nat auto`), and the host's traffic from that port leaves through the same external port; other LAN hosts reach it at the public address too. The external port is never below 1024 nor one the router itself listens on, and comes from the line's port set on MAP-E; DS-Lite lines cannot map. A host holds at most 16 mappings. Mappings live in memory: sixup tells the LAN on startup, and when the tunnel's address changes, that earlier ones are gone. |
-| `-source-filter` | `true` | Let the LAN send to the WAN only from its own prefixes and the ones delegated from them, and answer other sources with ICMPv6 code 5 (BCP 38, RFC 7084 S-2 and L-14); let the WAN reach only those prefixes too. Turn it off when another prefix is routed into the LAN by other means. |
-
-### Runtime
-
 | Option | Default | Description |
 |---|---|---|
 | `-state-dir` | `/var/lib/sixup` | Directory for the DUID, the secret behind the stable addresses, the ULA and the leases. Keep it across restarts, or the provider may hand out a different prefix. |
-| `-no-sysctl` | `false` | Leave `forwarding`, `accept_ra` and the other sysctls alone, for setups that manage them elsewhere. |
-| `-settle` | `1s` | How long the parameters must stay unchanged before they are applied, so the RA, the delegated prefix, DNS and the capture result arriving one after another at startup are applied together. Withdrawals are applied at once. |
+| `-no-sysctl` | `false` | Leave `forwarding`, `accept_ra` and the other sysctls alone, for setups that manage them elsewhere. The LAN then needs `proxy_ndp` 1 and `proxy_delay` 0. |
 | `-dry-run` | `false` | Go through obtaining and renewing the parameters and finding the tunnel, printing as it goes, without changing the system or sending RAs to the LAN. |
 | `-dry-run-timeout` | `0` | How long a dry run lasts. `0` runs until interrupted. |
 | `-log-level` | `info` | Lowest level printed: `debug`, `info`, `warn` or `error`. |

@@ -78,6 +78,23 @@ func TestProxyLANAsksUpstreamHost(t *testing.T) {
 	}
 }
 
+// A WAN host asking for a LAN host under the lan layout is learned with its /128 route, which
+// the reply needs: the /64 is routed to the LAN.
+func TestProxyLearnsTheWANAsker(t *testing.T) {
+	old := dryRun
+	dryRun = true
+	defer func() { dryRun = old }()
+	n := newTestProxy("lan")
+	asker := netip.MustParseAddr("2001:db8::20")
+	n.mu.Lock()
+	n.onSolicit(sideWAN, netip.MustParseAddr("2001:db8::abcd"), asker)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if s := n.sessions[asker]; s == nil || s.State != "valid" || s.Side != sideWAN || n.kernelSet[asker] != n.wanIfi.Index {
+		t.Fatalf("the asker is learned on the WAN: %+v %v", s, n.kernelSet)
+	}
+}
+
 // No proxying between same-side hosts: a lan host asking for a known lan host gets no answer and no probe.
 func TestProxySameSideNoReply(t *testing.T) {
 	n := newTestProxy("wan")

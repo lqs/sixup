@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -437,6 +438,68 @@ func TestStoreWithdrawsPrefixesFromBeforeRestart(t *testing.T) {
 	}
 }
 
+// The ULA prefixes are recorded too, without an expiry while given, and after a restart those -ula
+// no longer gives are withdrawn at once, without waiting for the line (RFC 9096 section 3.5).
+func TestStoreWithdrawsULAFromBeforeRestart(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "lan-prefixes.json")
+	lans := []lanDef{{"lan0", 0}}
+	old, cur := netip.MustParsePrefix("fd00:1::/64"), netip.MustParsePrefix("fd00:2::/64")
+	st := newStore("pd", lans, time.Minute, []netip.Prefix{netip.MustParsePrefix("fd00:1::/48")}, false, 0, 0, file)
+	recv(t, st.Subscribe())
+	b, err := os.ReadFile(file)
+	if err != nil || !strings.Contains(string(b), `"fd00:1::/64"`) || strings.Contains(string(b), "valid_until") {
+		t.Fatalf("a ULA given is recorded without an expiry: %s %v", b, err)
+	}
+
+	stale := func(s Snapshot) map[netip.Prefix]bool {
+		out := map[netip.Prefix]bool{}
+		for _, p := range s.LAN["lan0"] {
+			out[p.Prefix] = p.Stale
+			if p.Stale && (p.Source != sourceULA || p.validLeft(time.Now()) > time.Minute || p.validLeft(time.Now()) == 0) {
+				t.Fatalf("withdrawn for the hold: %+v", p)
+			}
+		}
+		return out
+	}
+	st = newStore("pd", lans, time.Minute, []netip.Prefix{netip.MustParsePrefix("fd00:2::/48")}, false, 0, 0, file)
+	if st.previous != nil {
+		t.Fatalf("nothing is left for the line to answer: %+v", st.previous)
+	}
+	if got := stale(recv(t, st.Subscribe())); len(got) != 2 || !got[old] || got[cur] {
+		t.Fatalf("the old ULA is withdrawn before the line answers, the new one given: %v", got)
+	}
+	// both are recorded, the withdrawn one with the end of its hold, which a further restart keeps to
+	b, _ = os.ReadFile(file)
+	if strings.Count(string(b), "valid_until") != 1 {
+		t.Fatalf("record: %s", b)
+	}
+	st = newStore("pd", lans, time.Minute, nil, false, 0, 0, file)
+	if got := stale(recv(t, st.Subscribe())); len(got) != 2 || !got[old] || !got[cur] {
+		t.Fatalf("with -ula gone, every ULA is withdrawn: %v", got)
+	}
+
+	// The line's prefixes stay for the line to answer; a ULA of a LAN no longer configured, or
+	// whose hold is over, is left alone
+	past := time.Now().Add(-time.Hour).Format(time.RFC3339)
+	// and so is a ULA the upstream delegated
+	os.WriteFile(file, []byte(`[{"iface":"lan0","prefix":"2001:db8:a::/64","valid_until":"`+time.Now().Add(time.Hour).Format(time.RFC3339)+`"},
+		{"iface":"lan9","prefix":"fd00:3::/64"},{"iface":"lan0","prefix":"fd00:4::/64","valid_until":"`+past+`"},
+		{"iface":"lan0","prefix":"fd00:5::/64","valid_until":"`+time.Now().Add(time.Hour).Format(time.RFC3339)+`","delegated":true}]`), 0o600)
+	st = newStore("pd", lans, time.Minute, nil, false, 0, 0, file)
+	if len(st.previous) != 2 || st.previous[0].Prefix != netip.MustParsePrefix("2001:db8:a::/64") || !st.previous[1].Delegated || len(st.revoked) != 0 {
+		t.Fatalf("previous %+v, revoked %+v", st.previous, st.revoked)
+	}
+	// the line answers without the ULA, which goes as one
+	ch := st.Subscribe()
+	recv(t, ch)
+	now := time.Now()
+	st.Set(sourcePD, SourceUpdate{Prefixes: []Prefix{{Prefix: netip.MustParsePrefix("2001:db8:a::/56"), Preferred: now.Add(time.Hour), Valid: now.Add(2 * time.Hour), Source: sourcePD}}})
+	s := recv(t, ch)
+	if i := slices.IndexFunc(s.LAN["lan0"], func(p Prefix) bool { return p.Prefix == netip.MustParsePrefix("fd00:5::/64") }); i < 0 || !s.LAN["lan0"][i].Stale || s.LAN["lan0"][i].Source != sourceULA {
+		t.Fatalf("the delegated ULA is withdrawn: %+v", s.LAN["lan0"])
+	}
+}
+
 // The settle window must open on a real change only: a no-op update at startup used to consume it,
 // pushing whatever arrived a moment later into the next batch.
 func TestStoreSettleBatching(t *testing.T) {
@@ -704,6 +767,23 @@ func TestStoreConfiguredWAN(t *testing.T) {
 	}
 }
 
+// The static prefixes go to the store again each day, on the fake clock of a synctest bubble, so
+// their lifetimes never run out. The store's loop is left out, since it never ends.
+func TestKeepStaticRenews(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		st := &Store{in: make(chan storeMsg, 1)}
+		ctx, cancel := context.WithCancel(context.Background())
+		go keepStatic(ctx, st, nil, []netip.Prefix{netip.MustParsePrefix("2001:db8:100::/56")}, false, netip.Addr{})
+		first := <-st.in
+		time.Sleep(24 * time.Hour)
+		again := <-st.in
+		if d := again.upd.Prefixes[0].Valid.Sub(first.upd.Prefixes[0].Valid); d != 24*time.Hour {
+			t.Fatalf("renewed %s later", d)
+		}
+		cancel()
+	})
+}
+
 // A /64 given with -wan-prefix is the WAN link's, shared with the LAN (RFC 7278); one of -routed-prefix is
 // split across the LANs as a delegation; and either stands before what DHCPv6-PD says.
 func TestStoreStaticPrefix(t *testing.T) {
@@ -913,6 +993,9 @@ func TestLoadULASpecs(t *testing.T) {
 	if err != nil || !slices.Equal(got, []netip.Prefix{netip.MustParsePrefix("fd00:1::/48"), netip.MustParsePrefix("fd00:2:0:1::/64")}) {
 		t.Fatalf("list: %v %v", got, err)
 	}
+	if _, err := loadULA("", "fc00:aaaa::2/48"); err == nil || !strings.Contains(err.Error(), "give only the prefix such as fc00:aaaa::/48") {
+		t.Fatalf("bits past the prefix must fail rather than be dropped: %v", err)
+	}
 	if _, err := loadULA("", "nonsense"); err == nil {
 		t.Fatal("nonsense must fail")
 	}
@@ -925,5 +1008,17 @@ func TestLoadULASpecs(t *testing.T) {
 	}
 	if got, err := parsePrefixes("2001:db8:1::/48,,"); err != nil || len(got) != 1 {
 		t.Fatalf("empty fields are skipped: %v %v", got, err)
+	}
+}
+
+// A LAN takes addresses of this router only in its ULA prefixes.
+func TestLANULA(t *testing.T) {
+	ula := Prefix{Prefix: netip.MustParsePrefix("fd00:1::/64"), Source: sourceULA}
+	s := Snapshot{LAN: map[string][]Prefix{"lan0": {{Prefix: netip.MustParsePrefix("2001:db8:1::/64"), Source: sourcePD}, ula}}}
+	if got := s.lanULA("lan0"); len(got) != 1 || got[0] != ula {
+		t.Fatalf("%+v", got)
+	}
+	if got := s.lanULA("lan1"); got != nil {
+		t.Fatalf("another LAN: %+v", got)
 	}
 }

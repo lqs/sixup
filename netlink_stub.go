@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -17,6 +18,7 @@ var errUnsupported = errors.New("linux only")
 const infiniteLft = 0xffffffff
 
 type ifAddr struct {
+	Index     int
 	Addr      netip.Addr
 	PrefixLen int
 	Flags     uint32
@@ -63,8 +65,17 @@ func routeUnreachable(dst netip.Prefix, _ time.Duration, _ bool) error {
 func neighProxySet(_ int, a netip.Addr, _ bool) error {
 	return skipOrUnsupported("proxy neighbor " + a.String())
 }
-func linkWatch(chan<- linkEvent) error { return errUnsupported }
-func linkSetUp(int) error              { return errUnsupported }
+func neighProxyList(int) ([]netip.Addr, error) { return nil, errUnsupported }
+func lanRouteSet(_ int, dst netip.Prefix, src netip.Addr, _ time.Duration) error {
+	return skipOrUnsupported(fmt.Sprintf("LAN route %s src %s", dst, src))
+}
+func lanRouteDel(_ int, dst netip.Prefix) error {
+	return skipOrUnsupported("LAN route delete " + dst.String())
+}
+func lanRouteList(int) ([]netip.Prefix, error)         { return nil, errUnsupported }
+func addrWatch(context.Context, chan<- struct{}) error { return errUnsupported }
+func linkWatch(chan<- linkEvent) error                 { return errUnsupported }
+func linkSetUp(int) error                              { return errUnsupported }
 func sysctlSet(iface, key, val string) error {
 	return skipOrUnsupported(fmt.Sprintf("sysctl %s/%s=%s", iface, key, val))
 }

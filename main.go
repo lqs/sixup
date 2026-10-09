@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -20,6 +21,22 @@ var (
 	verbose bool
 	dryRun  bool
 	version = "dev" // injected by build.sh via -ldflags -X
+
+	// settle is how long parameters must stay unchanged before they are pushed to the components,
+	// so the RA, PD, DNS and capture results arriving one after another at startup go out together;
+	// revocation does not wait. Tests shorten it.
+	settle = time.Second
+)
+
+const (
+	// pdGrace is the longest wait after startup for a PD result, which ends as soon as PD succeeds
+	// or is refused. Until then RA prefixes are not handed to the LAN, so none has to be revoked
+	// later, and while the RA sets M or O the WAN takes no address in them, since the prefix length
+	// depends on the result.
+	pdGrace    = 10 * time.Second
+	tunCapMax  = 2 * time.Minute  // how long the capture waits for a tunnel packet before it gives up until the next change
+	ndProxyTTL = 30 * time.Second // lifetime of a learned NDP proxy session
+	tempGrace  = 5 * time.Second  // gap between the two checks that find a temporary address no longer in use
 )
 
 // A release is a bare binary, and both licences ask for their text to accompany it. Carrying them
@@ -159,8 +176,14 @@ func main() {
 	default:
 		fatalf("-ndproxy-mode must be auto / off / static / prefix / forward")
 	}
-	if *srvPDLen < 0 || *srvPDLen > 64 {
-		fatalf("-dhcp6s-pd-len must be between 0 and 64")
+	// auto is 0 to the pool, and 0 turns downstream PD off
+	srvPD, pdOff := 0, false
+	if *srvPDLen != "auto" {
+		n, err := strconv.Atoi(*srvPDLen)
+		if err != nil || n < 0 || n > 64 {
+			fatalf("-dhcp6s-pd-len must be auto or between 0 and 64")
+		}
+		srvPD, pdOff = n, n == 0
 	}
 	if *raMin > *raMax || *raMin < 3*time.Second {
 		fatalf("-ra-min must be at least 3 seconds and no larger than -ra-max")
@@ -172,10 +195,6 @@ func main() {
 	if err != nil {
 		fatalf("-wan-iid: %v", err)
 	}
-	lanIIDs, err := parseIIDPolicies(*lanIIDSpec)
-	if err != nil {
-		fatalf("-lan-iid: %v", err)
-	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -183,11 +202,11 @@ func main() {
 	if err != nil {
 		fatalf("-ula: %v", err)
 	}
-	grace := *pdGrace
+	grace := pdGrace
 	if !pdEnabled {
 		grace = 0
 	}
-	store := newStore(prefixSource(*prefer), lanDefs, *hold, ula, *tunRules, grace, *settle, filepath.Join(*stateDir, "lan-prefixes.json"))
+	store := newStore(prefixSource(*prefer), lanDefs, *hold, ula, *tunRules, grace, settle, filepath.Join(*stateDir, "lan-prefixes.json"))
 	if len(static) > 0 || wanAddr.IsValid() {
 		go keepStatic(ctx, store, onLink, routed, slaac, wanAddr)
 	}
@@ -286,10 +305,10 @@ func main() {
 		go p.run(ctx, store.Subscribe())
 	}
 	if *tunCap && dhcp != nil {
-		go (&tunnelWatcher{ifname: *wan, store: store, pkts: pkts, maxRun: *tunCapMax}).run(ctx, store.Subscribe())
+		go (&tunnelWatcher{ifname: *wan, store: store, pkts: pkts, maxRun: tunCapMax}).run(ctx, store.Subscribe())
 	}
 
-	dnsOverride := lanDNS{iid: lanIIDs[0], secret: secret}
+	dnsOverride := lanDNS{wanIID: iids[0], wan: *wan, secret: secret}
 	if dnsOverride.list, err = parseLANDNS(*raDNS); err != nil {
 		fatalf("-ra-dns: %v", err)
 	}
@@ -297,23 +316,24 @@ func main() {
 	for _, r := range routes {
 		rios = append(rios, netip.MustParsePrefix(r))
 	}
-	tcfg := tempConfig{regenInterval: *tRegen, preferredLft: *tPref, validLft: *tValid, maxConcurrent: *tMax, skipDAD: *tSkipDAD, grace: *tGrace}
-	if *upRA && *wanSLAAC {
-		wcfg := tcfg
-		wcfg.enabled = *tEnable
-		go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanStatic, tempPick: Snapshot.wanTemp, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
-	}
+	tcfg := tempConfig{regenInterval: *tRegen, preferredLft: *tRegen, maxConcurrent: *tMax, grace: tempGrace}
+	// The WAN holds every global address of this router, so its manager runs whatever the RA does:
+	// without SLAAC it still takes a /128 of the delegation and the tunnel endpoints
+	wcfg := tcfg
+	wcfg.enabled = *tEnable
+	go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanStatic, tempPick: Snapshot.wanTemp, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
 	poolStart, poolEnd := parsePool(*poolRange)
 	var pd *pdPool
-	if *srvMode != "off" && *srvPDLen > 0 {
-		pd = newPDPool(*srvPDLen, filepath.Join(*stateDir, "pd-leases.json"), fw)
+	if *srvMode != "off" && !pdOff {
+		pd = newPDPool(srvPD, filepath.Join(*stateDir, "pd-leases.json"), fw)
 	}
 	for _, l := range lanDefs {
 		iface := l.iface
-		go (&addrManager{ifname: iface, secret: secret, cfg: tcfg, iids: lanIIDs, pick: func(s Snapshot) []Prefix { return s.LAN[iface] }, side: sideLAN, layout: layout}).run(ctx, hub, store, store.Subscribe())
+		go (&addrManager{ifname: iface, secret: secret, cfg: tcfg, iids: []iidPolicy{lanIID}, pick: func(s Snapshot) []Prefix { return s.lanULA(iface) }, side: sideLAN, layout: layout}).run(ctx, hub, store, store.Subscribe())
+		go (&lanRoutes{ifname: iface, layout: layout, sysctl: !*noSysctl}).run(ctx, hub, store, store.Subscribe())
 		go (&raServer{
 			ifname: l.iface, minI: *raMin, maxI: *raMax, lifetime: *raLifetime, mtu: uint32(*raMTU),
-			managed: srv == serverStateful, other: srv != serverOff, noSLAAC: !*raSLAAC, offLink: !*raOnLink, routes: rios, ula: ula, dns: dnsOverride, pref64: pref64, pref64Off: pref64Off,
+			managed: srv == serverStateful, other: srv != serverOff, noSLAAC: !*raSLAAC, offLink: !*raOnLink, routes: rios, dns: dnsOverride, pref64: pref64, pref64Off: pref64Off,
 		}).run(ctx, hub, store, store.Subscribe())
 		if *srvMode != "off" {
 			s := &dhcpServer{
@@ -331,7 +351,7 @@ func main() {
 	}
 	var proxy *ndProxy
 	if *ndMode != "off" {
-		proxy = &ndProxy{mode: proxyMode(*ndMode), wanIf: *wan, wanPkts: pkts, lanIf: lanDefs[0].iface, ttl: *ndTTL, layout: layout}
+		proxy = &ndProxy{mode: proxyMode(*ndMode), wanIf: *wan, wanPkts: pkts, lanIf: lanDefs[0].iface, ttl: ndProxyTTL, layout: layout}
 		for _, s := range ndStatic {
 			proxy.static = append(proxy.static, parsePrefixOrAddr(s))
 		}

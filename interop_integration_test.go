@@ -107,7 +107,7 @@ type dryReportOf struct {
 // dryRunUntil runs sixup -dry-run on wan-test0 until a report satisfies done, and returns that report.
 func dryRunUntil(t *testing.T, done func(dryReportOf) bool, args ...string) dryReportOf {
 	t.Helper()
-	cmd, _, stderr := mainCmd(t, append([]string{"-dry-run", "-wan", "wan-test0", "-state-dir", t.TempDir(), "-settle", "100ms"}, args...)...)
+	cmd, _, stderr := mainCmd(t, append([]string{"-dry-run", "-wan", "wan-test0", "-state-dir", t.TempDir()}, args...)...)
 	cmd.Stdout = nil
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -249,7 +249,7 @@ func TestInteropDhcpcd(t *testing.T) {
 	if err := vethAdd("wan-test0", "isp-test0", ownNsFd(t)); err != nil {
 		t.Fatal(err)
 	}
-	cmd, _, stderr := mainCmd(t, "-wan", "wan-test0", "-lan", "lan-test0", "-state-dir", t.TempDir(), "-settle", "10ms",
+	cmd, _, stderr := mainCmd(t, "-wan", "wan-test0", "-lan", "lan-test0", "-state-dir", t.TempDir(),
 		"-dhcp6c-mode", "off", "-wan-ra=false", "-routed-prefix", "2001:db8:1::/48", "-tunnel-dev", "",
 		"-dhcp6s-mode", "stateful", "-dhcp6s-pd-len", "60", "-ra-dns", "self", "-ra-min", "3s", "-ra-max", "4s")
 	if err := cmd.Start(); err != nil {
@@ -293,9 +293,9 @@ option dhcp6_name_servers
 	if iid := binary.BigEndian.Uint64(a.AsSlice()[8:]); err != nil || !inPrefix("2001:db8:1::/64", a.String()) || iid < 0x1000 || iid > 0xffff {
 		t.Errorf("address %q is not from the pool:\n%s", vars["new_dhcp6_ia_na1_ia_addr1"], got)
 	}
-	// -ra-dns self: this router's own address on the LAN
+	// -ra-dns self without a ULA: this router's WAN address, its /128 in the LAN's /64
 	if dns := vars["new_dhcp6_name_servers"]; !inPrefix("2001:db8:1::/64", dns) {
-		t.Errorf("DNS server %q is not sixup's LAN address:\n%s", dns, got)
+		t.Errorf("DNS server %q is not sixup's WAN address in the LAN's /64:\n%s", dns, got)
 	}
 	pd, err := netip.ParsePrefix(vars["new_dhcp6_ia_pd1_prefix1"] + "/" + vars["new_dhcp6_ia_pd1_prefix1_length"])
 	if err != nil || pd.Bits() != 60 || !netip.MustParsePrefix("2001:db8:1::/48").Contains(pd.Addr()) {

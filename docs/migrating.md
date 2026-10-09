@@ -34,7 +34,7 @@ Check the output.
 - There are no errors, and you understand every warning.
 
 If something is not as you expect, stop here and do not go on to the next steps. Your router is
-still unchanged. Check the options in the README, or
+still unchanged. Check the options in the [recipes](recipes.md) and `sixup -h`, or
 [open an issue](https://github.com/lqs/sixup/issues) with the output of the dry run.
 
 ## 2. Make a checklist
@@ -216,7 +216,7 @@ tail -f /var/log/sixup.log
 
 Then check the following, on the router and on a host in the LAN.
 
-- The log shows the prefix and the LAN addresses. On a tunnel line, it also shows the tunnel.
+- The log shows the prefix and the LAN routes. On a tunnel line, it also shows the tunnel.
 - A LAN host gets an address in the new prefix and can reach IPv6 sites. test-ipv6.com tests IPv4
   and IPv6 at the same time.
 - On a MAP-E or DS-Lite line, IPv4 works through the tunnel.

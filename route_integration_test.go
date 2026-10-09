@@ -117,7 +117,7 @@ func TestRoutePrefixDeleteAgainstKernel(t *testing.T) {
 	enterNetNS(t)
 	loUp(t)
 	dst := netip.MustParsePrefix("2001:db8:1::/64")
-	if err := routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create, unix.RTN_UNICAST, unix.RTPROT_KERNEL, 1, dst, netip.Addr{}, 256, time.Hour); err != nil {
+	if err := routeOp(unix.RTM_NEWROUTE, netlink.Request|netlink.Acknowledge|netlink.Create, unix.RTN_UNICAST, unix.RTPROT_KERNEL, 1, dst, netip.Addr{}, netip.Addr{}, 256, time.Hour); err != nil {
 		t.Fatalf("adding a kernel route: %v", err)
 	}
 	if err := routeUnreachable(dst, time.Hour, false); err != nil {

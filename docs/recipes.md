@@ -18,15 +18,23 @@ both.
 |---|---|
 | [Reaching LAN hosts from the Internet](#reaching-lan-hosts-from-the-internet) | `-unsolicited allow`, or `deny` to close it further |
 | [Several LAN segments](#several-lan-segments) | `-lan eth1:0 -lan eth2:1` |
+| [Only one /64 from the line](#only-one-64-from-the-line) | `-wan-shared64 wan`, `-ndproxy-mode` |
+| [Adjusting how the prefix is obtained](#adjusting-how-the-prefix-is-obtained) | `-dhcp6c-pd-len 60`, `-wan-prefer ra` |
 | [SoftBank Hikari](#softbank-hikari) | `-wan-iid ::1111:1111:1111:1111` |
 | [A prefix nobody announces](#a-prefix-nobody-announces) | `-routed-prefix 2001:db8:100::/48` |
 | [Your own firewall rules for the tunnel](#your-own-firewall-rules-for-the-tunnel) | `-tunnel-nat off` |
-| [Fixed addresses for the router](#fixed-addresses-for-the-router) | `-wan-iid ::1 -lan-iid ::1` |
+| [Adjusting the IPv4 tunnel](#adjusting-the-ipv4-tunnel) | `-tunnel-mtu 1460`, `-tunnel-dev ""` |
+| [Fixed WAN addresses for the router](#fixed-wan-addresses-for-the-router) | `-wan-iid ::1` |
+| [A ULA for the LAN](#a-ula-for-the-lan) | `-ula auto` |
 | [Rotating addresses for the router's own traffic](#rotating-addresses-for-the-routers-own-traffic) | `-tempaddr` |
 | [Choosing the DNS servers](#choosing-the-dns-servers) | `-ra-dns self`, or the servers' addresses |
 | [Addresses handed out by DHCPv6](#addresses-handed-out-by-dhcpv6) | `-dhcp6s-mode stateful` |
 | [A router behind this one](#a-router-behind-this-one) | `-dhcp6s-mode stateless` on the upstream router |
 | [An IPv6-only or IPv6-mostly LAN](#an-ipv6-only-or-ipv6-mostly-lan) | `-nat64 jool` |
+| [Another network behind a LAN host](#another-network-behind-a-lan-host) | `-ra-route`, `-source-filter=false` |
+| [Running in a container](#running-in-a-container) | `-no-sysctl`, `-state-dir` |
+
+Every option, with its default, is listed by `sixup -h`; this page shows them by need.
 
 On a new line, start with a dry run. It talks to the ISP, prints what the line provides and
 changes nothing.
@@ -45,13 +53,21 @@ sudo sixup -wan eth0 -dry-run
 - **A delegated prefix.** sixup requests a /56 with DHCPv6-PD, puts a /64 of it on the LAN and
   advertises it with its own RA. The rest of the delegation is held by an unreachable route, so
   traffic for an unassigned part is dropped here instead of looping back to the ISP.
+- **No address of the router on the LAN.** The LAN holds only an on-link route for each of its
+  prefixes (`proto 66` in `ip -6 route`); the router's global addresses are on the WAN, and one of
+  them that falls in a LAN prefix is answered for on the LAN. Hosts reach the router by its
+  link-local address, and with a ULA by `::1` in it.
+- **A prefix the line takes away.** The LAN is told at once, with both lifetimes 0, for 90 minutes
+  (`-lan-deprecate-hold`), so hosts drop it. The LAN prefixes are recorded in the state directory,
+  so one advertised before a restart that the line does not hand out again goes the same way.
 - **Only a /64.** When nothing is delegated, the /64 from the upstream RA moves to the LAN
   (RFC 7278). On an Ethernet WAN the upstream router still resolves LAN addresses on the WAN
   link, so sixup answers Neighbor Discovery for them there, and logs a warning with what to ask
   the ISP for.
 - **PPPoE.** Give the PPP device as the WAN, `-wan ppp0`. A point-to-point WAN has no address
   resolution, so a shared /64 needs no proxy, and without an RA the default route points at the
-  device.
+  device. The RA tells the LAN the smaller MTU of the line, 1492, so hosts do not depend on path
+  MTU discovery; `-ra-mtu` gives another.
 - **MAP-E.** When DHCPv6 carries a MAP-E option, or the prefix matches the rule tables of the
   Japanese IPoE providers (v6plus, BIGLOBE, OCN, NURO), sixup builds the tunnel `sixup-ipv4`,
   gives it the shared IPv4 address, adds an IPv4 default route through it with a high metric,
@@ -106,6 +122,59 @@ prefix. Give the segments a ULA if they need to reach each other.
 sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1 -ula auto
 ```
 
+## Only one /64 from the line
+
+When the line delegates nothing, the /64 of the upstream RA goes to the LAN, and the router answers
+Neighbor Discovery on the WAN for the LAN hosts (RFC 7278). That is `-wan-shared64 lan`, the
+default. Other layouts keep the /64 elsewhere:
+
+- `wan` keeps the /64 on the WAN, and each LAN host gets a /128 route. It is chosen on its own
+  when a /64 the LAN would share holds an address configured by hand.
+- `split` puts /128 routes on both sides, and the router itself cannot reach a host it has not
+  learned yet.
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -wan-shared64 wan
+```
+
+The proxy follows `-ndproxy-mode`. `auto` turns `forward` on for a shared /64 on a broadcast WAN,
+which probes the other side before answering, both ways. `prefix` answers every WAN solicitation
+for an address in the LAN prefix without probing, `static` puts only the `-ndproxy-static`
+entries into the kernel proxy table, and `off` answers nothing. `-ndproxy-exclude` keeps a prefix
+out of the proxy.
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -ndproxy-mode static -ndproxy-static 2001:db8:1:1::100
+```
+
+Routers behind one another can each share the /64 again, every one answering for the hosts
+behind it.
+
+## Adjusting how the prefix is obtained
+
+sixup asks for a /56 and takes whatever length the ISP delegates, asking again without the hint
+when it is refused. To ask for another length, such as the one the contract names, give it.
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -dhcp6c-pd-len 60
+```
+
+The DHCPv6 client starts when the RA sets M or O, and tries PD when neither is set. `-dhcp6c-mode
+on` runs it regardless, and `off` never, for a line that gives everything by RA. It also asks
+for an address of the WAN interface itself (IA_NA); `-dhcp6c-ia-na=false` stops that.
+`-dhcp6c-pd-len 0` asks for no prefix.
+
+When both a delegation and an RA prefix are available, the delegation feeds the LAN.
+`-wan-prefer ra` makes it the RA prefix instead. `-wan-slaac=false` gives the WAN no SLAAC
+address, and `-wan-ra=false` ignores the upstream RA altogether, for a WAN configured by hand.
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -wan-prefer ra
+```
+
+The prefix is kept across restarts: the DUID stays in the state directory, and nothing is
+released on exit, so the ISP renews the same one. `-dhcp6c-release` gives it back on exit instead.
+
 ## SoftBank Hikari
 
 On SoftBank Hikari (ソフトバンク光), the prefix for the LAN comes from the RA or DHCPv6-PD,
@@ -134,7 +203,9 @@ gives these values when it hands the line over:
 sudo sixup -wan eth0 -routed-prefix 2001:db8:100::/48 -lan eth1
 ```
 
-sixup leaves the address on the WAN as it is and adds none of its own there. The prefix is split
+sixup leaves the address on the WAN as it is and adds no SLAAC or IA_NA address beside it; an
+address counts as configured by hand when both its lifetimes are infinite, and the first one is
+the WAN address. The prefix is split
 across the LAN segments and delegated to downstream routers, as a delegation is. The DHCPv6
 client then asks only for DNS servers and the like; if it gets none, give them with `-ra-dns`.
 
@@ -161,6 +232,28 @@ warns about such chains. To leave the tunnel's source NAT and MSS clamp to your 
 sudo sixup -wan eth0 -lan eth1 -tunnel-nat off
 ```
 
+## Adjusting the IPv4 tunnel
+
+The DS-Lite, MAP-E or IPIP6 tunnel is the device `sixup-ipv4`, with the WAN MTU less 40. A line
+whose path is narrower needs a smaller MTU.
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -tunnel-mtu 1460
+```
+
+`-tunnel-dev` names the device, and `-tunnel-dev ""` builds none, for a tunnel you set up yourself
+from the parameters sixup prints. The IPv4 default route through the tunnel has metric 4096, so an
+existing IPv4 default route keeps winning; `-tunnel-route4-metric` changes it, and `0` adds none.
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -tunnel-route4-metric 100
+```
+
+When DHCPv6 gives no MAP-E option, sixup reads the parameters from the rule tables of the Japanese
+IPoE providers; `-tunnel-mape-rules=false` stops that on a line the tables get wrong. When DHCPv6
+gives no tunnel at all, sixup looks for tunnel traffic on the WAN; `-tunnel-capture=false` stops
+that.
+
 ## NAT66 for containers
 
 Docker hands its containers fixed addresses, which cannot follow a prefix that changes, so a
@@ -179,13 +272,26 @@ table ip6 docker-nat {
 }
 ```
 
-## Fixed addresses for the router
+## Fixed WAN addresses for the router
 
 Interface identifiers that stay the same across renumbering make the router easy to find. The
-first WAN one is the address sixup reports as the WAN address.
+first WAN one is the address sixup reports as the WAN address. When neither SLAAC nor IA_NA
+gives the WAN an address, its static addresses go in the first LAN's /64, so keep `-wan-iid`
+clear of the addresses of LAN hosts.
 
 ```sh
-sudo sixup -wan eth0 -wan-iid ::1 -lan eth1 -lan-iid ::1
+sudo sixup -wan eth0 -wan-iid ::1 -lan eth1
+```
+
+## A ULA for the LAN
+
+A ULA gives the LAN addresses of its own beside the ISP's prefix. Each LAN gets a /64 of it, and
+hosts take an address there that stays the same when the ISP renumbers and works when the WAN is
+down. The router takes `::1` of each such /64, its only address on the LAN besides the
+link-local one. `auto` generates a random /48 and keeps it in `/var/lib/sixup/ula`.
+
+```sh
+sudo sixup -wan eth0 -lan eth1 -ula auto
 ```
 
 ## Rotating addresses for the router's own traffic
@@ -222,11 +328,12 @@ identifies the line.
 By default the LAN gets the DNS servers the upstream hands out. `-ra-dns` replaces them in the RA
 and in the DHCPv6 server, with a list of entries used in order.
 
-A resolver running on the router itself is `self`, the router's address on each LAN. A ULA keeps
-that address valid when the ISP renumbers.
+A resolver running on the router itself is `self`, the router's address in each LAN's ULA, which
+stays reachable when the ISP renumbers or the WAN is down. Without a ULA it is the router's WAN
+address.
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -ula auto -lan-iid ::1 -ra-dns self
+sudo sixup -wan eth0 -lan eth1 -ula auto -ra-dns self
 ```
 
 A resolver on another host of the LAN is given by its address. Give that host a fixed address in
@@ -254,13 +361,15 @@ sudo sixup -wan eth0 -lan eth1 -dhcp6s-mode stateful \
   -dhcp6s-static mac=aa:bb:cc:00:00:01,addr=::100
 ```
 
-The RA sets M, so hosts ask DHCPv6 for addresses. `-dhcp6s-mode stateless` hands out no
-addresses, only options such as DNS, and prefixes to downstream routers.
+The RA sets M, so hosts ask DHCPv6 for addresses. Addresses come from the interface identifiers
+`1000` to `ffff`; `-dhcp6s-pool 100-1ff` picks another range. `-dhcp6s-mode stateless` hands out
+no addresses, only options such as DNS, and prefixes to downstream routers.
 
 ## A router behind this one
 
 The DHCPv6 server delegates prefixes to downstream routers out of the upstream delegation, clear
-of the LAN subnets, a /60 by default. Another sixup behind this one works without configuration.
+of the LAN subnets, sized by default from what the upstream delegated. Another sixup behind this
+one works without configuration.
 
 ```sh
 # upstream router
@@ -269,9 +378,14 @@ sudo sixup -wan eth0 -lan eth1 -dhcp6s-mode stateless
 sudo sixup -wan eth0 -lan eth1
 ```
 
-The downstream one asks for a /56 and gets a /60, which it splits across its own LANs. This needs
+The downstream one asks for a /56, gets at most what the upstream one can spare, such as a /60
+out of a /56, and splits it across its own LANs. `-dhcp6s-pd-len` sets the size instead. This needs
 a delegation shorter than /64 upstream, since a /64 has no room left once the LAN has it.
 `-dhcp6s-pd-len 0` turns delegation off.
+
+With a ULA upstream, each downstream router also gets a part of it in the same delegation, and
+uses it unless it has `-ula` of its own. Hosts behind every router of the site then reach each
+other and each router by ULA, while the ULA of another site stays out.
 
 The upstream firewall lets traffic for a delegated prefix through and leaves it to the downstream
 router's own, so ports opened with PCP on the downstream router can be reached.
@@ -285,6 +399,8 @@ IPv6, since every such network is one less reason for anyone to keep IPv4 around
 your plan, this section is for you.
 
 Install the Jool module and start sixup with NAT64. If the module is not loaded, sixup loads it with `/sbin/modprobe jool`.
+The namespace is reached through the IPv4 /31 `192.168.255.254/31`; when that overlaps an address
+or a route of the host, sixup refuses to start, and `-jool-ipv4` gives another.
 
 ```sh
 sudo sixup -wan eth0 -lan eth1 -nat64 jool
@@ -331,4 +447,35 @@ the RA.
 
 ```sh
 sudo sixup -wan eth0 -lan eth1 -nat64 jool -ra-pref64 off
+```
+
+## Another network behind a LAN host
+
+A host on the LAN may route a network of its own, such as a VPN server with a prefix for its
+clients. `-ra-route` tells the LAN hosts to send that prefix to the router, which needs a route to
+the host itself, and the source filter has to let the prefix out.
+
+```sh
+sudo ip -6 route add 2001:db8:200::/64 via fe80::1234 dev eth1
+sudo sixup -wan eth0 -lan eth1 -ra-route 2001:db8:200::/64 -source-filter=false
+```
+
+The source filter lets the LAN send out only from its own and the delegated prefixes, and answers
+other sources with ICMPv6 code 5 (BCP 38). Turning it off lets the routed prefix out; it then has
+to be routed to this router upstream too. `-ra-onlink=false` goes further the other way: hosts
+then send even traffic for each other through the router.
+
+## Running in a container
+
+sixup needs the host network, and sets `forwarding`, `accept_ra`, `proxy_ndp` and `proxy_delay`
+itself. Where `/proc/sys` is read-only, as in a container without `privileged`, set them on the
+host and pass `-no-sysctl`: forwarding 1, `accept_ra` 0 on the LAN, `proxy_ndp` 1 and
+`proxy_delay` 0 on the LAN. Keep the state directory on a volume, or a new container gets a new
+DUID and the ISP may hand out a different prefix. [`docker-compose.yml`](../docker-compose.yml)
+shows both.
+
+```sh
+docker run -d --network host --cap-add NET_ADMIN --cap-add NET_RAW --cap-add NET_BIND_SERVICE \
+  -v sixup-state:/var/lib/sixup ghcr.io/lqs/sixup -wan eth0 -lan eth1 -no-sysctl \
+  -state-dir /var/lib/sixup
 ```
