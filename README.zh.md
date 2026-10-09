@@ -29,17 +29,9 @@ sixup 一个程序做完这些，各环节的状态和参数在内部流转，�
 
 ## 快速开始
 
-</div>
-
-> [!WARNING]
-> <span lang="zh-Hans">项目仍在开发中，尚未发布。部分功能从未在真实线路上跑过，可能根本不能用，
-> 参数也随时会变。</span>
-
-<div lang="zh-Hans">
-
 从 [Releases 页面](https://github.com/lqs/sixup/releases) 下载适合自己发行版的包（`.deb`、
-`.rpm`、`.apk` 或 Arch Linux 的 `.pkg.tar.zst`），或者直接下载静态二进制。目前还没有正式
-版本，只有 `dev` 预发布版。
+`.rpm`、`.apk` 或 Arch Linux 的 `.pkg.tar.zst`），或者直接下载静态二进制。`dev` 预发布版由
+main 上的每次提交构建，未经测试；实际使用的路由器请选带版本号的正式版。
 
 查看线路提供了什么，不改动系统：
 
@@ -72,13 +64,6 @@ sudo sixup -wan eth0 -lan eth1:0 -lan eth2:1
 逐条的实现情况和尚未做到的地方，见 [Standards](docs/standards.md)（英文）。
 
 ## 选项
-
-</div>
-
-> [!WARNING]
-> <span lang="zh-Hans">项目尚未发布，选项可能随时改名或删除，不另行通知。</span>
-
-<div lang="zh-Hans">
 
 `sixup -h` 列出全部选项及其默认值，[配置速查](docs/recipes.zh.md)按需求介绍它们的用法。这里只列出运行 sixup 本身的选项。
 

@@ -30,14 +30,10 @@ the tunnel endpoints all follow from that one event. No manual step, no restart.
 
 ## Quick start
 
-> [!WARNING]
-> sixup is under development and has not been released yet. Parts of it have never run on
-> a real line, so it may not work at all, and options change from one commit to the next.
-
 Pick the package for your distribution (`.deb`, `.rpm`, `.apk` or Arch Linux
 `.pkg.tar.zst`) or a static binary from the
-[releases page](https://github.com/lqs/sixup/releases). There is no formal release yet,
-only the `dev` pre-release.
+[releases page](https://github.com/lqs/sixup/releases). The `dev` pre-release is built from
+every commit on main and untested; a router in daily use should run a numbered release.
 
 Check what the line provides, without changing anything:
 
@@ -74,9 +70,6 @@ For other needs, such as several LAN segments, fixed addresses, DNS servers or N
 [standards](docs/standards.md).
 
 ## Options
-
-> [!WARNING]
-> sixup has not been released yet, so options may be renamed or removed without notice.
 
 `sixup -h` lists every option with its default, and the [recipes](docs/recipes.md) show them by
 need. Only the options for running sixup itself are listed here.
