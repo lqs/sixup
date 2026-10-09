@@ -911,6 +911,11 @@ func TestStoreTunnelInputs(t *testing.T) {
 	if s = recv(t, ch); len(s.Tunnel.Conflicts) != 0 {
 		t.Fatalf("conflict cleared: %v", s.Tunnel.Conflicts)
 	}
+	moved := netip.MustParseAddr("2001:db8:1::abcd")
+	st.SetSelf(netip.MustParsePrefix("2001:db8:1::/64"), moved)
+	if s = recv(t, ch); s.Change != changeRenew || s.Self[netip.MustParsePrefix("2001:db8:1::/64")] != moved {
+		t.Fatalf("an address DAD moved is published: %s %v", s.Change, s.Self)
+	}
 
 	// MAP-E delivered by DHCPv6 is computed for the first delegation still preferred.
 	r, ok := calcMAPE(live.Prefix)

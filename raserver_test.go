@@ -298,6 +298,12 @@ func TestLANDNS(t *testing.T) {
 	if got := resolve("self,upstream,2001:db8::53", snap); len(got) != 3 || got[0] != netip.MustParseAddr("2001:db8:1::1") || got[1] != google || got[2] != netip.MustParseAddr("2001:db8::53") {
 		t.Fatalf("self on the WAN, in order: %v", got)
 	}
+	wanMoved := netip.MustParseAddr("2001:db8:1::abcd")
+	snap.Self = map[netip.Prefix]netip.Addr{snap.WANSubnet.Prefix: wanMoved}
+	if got := resolve("self", snap); len(got) != 1 || got[0] != wanMoved {
+		t.Fatalf("self on the WAN follows the address DAD moved to: %v", got)
+	}
+	snap.Self = nil
 	snap.WANAddr = netip.MustParseAddr("2001:db8::99")
 	if got := resolve("self", snap); len(got) != 1 || got[0] != snap.WANAddr {
 		t.Fatalf("self is the WAN address from IA_NA or configured by hand: %v", got)
@@ -305,6 +311,11 @@ func TestLANDNS(t *testing.T) {
 	snap.LAN["lan0"] = append(snap.LAN["lan0"], Prefix{Prefix: netip.MustParsePrefix("fd00:1::/64"), Source: "ula"})
 	if got := resolve("self", snap); len(got) != 1 || got[0] != netip.MustParseAddr("fd00:1::1") {
 		t.Fatalf("self prefers the ULA: %v", got)
+	}
+	moved := netip.MustParseAddr("fd00:1::abcd")
+	snap.Self = map[netip.Prefix]netip.Addr{netip.MustParsePrefix("fd00:1::/64"): moved}
+	if got := resolve("self", snap); len(got) != 1 || got[0] != moved {
+		t.Fatalf("self follows the address DAD moved to: %v", got)
 	}
 	snap.LAN["lan0"][1].Deprecated = true
 	if got := resolve("self", snap); len(got) != 1 || got[0] != snap.WANAddr {

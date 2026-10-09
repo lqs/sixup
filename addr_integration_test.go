@@ -164,6 +164,9 @@ func TestAddressDADAgainstKernel(t *testing.T) {
 	if _, ok := m.applied[stable]; !ok {
 		t.Fatalf("the next address %s is not applied: %v", stable, m.applied)
 	}
+	if got := m.store.Current().Self[p.Prefix]; got != stable {
+		t.Fatalf("the store is not told of the next address: %v", got)
+	}
 	if m.endpoints[e1] != "conflict" || m.endpoints[e2] != "ok" || m.endpoints[w] != "external" {
 		t.Fatalf("endpoints %v", m.endpoints)
 	}

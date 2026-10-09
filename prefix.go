@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -131,6 +132,9 @@ type Snapshot struct {
 	// ULA is the site's ULA this router splits among its LANs and delegates from: its own from
 	// -ula, else the part of the upstream's that came with the delegation
 	ULA []Prefix `json:"ula,omitempty"`
+	// Self holds the address of this router in a prefix where its first choice failed DAD, and
+	// with it what -ra-dns self announces
+	Self map[netip.Prefix]netip.Addr `json:"self,omitempty"`
 }
 
 // wanSLAAC returns the SLAAC-capable /64s from the upstream RA, including deprecated ones so addresses can be retired.
@@ -174,10 +178,18 @@ func (s Snapshot) wanSelf(iid iidPolicy, secret []byte, ifi *net.Interface) (net
 	}
 	for _, p := range s.wanStatic() {
 		if !p.Deprecated {
-			return iid.addr(secret, p.Prefix, ifi, 0), true
+			return s.selfAddr(iid, secret, p.Prefix, ifi), true
 		}
 	}
 	return netip.Addr{}, false
+}
+
+// selfAddr returns the address of this router in prefix by the policy iid, after any DAD failure.
+func (s Snapshot) selfAddr(iid iidPolicy, secret []byte, prefix netip.Prefix, ifi *net.Interface) netip.Addr {
+	if a, ok := s.Self[prefix]; ok {
+		return a
+	}
+	return iid.addr(secret, prefix, ifi, 0)
 }
 
 // wanTemp returns the prefixes for temporary WAN addresses: WANSubnet, else SLAAC. In an on-link
@@ -220,6 +232,8 @@ type Store struct {
 	aftrIn    chan aftrUpdate
 	conflicts map[netip.Addr]bool // tunnel endpoints that failed DAD
 	confIn    chan endpointState
+	self      map[netip.Prefix]netip.Addr
+	selfIn    chan selfAddr
 	cur       Snapshot
 	subs      []chan Snapshot
 	// Settle period: at startup RA, PD, Information-Request and capture results arrive one by one;
@@ -273,6 +287,8 @@ func newStore(prefer prefixSource, lans []lanDef, hold time.Duration, ula []neti
 		aftrIn:    make(chan aftrUpdate, 4),
 		confIn:    make(chan endpointState, 8),
 		conflicts: map[netip.Addr]bool{},
+		self:      map[netip.Prefix]netip.Addr{},
+		selfIn:    make(chan selfAddr, 8),
 		prefer:    prefer,
 		lans:      lans,
 		hold:      hold,
@@ -315,6 +331,16 @@ type endpointState struct {
 // SetEndpointConflict is called by the address manager when a tunnel endpoint fails or recovers DAD.
 func (s *Store) SetEndpointConflict(addr netip.Addr, conflict bool) {
 	s.confIn <- endpointState{addr, conflict}
+}
+
+type selfAddr struct {
+	prefix netip.Prefix
+	addr   netip.Addr
+}
+
+// SetSelf is called by the address manager when DAD moves this router's address in a prefix.
+func (s *Store) SetSelf(prefix netip.Prefix, addr netip.Addr) {
+	s.selfIn <- selfAddr{prefix, addr}
 }
 
 // aftrUpdate carries the AAAA records of an AFTR name back into the store.
@@ -384,6 +410,9 @@ func (s *Store) loop() {
 			} else {
 				delete(s.conflicts, e.addr)
 			}
+			s.recompute(time.Now())
+		case a := <-s.selfIn:
+			s.self[a.prefix] = a.addr
 			s.recompute(time.Now())
 		case <-expire:
 			s.recompute(time.Now())
@@ -461,6 +490,9 @@ func (s *Store) recompute(now time.Time) {
 		// no RA source means the RA is not listened to, and the default route is not its to decide
 		NoWANRouter: s.sources[sourceRA].NoRouter,
 		UpstreamULA: s.sources[sourceRA].ULA,
+	}
+	if len(s.self) > 0 {
+		next.Self = maps.Clone(s.self)
 	}
 	// Prefixes and DNS often come from different sources (RA gives the /64, Information-Request gives DNS), so fill gaps from the other one
 	for _, name := range []prefixSource{sourcePD, sourceRA} {
@@ -780,6 +812,9 @@ func (s *Store) recompute(now time.Time) {
 			change = changeRenew
 		}
 		if change == changeNone && (s.cur.PREF64 != next.PREF64 || s.cur.NAT64 != next.NAT64 || s.cur.WANMTU != next.WANMTU) {
+			change = changeRenew
+		}
+		if change == changeNone && !maps.Equal(s.cur.Self, next.Self) {
 			change = changeRenew
 		}
 		if change == changeNone && (s.cur.NoWANRouter != next.NoWANRouter || !slices.Equal(s.cur.UpstreamULA, next.UpstreamULA)) {

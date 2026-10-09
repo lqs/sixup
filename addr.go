@@ -314,6 +314,10 @@ func (m *addrManager) prefixDADFailed(a netip.Addr) {
 	delete(m.applied, a)
 	delete(m.plens, a)
 	m.applyPrefixAddrs()
+	// the first policy gives the address others are told of, such as the DNS server
+	if slot.policy == 0 && m.store != nil {
+		m.store.SetSelf(slot.prefix, m.iids[0].addr(m.secret, slot.prefix, m.ifi, m.dadCnt[slot]))
+	}
 }
 
 // awaitAnnounce queues a new address for announcement once DAD lets it go, or at once if it is

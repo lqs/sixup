@@ -487,7 +487,7 @@ func (d lanDNS) resolve(s Snapshot, ifi *net.Interface) []netip.Addr {
 			out = append(out, routableDNS(s.DNS)...)
 		case e.self:
 			if p, ok := selfPrefix(s.LAN[ifi.Name]); ok {
-				out = append(out, lanIID.addr(d.secret, p, ifi, 0))
+				out = append(out, s.selfAddr(lanIID, d.secret, p, ifi))
 			} else if a, ok := s.wanSelf(d.wanIID, d.secret, d.wanIfi()); ok {
 				out = append(out, a)
 			}
