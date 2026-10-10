@@ -9,9 +9,12 @@ import (
 	"log"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/mdlayher/genetlink"
+	"github.com/mdlayher/genetlink/genltest"
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -19,7 +22,7 @@ import (
 // The module compares the version in every request against its own and refuses anything else, so
 // the number has to come from the module that is actually loaded.
 func TestJoolHeaderCarriesTheModuleVersion(t *testing.T) {
-	h := joolHeader(0x04010700, "sixup") // 4.1.7.0
+	h := joolHeader(0x04010700, xtNAT64, "sixup") // 4.1.7.0
 	if len(h) != 28 {
 		t.Fatalf("struct joolnlhdr is 28 bytes, got %d", len(h))
 	}
@@ -42,7 +45,7 @@ func TestJoolHeaderCarriesTheModuleVersion(t *testing.T) {
 
 // A name of exactly the maximum length would leave no terminator, which the module requires.
 func TestJoolHeaderTruncatesALongName(t *testing.T) {
-	h := joolHeader(1, "0123456789abcdefghij")
+	h := joolHeader(1, xtNAT64, "0123456789abcdefghij")
 	if got := string(h[12 : 12+joolINameLen-1]); got != "0123456789abcde" {
 		t.Fatalf("the name should be cut to 15 characters, got %q", got)
 	}
@@ -166,7 +169,7 @@ func TestJoolPool4(t *testing.T) {
 // be read for it: an instance that already exists must come back as EEXIST.
 func TestJoolReplyError(t *testing.T) {
 	reply := func(flags byte, attrs []byte) []byte {
-		h := joolHeader(0x04010700, "sixup")
+		h := joolHeader(0x04010700, xtNAT64, "sixup")
 		h[9] = flags
 		return append(h, attrs...)
 	}
@@ -227,5 +230,85 @@ func TestJoolInNetnsRefusesABadDescriptor(t *testing.T) {
 	})
 	if err == nil || ran {
 		t.Fatalf("want an error and fn not run, got %v, ran %v", err, ran)
+	}
+}
+
+// joolReply is a reply of Jool's: the header, then attrs.
+func joolReply(xt uint8, attrs func(*netlink.AttributeEncoder)) genetlink.Message {
+	return genetlink.Message{Data: append(joolHeader(0x04010700, xt, ""), encodeAttrs(attrs)...)}
+}
+
+// The module lists the instances of every namespace; only those a hello finds in the host's are
+// reported, each once. A type whose module is absent refuses the listing and is passed over.
+func TestHostInstances(t *testing.T) {
+	entry := func(iname string) func(*netlink.AttributeEncoder) error {
+		return func(ae *netlink.AttributeEncoder) error {
+			ae.Uint32(1, 0xdead) // JNLAIE_NS
+			ae.Uint8(2, xfNetfilter)
+			ae.String(jnlaieIName, iname)
+			return nil
+		}
+	}
+	c := genltest.Dial(func(greq genetlink.Message, _ netlink.Message) ([]genetlink.Message, error) {
+		xt, iname := greq.Data[8], string(bytes.TrimRight(greq.Data[12:joolHdrLen], "\x00"))
+		switch {
+		case xt == xtSIIT: // jool_siit not loaded
+			h := joolHeader(0x04010700, xt, "")
+			h[9] = joolFlagError
+			return []genetlink.Message{{Data: append(h, encodeAttrs(func(ae *netlink.AttributeEncoder) { ae.Uint16(jnlaerrCode, uint16(unix.EINVAL)) })...)}}, nil
+		case greq.Header.Command == opInstanceForeach:
+			return []genetlink.Message{joolReply(xt, func(ae *netlink.AttributeEncoder) {
+				ae.Nested(jnlalEntry, entry("other"))
+				ae.Nested(jnlalEntry, entry("sixup"))
+				ae.Nested(jnlalEntry, entry("other")) // the same name in another namespace
+				ae.Nested(jnlalEntry, entry("gone"))
+			})}, nil
+		case iname == "gone":
+			return nil, genltest.Error(int(unix.ESRCH))
+		}
+		status := uint8(1) // IHS_DEAD: sixup's own is in its namespace
+		if iname == "other" {
+			status = ihsAlive
+		}
+		return []genetlink.Message{joolReply(xt, func(ae *netlink.AttributeEncoder) { ae.Uint8(jnlaisStatus, status) })}, nil
+	})
+	defer c.Close()
+	if got := hostInstances(c, 1, 0x04010700); !slices.Equal(got, []string{`NAT64 "other"`}) {
+		t.Fatalf("want only the instance in the host's namespace, once, got %q", got)
+	}
+}
+
+// Replies too short for the header, or with attributes that do not parse, carry nothing.
+func TestJoolRepliesThatCarryNothing(t *testing.T) {
+	bad := []genetlink.Message{{Data: []byte("jool")}, {Data: append(joolHeader(0, xtNAT64, ""), 0xff, 0xff)}}
+	if names := instanceNames(bad); len(names) != 0 {
+		t.Fatalf("want no names, got %q", names)
+	}
+	if helloAlive(bad) {
+		t.Fatal("a reply without a status is no instance")
+	}
+	other := []genetlink.Message{joolReply(xtNAT64, func(ae *netlink.AttributeEncoder) { ae.Uint8(9, 0) })}
+	if names := instanceNames(other); len(names) != 0 || helloAlive(other) {
+		t.Fatalf("attributes of other types carry nothing, got %q", names)
+	}
+}
+
+// Instances in the host's namespace are reported when they appear and again when they change, but
+// not every minute.
+func TestNoteHostInstances(t *testing.T) {
+	var logged bytes.Buffer
+	log.SetOutput(&logged)
+	defer log.SetOutput(os.Stderr)
+	m := &joolManager{}
+	m.noteHostInstances(nil)
+	m.noteHostInstances([]string{`NAT64 "a"`})
+	m.noteHostInstances([]string{`NAT64 "a"`})
+	m.noteHostInstances(nil)
+	m.noteHostInstances([]string{`NAT64 "a"`, `SIIT "b"`})
+	if n := strings.Count(logged.String(), "the host's namespace has instances"); n != 2 {
+		t.Fatalf("want two warnings, got %d:\n%s", n, logged.String())
+	}
+	if !strings.Contains(logged.String(), `(NAT64 "a", SIIT "b")`) {
+		t.Fatalf("the warning should name the instances:\n%s", logged.String())
 	}
 }

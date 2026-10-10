@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -31,14 +32,22 @@ const (
 	joolINameLen   = 16 // INAME_MAX_SIZE
 	joolModule     = "/sys/module/jool/version"
 
+	xtSIIT      = 1 << 0 // XT_SIIT
 	xtNAT64     = 1 << 1 // XT_NAT64
 	xfNetfilter = 1 << 2 // XF_NETFILTER
 
-	opInstanceAdd = 1  // JNLOP_INSTANCE_ADD
-	opInstanceRm  = 3  // JNLOP_INSTANCE_RM
-	opPool4Add    = 19 // JNLOP_POOL4_ADD
+	opInstanceForeach = 0  // JNLOP_INSTANCE_FOREACH
+	opInstanceAdd     = 1  // JNLOP_INSTANCE_ADD
+	opInstanceHello   = 2  // JNLOP_INSTANCE_HELLO
+	opInstanceRm      = 3  // JNLOP_INSTANCE_RM
+	opPool4Add        = 19 // JNLOP_POOL4_ADD
 
 	jnlarOperand = 10 // JNLAR_OPERAND
+	jnlalEntry   = 1  // JNLAL_ENTRY
+
+	jnlaieIName  = 3 // JNLAIE_INAME
+	jnlaisStatus = 1 // JNLAIS_STATUS
+	ihsAlive     = 0 // IHS_ALIVE
 
 	joolHdrLen    = 4 + 4 + 4 + joolINameLen // struct joolnlhdr, already aligned
 	joolFlagError = 1 << 0                   // JOOLNLHDR_FLAGS_ERROR
@@ -90,6 +99,7 @@ type joolManager struct {
 	ns      int    // descriptor holding the namespace while active
 	family  uint16 // Jool's generic netlink family then; the kernel hands out a new one when the module is reloaded
 	lastErr string // the module may be absent for hours; the same complaint is logged once
+	others  string // the instances last found in the host's namespace, logged when they change
 	probed  bool   // modprobe was tried
 }
 
@@ -149,6 +159,106 @@ func (m *joolManager) check() {
 	if !m.active {
 		m.report(m.start(family))
 	}
+	m.noteHostInstances(listHostInstances(family))
+}
+
+// noteHostInstances warns about the instances in the host's namespace whenever they change.
+func (m *joolManager) noteHostInstances(found []string) {
+	s := strings.Join(found, ", ")
+	if s == m.others {
+		return
+	}
+	m.others = s
+	if s != "" {
+		warnf("[jool] the host's namespace has instances of its own (%s): they take the packets of the prefixes they translate before these reach %s", s, joolOutside)
+	}
+}
+
+// listHostInstances names the instances in the host's namespace, or none when Jool cannot be asked.
+func listHostInstances(family uint16) []string {
+	c, err := genetlink.Dial(nil)
+	if err != nil {
+		return nil
+	}
+	defer c.Close()
+	ver, err := joolVersion()
+	if err != nil {
+		return nil
+	}
+	return hostInstances(c, family, ver)
+}
+
+// hostInstances names the instances in the namespace of the caller, the host's. Jool takes packets
+// in PREROUTING, so one there translating the NAT64 prefix leaves nothing for sixup's. The module
+// lists the instances of every namespace, so each name is checked with a hello, which looks only in
+// the caller's. A translator type whose module is not loaded refuses the listing and is passed over.
+func hostInstances(c *genetlink.Conn, family uint16, ver uint32) []string {
+	var found []string
+	for _, t := range []struct {
+		xt   uint8
+		name string
+	}{{xtNAT64, "NAT64"}, {xtSIIT, "SIIT"}} {
+		msgs, err := joolExecute(c, family, joolHeader(ver, t.xt, ""), opInstanceForeach, nil)
+		if err != nil {
+			continue
+		}
+		for _, iname := range instanceNames(msgs) {
+			msgs, err := joolExecute(c, family, joolHeader(ver, t.xt, iname), opInstanceHello, nil)
+			if err == nil && helloAlive(msgs) {
+				found = append(found, fmt.Sprintf("%s %q", t.name, iname))
+			}
+		}
+	}
+	return found
+}
+
+// instanceNames reads the names in an instance listing, once each: another namespace may use the
+// same one. A reply holds about a hundred entries, and a router does not run more.
+func instanceNames(msgs []genetlink.Message) []string {
+	var names []string
+	for _, m := range msgs {
+		if len(m.Data) < joolHdrLen {
+			continue
+		}
+		ad, err := netlink.NewAttributeDecoder(m.Data[joolHdrLen:])
+		if err != nil {
+			continue
+		}
+		for ad.Next() {
+			if ad.Type() != jnlalEntry {
+				continue
+			}
+			ad.Nested(func(nad *netlink.AttributeDecoder) error {
+				for nad.Next() {
+					if nad.Type() == jnlaieIName {
+						names = append(names, nad.String())
+					}
+				}
+				return nil
+			})
+		}
+	}
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
+// helloAlive reads the answer to a hello: whether the instance exists in the caller's namespace.
+func helloAlive(msgs []genetlink.Message) bool {
+	for _, m := range msgs {
+		if len(m.Data) < joolHdrLen {
+			continue
+		}
+		ad, err := netlink.NewAttributeDecoder(m.Data[joolHdrLen:])
+		if err != nil {
+			continue
+		}
+		for ad.Next() {
+			if ad.Type() == jnlaisStatus && ad.Uint8() == ihsAlive {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (m *joolManager) start(family uint16) error {
@@ -354,21 +464,26 @@ func (m *joolManager) configure() error {
 // would leave that second reply queued, and the next request on the connection would read it and
 // fail on its sequence number.
 func joolRequest(c *genetlink.Conn, family uint16, ver uint32, op uint8, attrs []byte) error {
-	data := append(joolHeader(ver, joolIName), attrs...)
+	_, err := joolExecute(c, family, joolHeader(ver, xtNAT64, joolIName), op, attrs)
+	return err
+}
+
+// joolExecute sends one request under the header hdr and returns the replies.
+func joolExecute(c *genetlink.Conn, family uint16, hdr []byte, op uint8, attrs []byte) ([]genetlink.Message, error) {
 	msgs, err := c.Execute(
-		genetlink.Message{Header: genetlink.Header{Command: op, Version: 1}, Data: data},
+		genetlink.Message{Header: genetlink.Header{Command: op, Version: 1}, Data: append(hdr, attrs...)},
 		family,
 		netlink.Request,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, m := range msgs {
 		if err := joolReplyError(m.Data); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	return msgs, nil
 }
 
 // joolReplyError reads the error report in a reply: the header's error flag, then the code, an
@@ -396,11 +511,11 @@ func joolReplyError(b []byte) error {
 
 // joolHeader is struct joolnlhdr: the module rejects a request whose version is not exactly its own,
 // so the number is read from the loaded module rather than compiled in.
-func joolHeader(ver uint32, iname string) []byte {
+func joolHeader(ver uint32, xt uint8, iname string) []byte {
 	b := make([]byte, 4+4+4+joolINameLen)
 	copy(b, joolMagic)
 	binary.BigEndian.PutUint32(b[4:8], ver)
-	b[8] = xtNAT64
+	b[8] = xt
 	// b[9] flags, b[10] and b[11] reserved
 	copy(b[12:12+joolINameLen-1], iname)
 	return b

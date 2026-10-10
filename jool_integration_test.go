@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/netip"
@@ -185,6 +186,9 @@ func TestJoolCheckWithoutTheModule(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	m.run(ctx)
+	if got := listHostInstances(0); got != nil {
+		t.Fatalf("without the module there is nobody to ask, got %q", got)
+	}
 	if !m.probed || !strings.Contains(m.lastErr, "does not look loaded") {
 		t.Fatalf("want modprobe tried and the missing module reported, got probed=%v %q", m.probed, m.lastErr)
 	}
@@ -326,6 +330,21 @@ func TestJoolAgainstAFakeModule(t *testing.T) {
 		t.Fatalf("want the missing family reported, got %v", err)
 	}
 	removeOldInstance() // finds no family and leaves
+	// nlctrl stands in for the family and refuses Jool's listing as an unknown command
+	if got := listHostInstances(unix.GENL_ID_CTRL); got != nil {
+		t.Fatalf("a refused listing finds no instances, got %q", got)
+	}
+	// Out of descriptors: first for the netlink socket, then for the version file
+	for extra := range 2 {
+		if err := joolWithFDs(t, extra, func() error {
+			if got := listHostInstances(unix.GENL_ID_CTRL); got != nil {
+				return fmt.Errorf("with room for %d descriptors, no instances, got %q", extra, got)
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	m := &joolManager{prefix: nat64WKP, link: netip.MustParsePrefix("192.168.255.254/31")}
 	if err := m.configure(); err == nil || !strings.Contains(err.Error(), "offers no Jool netlink family") {
 		t.Fatalf("want the missing family reported, got %v", err)
