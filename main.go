@@ -347,7 +347,9 @@ func main() {
 	// without SLAAC it still takes a /128 of the delegation and the tunnel endpoints
 	wcfg := tcfg
 	wcfg.enabled = *tEnable
-	go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanStatic, tempPick: Snapshot.wanTemp, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
+	go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanStatic, tempPick: Snapshot.wanTemp, side: sideWAN, layout: layout, extra: wanEndpoints(secret)}).run(ctx, hub, store, store.Subscribe())
+	// While the line announces a PREF64, this host's own IPv4 has a way out through its NAT64
+	go (&clatManager{wan: *wan, secret: secret, sysctl: !*noSysctl}).run(ctx, store.Subscribe())
 	poolStart, poolEnd := parsePool(*poolRange)
 	var pd *pdPool
 	if *srvMode != "off" && !pdOff && !hostOnly {

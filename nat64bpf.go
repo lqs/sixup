@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"os"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/mdlayher/netlink"
@@ -80,7 +79,7 @@ func (b *bpfNAT64) run(ctx context.Context) {
 
 // start sets the translator up, and on failure undoes what it did.
 func (b *bpfNAT64) start() (err error) {
-	ifi, err := dummyAdd(joolOutside)
+	ifi, err := dummyAdd(joolOutside, 0)
 	if err != nil {
 		return fmt.Errorf("cannot create %s: %w", joolOutside, err)
 	}
@@ -96,7 +95,7 @@ func (b *bpfNAT64) start() (err error) {
 	if err := b.route(ifi); err != nil {
 		return err
 	}
-	if b.slow, err = newSlowPath(b.prefix, b.objs.maps[nat64MapV4Of], b.objs.maps[nat64MapV6Of], ifi, b.lanMTU()); err != nil {
+	if b.slow, err = newSlowPath(nat64Mapping(b.prefix, b.objs.maps[nat64MapV4Of], b.objs.maps[nat64MapV6Of]), ifi, b.lanMTU()); err != nil {
 		return err
 	}
 	if b.reader, err = newRingReader(b.objs.maps[nat64MapSlow]); err != nil {
@@ -155,11 +154,9 @@ func (b *bpfNAT64) load() error {
 		return fmt.Errorf("loading the BPF translator: %w", err)
 	}
 	b.objs = objs
-	fd, err := objs.attachTCX(b.ifindex)
-	if err != nil {
-		return fmt.Errorf("attaching the BPF translator, which needs Linux 6.6 or later: %w", err)
+	if b.link, err = objs.attachTCX(b.ifindex, unix.BPF_TCX_EGRESS); err != nil {
+		return fmt.Errorf("the BPF translator: %w", err)
 	}
-	b.link = os.NewFile(uintptr(fd), "tcx")
 	return nil
 }
 
@@ -292,33 +289,12 @@ func route4MTU(ifi int, dst netip.Prefix, mtu int) error {
 	return linkRequest(unix.RTM_NEWROUTE, netlink.Create|netlink.Replace, hdr, attrs)
 }
 
-// drops sums the drop counters over the CPUs, naming those that are not zero, and adds what the
-// slow path dropped.
-func (b *bpfNAT64) drops() string {
-	var parts []string
-	stats := b.objs.maps[nat64MapStats]
-	per := make([]byte, stats.valueSize)
-	for i, name := range bpfStatNames {
-		if name == "" {
-			continue
-		}
-		stats.lookup(nativeEndian.AppendUint32(nil, uint32(i)), per) // every index of an array is there
-		var n uint64
-		for c := 0; c < len(per); c += 8 {
-			n += nativeEndian.Uint64(per[c:])
-		}
-		if n != 0 {
-			parts = append(parts, fmt.Sprintf("%s %d", name, n))
-		}
-	}
-	if n := b.slow.dropped.Load(); n != 0 {
-		parts = append(parts, fmt.Sprintf("slow-path %d", n))
-	}
-	return strings.Join(parts, ", ")
-}
+// drops names the program's drop counters that are not zero, and what the slow path dropped.
+func (b *bpfNAT64) drops() string { return drops(b.objs.maps[nat64MapStats], bpfStatNames, b.slow) }
 
-// dummyAdd creates a dummy device, replacing one of the same name.
-func dummyAdd(name string) (*net.Interface, error) {
+// dummyAdd creates a dummy device, with an MTU of its own unless mtu is 0, replacing one of the
+// same name.
+func dummyAdd(name string, mtu int) (*net.Interface, error) {
 	if ifi, err := net.InterfaceByName(name); err == nil {
 		if err := linkDel(ifi.Index); err != nil {
 			return nil, fmt.Errorf("removing the old %s: %w", name, err)
@@ -326,6 +302,9 @@ func dummyAdd(name string) (*net.Interface, error) {
 	}
 	ae := netlink.NewAttributeEncoder()
 	ae.String(unix.IFLA_IFNAME, name)
+	if mtu > 0 {
+		ae.Uint32(unix.IFLA_MTU, uint32(mtu))
+	}
 	ae.Nested(unix.IFLA_LINKINFO, func(ae *netlink.AttributeEncoder) error {
 		ae.String(unix.IFLA_INFO_KIND, "dummy")
 		return nil

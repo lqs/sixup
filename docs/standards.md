@@ -463,6 +463,9 @@ Tested by `TestNATPMP` and `TestPCPServerAgainstKernel`.
 - **RFC 8781, PREF64 in the RA.** Advertised while the NAT64 translates, with a lifetime of
   3 × MaxRtrAdvInterval, and withdrawn with lifetime 0.
 - **RFC 6877, 464XLAT.** The CLAT is on the clients; PREF64 is what lets them find the prefix.
+  For the router's own IPv4, sixup runs one itself when the upstream announces a PREF64, in BPF,
+  from `192.0.0.4` (RFC 7335), with errors from the IPv6 path coming from `192.0.0.8`
+  (RFC 7600).
 - **RFC 8925, IPv6-Only Preferred.** A DHCPv4 option, left to the DHCPv4 server, since sixup runs
   none.
 

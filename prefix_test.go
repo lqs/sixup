@@ -882,6 +882,35 @@ func TestStoreWANSubnetWithoutALAN(t *testing.T) {
 	}
 }
 
+// The CLAT address exists while the upstream announces a PREF64: in the WAN subnet, else in the
+// SLAAC prefix, stable and apart from the host's own; the WAN holds it beside the tunnel endpoints.
+func TestCLATAddr(t *testing.T) {
+	secret := []byte("secret")
+	now := time.Now()
+	sub := Prefix{Prefix: netip.MustParsePrefix("2001:db8:100::/64"), Source: sourcePD, Valid: now.Add(time.Hour)}
+	ra := Prefix{Prefix: netip.MustParsePrefix("2001:db8:1::/64"), Source: sourceRA, SLAAC: true, Valid: now.Add(time.Hour)}
+	s := Snapshot{WANSubnet: sub, WAN: []Prefix{ra}}
+	if a := s.clatAddr(secret); a.IsValid() || len(wanEndpoints(secret)(s)) != 0 {
+		t.Fatalf("no PREF64, no CLAT address: %s", a)
+	}
+	s.PREF64 = nat64WKP
+	a := s.clatAddr(secret)
+	if !sub.Prefix.Contains(a) || a != s.clatAddr(secret) || a == stableIID(secret, sub.Prefix, "wan0", 0) {
+		t.Fatalf("want a stable address of its own in the WAN subnet, got %s", a)
+	}
+	if got := wanEndpoints(secret)(s); !slices.Equal(got, []netip.Addr{a}) {
+		t.Fatalf("the WAN should hold the CLAT address, got %v", got)
+	}
+	s.WANSubnet.Deprecated = true
+	if a := s.clatAddr(secret); !ra.Prefix.Contains(a) {
+		t.Fatalf("with the subnet deprecated, want the SLAAC prefix, got %s", a)
+	}
+	s.WAN = nil
+	if a := s.clatAddr(secret); a.IsValid() {
+		t.Fatalf("with no live prefix, want none, got %s", a)
+	}
+}
+
 // An expired prefix has no time left; without a WAN subnet the temporary addresses come from the
 // SLAAC prefix; and only a MAP-E CE is a tunnel endpoint to configure.
 func TestSnapshotHelpers(t *testing.T) {

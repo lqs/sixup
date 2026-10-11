@@ -34,6 +34,17 @@ jobs:
           files: coverage.out
           token: ${{ secrets.CODECOV_TOKEN }}
 
+  generate:
+    # The BPF programs are committed compiled, so that building sixup needs no clang; they have to
+    # be what bpf/*.c compiles to, with the toolchain AGENTS.md names.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker run --rm -v "$PWD:/src" -w /src golang:1.27-alpine3.24 sh -c 'apk add -q clang llvm libbpf-dev linux-headers && go generate ./...'
+      - name: Check the generated files
+        run: |
+          test -z "$(git status --porcelain)" || { git status --porcelain; echo "bpf/*.c changed: run go generate as AGENTS.md says and commit the result"; exit 1; }
+
   lint:
     runs-on: ubuntu-latest
     steps:

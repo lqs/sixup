@@ -4,3 +4,4 @@
 - Write modern Go 1.27: generics, `slices`/`maps`/`cmp`, `errors.Is`/`%w`, `log/slog`, context. Compatibility with older versions is not a concern.
 - Do not rush to commit. After changing code, run `go build ./... && go vet ./... && go test ./...` and `GOOS=linux golangci-lint run` (the Linux target is the real one; on macOS the linux-only netlink constants are reported as unused), and wait for the user to confirm before committing.
 - Comments, log messages and command-line help are always in English.
+- The BPF programs in `bpf/` are committed compiled. After changing them, regenerate with the toolchain CI checks against, and commit the result: `docker run --rm -v "$PWD:/src" -w /src golang:1.27-alpine3.24 sh -c 'apk add -q clang llvm libbpf-dev linux-headers && go generate ./...'`.

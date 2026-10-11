@@ -21,13 +21,14 @@ import (
 // slowFixture is a slow path sending through a dummy device of its own, with maps of its own,
 // and a socket that sees what leaves the device.
 type slowFixture struct {
-	p   *slowPath
-	cap int
+	p          *slowPath
+	v4of, v6of *bpfMap
+	cap        int
 }
 
 func newSlowFixture(t *testing.T, mtu int) *slowFixture {
 	t.Helper()
-	ifi, err := dummyAdd("slowtest0")
+	ifi, err := dummyAdd("slowtest0", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,7 +38,7 @@ func newSlowFixture(t *testing.T, mtu int) *slowFixture {
 	}
 	ifi.MTU = mtu
 	v4of, v6of := testMaps(t, 64, 64)
-	p, err := newSlowPath(nat64WKP, v4of, v6of, ifi, 1500)
+	p, err := newSlowPath(nat64Mapping(nat64WKP, v4of, v6of), ifi, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,7 @@ func newSlowFixture(t *testing.T, mtu int) *slowFixture {
 		t.Fatal(err)
 	}
 	unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &unix.Timeval{Usec: 200000})
-	return &slowFixture{p: p, cap: fd}
+	return &slowFixture{p: p, v4of: v4of, v6of: v6of, cap: fd}
 }
 
 // sent returns the IP packets that left the device since the last call.
@@ -136,7 +137,7 @@ func TestSlowPathTranslates(t *testing.T) {
 	p := f.p
 	host := netip.MustParseAddr("2001:db8::5").As16()
 	pool := [4]byte{198, 18, 0, 5}
-	if err := p.v6of.update(pool[:], host[:], 0); err != nil {
+	if err := f.v6of.update(pool[:], host[:], 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -207,7 +208,7 @@ func TestSlowPathTranslates(t *testing.T) {
 	}
 	hdr, msg = reassembled(t, f.sent(), 600)
 	var a4 [4]byte
-	if err := p.v4of.lookup(src.AsSlice(), a4[:]); err != nil {
+	if err := f.v4of.lookup(src.AsSlice(), a4[:]); err != nil {
 		t.Fatal(err)
 	}
 	base, mask := binary.BigEndian.Uint32(bpfPool.Addr().AsSlice()), uint32(1)<<(32-bpfPool.Bits())-1
@@ -218,14 +219,20 @@ func TestSlowPathTranslates(t *testing.T) {
 		t.Fatalf("want a 2000-byte echo reply with a right checksum, TOS and TTL, got % x", hdr)
 	}
 
+	// A source the pool already numbers is found again without a new address
+	if got, err := p.v4of6(src.As16(), false); err != nil || got != a4 {
+		t.Fatalf("want %v again, got %v: %v", a4, got, err)
+	}
+
 	// What cannot be translated
 	for name, pkt := range map[string][]byte{
-		"IPv4 to an address no source has": v4Packet("192.0.2.2", "198.18.0.6", unix.IPPROTO_UDP, 0, udp),
-		"IPv4 TCP":                         v4Packet("192.0.2.2", "198.18.0.5", unix.IPPROTO_TCP, 0, udp),
-		"an IPv4 error":                    v4Packet("192.0.2.2", "198.18.0.5", unix.IPPROTO_ICMP, 0, []byte{3, 3, 0, 0, 0, 0, 0, 0}),
-		"IPv6 outside the prefix":          v6Packet("2001:db8::77", "2001:db8::1", unix.IPPROTO_ICMPV6, reply[:8]),
-		"IPv6 UDP":                         v6Packet("2001:db8::77", "64:ff9b::1", unix.IPPROTO_UDP, udp),
-		"an IPv6 error":                    v6Packet("2001:db8::77", "64:ff9b::1", unix.IPPROTO_ICMPV6, []byte{1, 4, 0, 0, 0, 0, 0, 0}),
+		"IPv4 from a pool address no source has": v4Packet("198.18.0.99", "198.18.0.5", unix.IPPROTO_UDP, 0, udp),
+		"IPv4 to an address no source has":       v4Packet("192.0.2.2", "198.18.0.6", unix.IPPROTO_UDP, 0, udp),
+		"IPv4 TCP":                               v4Packet("192.0.2.2", "198.18.0.5", unix.IPPROTO_TCP, 0, udp),
+		"an IPv4 error":                          v4Packet("192.0.2.2", "198.18.0.5", unix.IPPROTO_ICMP, 0, []byte{3, 3, 0, 0, 0, 0, 0, 0}),
+		"IPv6 outside the prefix":                v6Packet("2001:db8::77", "2001:db8::1", unix.IPPROTO_ICMPV6, reply[:8]),
+		"IPv6 UDP":                               v6Packet("2001:db8::77", "64:ff9b::1", unix.IPPROTO_UDP, udp),
+		"an IPv6 error":                          v6Packet("2001:db8::77", "64:ff9b::1", unix.IPPROTO_ICMPV6, []byte{1, 4, 0, 0, 0, 0, 0, 0}),
 	} {
 		if err := p.packet(pkt); err == nil {
 			t.Errorf("%s: want an error", name)
@@ -236,7 +243,7 @@ func TestSlowPathTranslates(t *testing.T) {
 	for i := range uint32(bpfProbes) {
 		var slot [4]byte
 		binary.BigEndian.PutUint32(slot[:], base+((hash6(busy)+i)&mask))
-		p.v6of.update(slot[:], host[:], 0)
+		f.v6of.update(slot[:], host[:], 0)
 	}
 	if err := p.packet(v6Packet("2001:db8::99", "64:ff9b::1", unix.IPPROTO_ICMPV6, reply[:8])); err == nil || !strings.Contains(err.Error(), "full") {
 		t.Fatalf("want the pool full, got %v", err)
@@ -282,7 +289,7 @@ func TestBPFProgram(t *testing.T) {
 		return
 	}
 	b := &bpfNAT64{prefix: nat64WKP}
-	ifi, err := dummyAdd("progtest0")
+	ifi, err := dummyAdd("progtest0", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,10 +356,10 @@ func TestBPFNAT64StartUndoes(t *testing.T) {
 	}
 	b.stop()
 	// A device of the same name, as a crash would leave, is replaced
-	if _, err := dummyAdd("reptest0"); err != nil {
+	if _, err := dummyAdd("reptest0", 0); err != nil {
 		t.Fatal(err)
 	}
-	ifi, err := dummyAdd("reptest0")
+	ifi, err := dummyAdd("reptest0", 0)
 	if err != nil {
 		t.Fatalf("the old device should be replaced: %v", err)
 	}
@@ -377,7 +384,7 @@ func TestBPFNAT64WithoutPrivileges(t *testing.T) {
 	if err := syscall.Setresuid(-1, 65534, -1); err != nil {
 		t.Fatal(err)
 	}
-	_, addErr := dummyAdd(joolOutside)
+	_, addErr := dummyAdd(joolOutside, 0)
 	b.sweep()
 	b.sweep()
 	if err := syscall.Setresuid(-1, 0, -1); err != nil {
@@ -431,7 +438,7 @@ func TestSlowPathWithoutDescriptors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := joolWithFDs(t, 0, func() error { _, err := newSlowPath(nat64WKP, nil, nil, lo, 1500); return err }); !errors.Is(err, unix.EMFILE) {
+	if err := joolWithFDs(t, 0, func() error { _, err := newSlowPath(slowMapping{}, lo, 1500); return err }); !errors.Is(err, unix.EMFILE) {
 		t.Fatalf("want the socket refused, got %v", err)
 	}
 }
@@ -443,7 +450,7 @@ func TestBPFICMPTranslation(t *testing.T) {
 		return
 	}
 	b := &bpfNAT64{prefix: nat64WKP}
-	ifi, err := dummyAdd("icmptest0")
+	ifi, err := dummyAdd("icmptest0", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -594,7 +601,7 @@ func TestBPFRFC6052(t *testing.T) {
 	udp := []byte{0, 7, 0x30, 0x39, 0, 8, 0xab, 0xcd}
 	for prefix, want := range rfc6052Examples {
 		b := &bpfNAT64{prefix: netip.MustParsePrefix(prefix)}
-		ifi, err := dummyAdd("rfctest0")
+		ifi, err := dummyAdd("rfctest0", 0)
 		if err != nil {
 			t.Fatal(err)
 		}

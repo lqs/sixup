@@ -184,6 +184,34 @@ func (s Snapshot) wanSelf(iid iidPolicy, secret []byte, ifi *net.Interface) (net
 	return netip.Addr{}, false
 }
 
+// clatDev is the device the CLAT takes this host's IPv4 from.
+const clatDev = "sixup-clat"
+
+// clatAddr is this host's CLAT address (RFC 6877) while the upstream announces a PREF64: stable in
+// the WAN subnet, else in the SLAAC prefix, and apart from every other address of the host.
+func (s Snapshot) clatAddr(secret []byte) netip.Addr {
+	if !s.PREF64.IsValid() {
+		return netip.Addr{}
+	}
+	prefixes := append([]Prefix{s.WANSubnet}, s.wanSLAAC()...)
+	i := slices.IndexFunc(prefixes, func(p Prefix) bool { return p.Prefix.IsValid() && !p.Deprecated })
+	if i < 0 {
+		return netip.Addr{}
+	}
+	return stableIID(secret, prefixes[i].Prefix, clatDev, 0)
+}
+
+// wanEndpoints is what the WAN holds beside the addresses of its prefixes: the tunnel endpoints
+// and the CLAT address, neither ever a source of its own.
+func wanEndpoints(secret []byte) func(Snapshot) []netip.Addr {
+	return func(s Snapshot) []netip.Addr {
+		if a := s.clatAddr(secret); a.IsValid() {
+			return append(s.tunnelEndpoints(), a)
+		}
+		return s.tunnelEndpoints()
+	}
+}
+
 // selfAddr returns the address of this router in prefix by the policy iid, after any DAD failure.
 func (s Snapshot) selfAddr(iid iidPolicy, secret []byte, prefix netip.Prefix, ifi *net.Interface) netip.Addr {
 	if a, ok := s.Self[prefix]; ok {

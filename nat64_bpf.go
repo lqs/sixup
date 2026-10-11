@@ -30,9 +30,9 @@ var nat64Maps = []bpfMapSpec{
 // Where each variable sits in the read-only data, and its size
 var (
 	nat64VarSlowMark = bpfVar{off: 0, size: 4}
-	nat64VarPoolBase = bpfVar{off: 4, size: 4}
-	nat64VarPoolMask = bpfVar{off: 8, size: 4}
-	nat64VarPref6    = bpfVar{off: 12, size: 16}
-	nat64VarMask6    = bpfVar{off: 28, size: 16}
-	nat64VarV4pos    = bpfVar{off: 44, size: 4}
+	nat64VarPref6    = bpfVar{off: 4, size: 16}
+	nat64VarMask6    = bpfVar{off: 20, size: 16}
+	nat64VarV4pos    = bpfVar{off: 36, size: 4}
+	nat64VarPoolBase = bpfVar{off: 40, size: 4}
+	nat64VarPoolMask = bpfVar{off: 44, size: 4}
 )

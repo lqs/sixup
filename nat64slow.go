@@ -16,8 +16,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The slow path of the BPF translator takes the datagrams bpf/nat64.c cannot give a right
-// checksum one fragment at a time: fragmented ICMP, and IPv4 UDP without a checksum. It puts
+// The slow path of the BPF translators takes the datagrams bpf/nat64.c and bpf/clat.c cannot give
+// a right checksum one fragment at a time: fragmented ICMP, and IPv4 UDP without a checksum. It puts
 // them together, translates them whole, cuts them into fragments again where they are too large
 // for the device, or for the smallest LAN, and sends them back out of the device marked
 // bpfSlowMark. The program hands them to the device's ingress, where they enter the stack like
@@ -31,9 +31,7 @@ const (
 )
 
 type slowPath struct {
-	prefix  netip.Prefix
-	v4of    *bpfMap
-	v6of    *bpfMap
+	slowMapping
 	dev     *net.Interface
 	mtu6    int // what an IPv6 packet sent on may be at most
 	fd      int // a packet socket, sending marked
@@ -41,6 +39,45 @@ type slowPath struct {
 	id      uint32
 	dropped atomic.Uint64
 	now     func() time.Time
+}
+
+// slowMapping maps addresses between the families as the program the slow path serves does.
+type slowMapping struct {
+	v4of6 func(a [16]byte, alloc bool) ([4]byte, error) // a new pool address for a source if alloc
+	v6of4 func(a [4]byte) ([16]byte, error)
+}
+
+// nat64Mapping is bpf/nat64.c's: the NAT64 prefix carries IPv4 addresses, and the pool stands for
+// IPv6 sources.
+func nat64Mapping(prefix netip.Prefix, v4of, v6of *bpfMap) slowMapping {
+	return slowMapping{
+		v4of6: func(a [16]byte, alloc bool) ([4]byte, error) {
+			var v [4]byte
+			switch {
+			case prefix.Contains(netip.AddrFrom16(a)):
+				return extract4(prefix, a), nil
+			case alloc:
+				v, ok := map4(v4of, v6of, a)
+				if !ok {
+					return v, errors.New("the pool is full")
+				}
+				return v, nil
+			case v4of.lookup(a[:], v[:]) != nil:
+				return v, fmt.Errorf("%s has no pool address", netip.AddrFrom16(a))
+			}
+			return v, nil
+		},
+		v6of4: func(a [4]byte) ([16]byte, error) {
+			var v [16]byte
+			if !bpfPool.Contains(netip.AddrFrom4(a)) {
+				return embed4(prefix, a), nil
+			}
+			if v6of.lookup(a[:], v[:]) != nil {
+				return v, fmt.Errorf("no source has %s", netip.AddrFrom4(a))
+			}
+			return v, nil
+		},
+	}
 }
 
 // slowKey tells the fragments of one datagram from those of others (RFC 791, RFC 8200).
@@ -57,13 +94,13 @@ type slowGroup struct {
 	expires time.Time
 }
 
-func newSlowPath(prefix netip.Prefix, v4of, v6of *bpfMap, dev *net.Interface, mtu6 int) (*slowPath, error) {
+func newSlowPath(m slowMapping, dev *net.Interface, mtu6 int) (*slowPath, error) {
 	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("packet socket: %w", err)
 	}
 	unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, bpfSlowMark) // CAP_NET_RAW, which the socket took, allows it
-	return &slowPath{prefix: prefix, v4of: v4of, v6of: v6of, dev: dev, mtu6: min(mtu6, dev.MTU), fd: fd, groups: map[slowKey]*slowGroup{}, now: time.Now}, nil
+	return &slowPath{slowMapping: m, dev: dev, mtu6: min(mtu6, dev.MTU), fd: fd, groups: map[slowKey]*slowGroup{}, now: time.Now}, nil
 }
 
 func (p *slowPath) close() { unix.Close(p.fd) }
@@ -208,13 +245,16 @@ func (p *slowPath) whole(hdr []byte, proto uint8, payload []byte) error {
 	return p.to4(hdr, proto, payload)
 }
 
-// to6 translates IPv4 from the pool's side: ICMP echo, or UDP whose checksum it computes.
+// to6 translates IPv4: ICMP echo, or UDP whose checksum it computes.
 func (p *slowPath) to6(hdr []byte, proto uint8, payload []byte) error {
-	var dst [16]byte
-	if err := p.v6of.lookup(hdr[16:20], dst[:]); err != nil {
-		return fmt.Errorf("no source has %s", netip.AddrFrom4([4]byte(hdr[16:20])))
+	src, err := p.v6of4([4]byte(hdr[12:16]))
+	if err != nil {
+		return err
 	}
-	src := embed4(p.prefix, [4]byte(hdr[12:16]))
+	dst, err := p.v6of4([4]byte(hdr[16:20]))
+	if err != nil {
+		return err
+	}
 	msg := slices.Clone(payload)
 	var csum int
 	switch {
@@ -241,18 +281,18 @@ func (p *slowPath) to6(hdr []byte, proto uint8, payload []byte) error {
 	return p.send6(h, msg)
 }
 
-// to4 translates IPv6 ICMP echo from the LAN side.
+// to4 translates IPv6 ICMP echo.
 func (p *slowPath) to4(hdr []byte, proto uint8, payload []byte) error {
-	src, dst := [16]byte(hdr[8:24]), [16]byte(hdr[24:40])
-	if !p.prefix.Contains(netip.AddrFrom16(dst)) {
-		return fmt.Errorf("%s is outside %s", netip.AddrFrom16(dst), p.prefix)
-	}
 	if proto != unix.IPPROTO_ICMPV6 || len(payload) < 8 || (payload[0] != 128 && payload[0] != 129) {
 		return fmt.Errorf("cannot translate protocol %d whole", proto)
 	}
-	a4, ok := map4(p.v4of, p.v6of, src)
-	if !ok {
-		return errors.New("the pool is full")
+	dst, err := p.v4of6([16]byte(hdr[24:40]), false)
+	if err != nil {
+		return err
+	}
+	src, err := p.v4of6([16]byte(hdr[8:24]), true)
+	if err != nil {
+		return err
 	}
 	msg := slices.Clone(payload)
 	msg[0] = map[byte]byte{128: 8, 129: 0}[msg[0]]
@@ -262,9 +302,8 @@ func (p *slowPath) to4(hdr []byte, proto uint8, payload []byte) error {
 	h[0] = 4<<4 | 5
 	h[1] = hdr[0]<<4 | hdr[1]>>4
 	h[8], h[9] = hdr[7], unix.IPPROTO_ICMP
-	copy(h[12:], a4[:])
-	a := extract4(p.prefix, dst)
-	copy(h[16:], a[:])
+	copy(h[12:], src[:])
+	copy(h[16:], dst[:])
 	return p.send4(h, msg)
 }
 
