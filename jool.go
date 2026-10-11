@@ -691,11 +691,12 @@ func linkRequest(typ netlink.HeaderType, flags netlink.HeaderFlags, hdr, attrs [
 	return err
 }
 
-// checkJoolIPv4 refuses a /31 that an address or a route of this host already covers: the two
-// hosts behind it would become unreachable, or Jool's traffic would go to them. The default route
-// covers everything and does not count, and neither does the veth of an earlier run, which the
-// kernel may still be tearing down when sixup starts again.
-func checkJoolIPv4(link netip.Prefix) error {
+// checkIPv4Unused refuses a prefix that an address or a route of this host already covers: Jool's
+// /31 or the BPF translator's pool, whose addresses would become unreachable, or whose traffic
+// would go to them. The default route covers everything and does not count, and neither does
+// sixup-nat64 of an earlier run, which the kernel may still be tearing down when sixup starts
+// again.
+func checkIPv4Unused(link netip.Prefix) error {
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return err

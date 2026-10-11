@@ -17,4 +17,4 @@ type joolManager struct {
 
 func (m *joolManager) run(ctx context.Context) { <-ctx.Done() }
 
-func checkJoolIPv4(netip.Prefix) error { return nil }
+func checkIPv4Unused(netip.Prefix) error { return nil }

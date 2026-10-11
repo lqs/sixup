@@ -48,6 +48,10 @@ var licenseText string
 //go:embed NOTICE
 var noticeText string
 
+// bpfPool is the private IPv4 pool -nat64 bpf numbers IPv6 sources from. The source NAT on the
+// way out hides these addresses like those of any other IPv4 host behind the router.
+var bpfPool = netip.MustParsePrefix("198.18.0.0/15")
+
 // nat64WKP is the well-known prefix of RFC 6052, the default of -nat64-prefix. Carving one out of
 // the delegated prefix would tie the translator to a prefix that changes, and every client would
 // have to be told again.
@@ -135,8 +139,8 @@ func main() {
 	if *tunNAT != "auto" && *tunNAT != "off" {
 		fatalf("-tunnel-nat must be auto / off")
 	}
-	if *nat64 != "jool" && *nat64 != "off" {
-		fatalf("-nat64 must be jool / off")
+	if *nat64 != "jool" && *nat64 != "bpf" && *nat64 != "off" {
+		fatalf("-nat64 must be jool / bpf / off")
 	}
 	joolLink, err := netip.ParsePrefix(*joolIPv4)
 	if err != nil || !joolLink.Addr().Is4() || joolLink.Bits() != 31 {
@@ -161,8 +165,13 @@ func main() {
 	}
 	// Refused before anything is configured, so a conflict leaves the host as it was
 	if *nat64 == "jool" && !dryRun {
-		if err := checkJoolIPv4(joolLink); err != nil {
+		if err := checkIPv4Unused(joolLink); err != nil {
 			fatalf("-jool-ipv4: %v", err)
+		}
+	}
+	if *nat64 == "bpf" && !dryRun {
+		if err := checkIPv4Unused(bpfPool); err != nil {
+			fatalf("-nat64 bpf numbers IPv6 sources from %s, but %v", bpfPool, err)
 		}
 	}
 	layout := shared64Layout(*shared64)
@@ -281,6 +290,10 @@ func main() {
 			go nat.run(ctx, store.Subscribe())
 		}
 	}
+	var names []string
+	for _, l := range lanDefs {
+		names = append(names, l.iface)
+	}
 	if *nat64 == "jool" {
 		// Jool's IPv4 output comes back through the veth and is forwarded out of this namespace
 		if !*noSysctl {
@@ -290,12 +303,17 @@ func main() {
 		}
 		go (&joolManager{prefix: nat64Pfx, link: joolLink, store: store}).run(ctx)
 	}
-	var names []string
-	for _, l := range lanDefs {
-		names = append(names, l.iface)
+	if *nat64 == "bpf" {
+		// The translated IPv4 comes in on the dummy device and is forwarded out of it
+		if !*noSysctl {
+			if err := sysctlWrite("/proc/sys/net/ipv4/ip_forward", "1"); err != nil {
+				warnf("[sysctl] ipv4/ip_forward=1 failed: %v", err)
+			}
+		}
+		go (&bpfNAT64{prefix: nat64Pfx, lans: names, store: store}).run(ctx)
 	}
 	// The border of RFC 7084 is kept in every mode; allow only lets unsolicited traffic in
-	fw := &firewall{wan: *wan, lans: names, inbound: *unsolicited != "allow", source: *srcFilter, nat64: *nat64 == "jool", holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
+	fw := &firewall{wan: *wan, lans: names, inbound: *unsolicited != "allow", source: *srcFilter, nat64: *nat64 != "off", holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
 	go fw.run(ctx, store.Subscribe())
 	if *unsolicited != "deny" {
 		p := &pcpServer{lans: names, nat: nat}

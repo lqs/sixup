@@ -30,7 +30,7 @@ func TestJoolNamespaceAgainstKernel(t *testing.T) {
 	enterNetNS(t)
 	loUp(t)
 	link := netip.MustParsePrefix("192.168.255.254/31")
-	if err := checkJoolIPv4(link); err != nil {
+	if err := checkIPv4Unused(link); err != nil {
 		t.Fatalf("an empty namespace has nothing to overlap: %v", err)
 	}
 	m := &joolManager{prefix: nat64WKP, link: link}
@@ -92,7 +92,7 @@ func TestJoolNamespaceAgainstKernel(t *testing.T) {
 
 	// A second run may start while the kernel still tears down the first one's namespace: its veth
 	// is no conflict, and building a new pair replaces it
-	if err := checkJoolIPv4(link); err != nil {
+	if err := checkIPv4Unused(link); err != nil {
 		t.Fatalf("the veth of an earlier run must not count as a conflict: %v", err)
 	}
 	srv.Close()
@@ -114,7 +114,7 @@ func TestJoolNamespaceAgainstKernel(t *testing.T) {
 	if err := routeSet(1, netip.MustParsePrefix("192.168.255.0/24"), netip.Addr{}, 0, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkJoolIPv4(link); err == nil {
+	if err := checkIPv4Unused(link); err == nil {
 		t.Fatal("a /31 inside another route must be refused")
 	}
 	routeDel(1, netip.MustParsePrefix("192.168.255.0/24"), netip.Addr{}, 0)
@@ -218,7 +218,7 @@ func TestJoolStartWithoutTheModule(t *testing.T) {
 	joolSkipIfLoaded(t)
 	enterNetNS(t)
 	loUp(t)
-	if err := checkJoolIPv4(netip.MustParsePrefix("127.0.0.0/31")); err == nil || !strings.Contains(err.Error(), "overlaps the address") {
+	if err := checkIPv4Unused(netip.MustParsePrefix("127.0.0.0/31")); err == nil || !strings.Contains(err.Error(), "overlaps the address") {
 		t.Fatalf("a /31 inside lo's 127.0.0.0/8 must be refused, got %v", err)
 	}
 	m := &joolManager{prefix: nat64WKP, link: netip.MustParsePrefix("192.168.255.254/31")}
@@ -263,7 +263,7 @@ func TestJoolStartWithoutTheModule(t *testing.T) {
 			t.Fatalf("with room for %d descriptors, want EMFILE, got %v", extra, err)
 		}
 	}
-	if err := joolWithFDs(t, 0, func() error { return checkJoolIPv4(m.link) }); !errors.Is(err, unix.EMFILE) {
+	if err := joolWithFDs(t, 0, func() error { return checkIPv4Unused(m.link) }); !errors.Is(err, unix.EMFILE) {
 		t.Fatalf("listing the interfaces needs a socket, got %v", err)
 	}
 	if err := joolWithFDs(t, 0, func() error { _, err := routes4(); return err }); !errors.Is(err, unix.EMFILE) {

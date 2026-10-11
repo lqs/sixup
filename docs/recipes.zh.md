@@ -26,7 +26,7 @@ sudo sixup -wan eth0 -lan eth1
 | [指定 DNS 服务器](#指定-dns-服务器) | `-ra-dns self`，或服务器的地址 |
 | [用 DHCPv6 分配地址](#用-dhcpv6-分配地址) | `-dhcp6s-mode stateful` |
 | [下级路由器](#下级路由器) | 上级路由器加 `-dhcp6s-mode stateless` |
-| [IPv6 单栈或 IPv6-mostly 内网](#ipv6-单栈或-ipv6-mostly-内网) | `-nat64 jool` |
+| [IPv6 单栈或 IPv6-mostly 内网](#ipv6-单栈或-ipv6-mostly-内网) | `-nat64 bpf` |
 | [内网主机后面的另一个网络](#内网主机后面的另一个网络) | `-ra-route`、`-source-filter=false` |
 | [在容器里运行](#在容器里运行) | `-no-sysctl`、`-state-dir` |
 
@@ -272,13 +272,15 @@ sudo sixup -wan eth0 -lan eth1
 
 内网可以只用 IPv6，没有 IPv4 地址，没有 DHCPv4，也不用同时维护两套协议。客户端仍然可以通过 NAT64 访问 IPv4 互联网，由路由器把它们的 IPv6 包转换成 IPv4。改用 IPv6 单栈，是一个网络能为 IPv6 做的最有意义的事情之一，因为每多一个这样的网络，大家继续保留 IPv4 的理由就少一个。如果你打算这样做，这一节就是为你写的。
 
-安装 Jool 模块，再启用 NAT64。如果模块没有加载，sixup 会用 `/sbin/modprobe jool` 加载它。与命名空间之间通过 IPv4 /31 `192.168.255.254/31` 相连；它与本机的地址或路由重叠时，sixup 拒绝启动，用 `-jool-ipv4` 指定另一个。
+启动 sixup 时启用 NAT64。`-nat64 bpf` 是 sixup 自带的转换器，不需要安装任何东西，只要求 Linux 6.6 及以上。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -nat64 jool
+sudo sixup -wan eth0 -lan eth1 -nat64 bpf
 ```
 
-Jool 运行在独立的网络命名空间里，经 veth `sixup-nat64` 相连，转换 `64:ff9b::/96`，内网和路由器自身都能使用。转换期间，RA 会通告这个前缀（PREF64，RFC 8781）。转换出的 IPv4 按路由器的 IPv4 路由出去。走 MAP-E 隧道时，它和其他流量共用线路的端口集；没有隧道时，从已配置的其他 IPv4 出口出去。防火墙需要放行经过 `sixup-nat64` 的流量。
+它在 dummy 设备 `sixup-nat64` 上转换 `64:ff9b::/96`，内网和路由器自身都能使用，转换在内核中完成。每个 IPv6 客户端从 `198.18.0.0/15` 分到一个自己的 IPv4 地址，再由路由器的 IPv4 源地址转换隐藏，和路由器后面的其他主机一样。走 MAP-E 隧道时，转换后的流量和其他流量共用线路的端口集；没有隧道时，从已配置的其他 IPv4 出口出去。这个地址池与本机的地址或路由重叠时，sixup 拒绝启动。转换期间，RA 会通告这个前缀（PREF64，RFC 8781）。防火墙需要放行经过 `sixup-nat64` 的流量。
+
+内核较旧时，可以改用 `-nat64 jool`，运行 Jool 内核模块（4.1 及以后），它在独立的网络命名空间里，经同名的 veth 相连。如果模块没有加载，sixup 会用 `/sbin/modprobe jool` 加载它。与命名空间之间通过 IPv4 /31 `192.168.255.254/31` 相连；它与本机的地址或路由重叠时，sixup 拒绝启动，用 `-jool-ipv4` 指定另一个。
 
 客户端访问 IPv4 有两种方式。
 
@@ -299,13 +301,13 @@ Jool 运行在独立的网络命名空间里，经 veth `sixup-nat64` 相连，�
 要通过 NAT64 访问私有 IPv4 地址，需要用网络专用前缀，因为知名前缀可能不能用于私有地址（RFC 6052）。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -nat64 jool -nat64-prefix fd00:64::/96
+sudo sixup -wan eth0 -lan eth1 -nat64 bpf -nat64-prefix fd00:64::/96
 ```
 
 只想通过 DNS64 提供 NAT64，不让客户端启用 CLAT，就不在 RA 中通告前缀。
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -nat64 jool -ra-pref64 off
+sudo sixup -wan eth0 -lan eth1 -nat64 bpf -ra-pref64 off
 ```
 
 ## 内网主机后面的另一个网络
