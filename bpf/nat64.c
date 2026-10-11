@@ -9,7 +9,7 @@
 // TCP, UDP and ICMP are translated, ICMP errors with the packet they quote, and fragments one by
 // one. Fragments reach the program as they were sent, or as conntrack's reassembly is cut again
 // on the way out of the device, no larger than the pool route's MTU leaves room for. Two kinds
-// need the whole datagram for their new checksum and go to sixup instead, through the perf buffer
+// need the whole datagram for their new checksum and go to sixup instead, through the ring buffer
 // slow: fragmented ICMP, whose IPv6 checksum covers a length no single fragment shows, and IPv4
 // UDP without a checksum, which IPv6 requires. sixup sends them back translated through the same
 // device, marked, and the program hands them to its ingress like the rest. Dropped and counted: IPv4 options, IPv6 extension
@@ -46,6 +46,16 @@ volatile const __u8 mask6[16]; // ones over the prefix's length
 volatile const __u8 v4pos[4];  // where RFC 6052 puts the bytes of an IPv4 address after it
 volatile const __u32 slow_mark; // marks the packets sixup sends back translated
 
+// A map as sixup creates it: tools/bpfgen reads these from the section maps, so that sixup needs
+// neither BTF nor an ELF parser
+struct map_def {
+	__u32 type;
+	__u32 key_size;
+	__u32 value_size;
+	__u32 max_entries;
+	__u32 flags;
+};
+
 enum {
 	STAT_OUT,        // IPv6 translated to IPv4
 	STAT_IN,         // IPv4 translated to IPv6
@@ -58,35 +68,24 @@ enum {
 	STAT_MAX,
 };
 
-struct {
-	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-	__uint(max_entries, STAT_MAX);
-	__type(key, __u32);
-	__type(value, __u64);
-} stats SEC(".maps");
+struct map_def stats SEC("maps") = {BPF_MAP_TYPE_PERCPU_ARRAY, sizeof(__u32), sizeof(__u64), STAT_MAX};
 
 // The two directions of the address mapping, kept in step; sixup removes the pairs conntrack has
 // no flow for
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 65536);
-	__type(key, struct in6_addr);
-	__type(value, __be32);
-} v4_of SEC(".maps");
+struct map_def v4_of SEC("maps") = {BPF_MAP_TYPE_HASH, sizeof(struct in6_addr), sizeof(__be32), 65536};
+struct map_def v6_of SEC("maps") = {BPF_MAP_TYPE_HASH, sizeof(__be32), sizeof(struct in6_addr), 65536};
 
-struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 65536);
-	__type(key, __be32);
-	__type(value, struct in6_addr);
-} v6_of SEC(".maps");
+#define SLOW_MAX 16384 // the largest frame handed to sixup, more than a jumbo LAN's; a power of two
 
-// The packets handed to sixup, each after its length
-struct {
-	__uint(type, BPF_MAP_TYPE_PERF_EVENT_ARRAY);
-	__uint(key_size, sizeof(__u32));
-	__uint(value_size, sizeof(__u32));
-} slow SEC(".maps");
+// The frames handed to sixup
+struct map_def slow SEC("maps") = {BPF_MAP_TYPE_RINGBUF, 0, 0, 1 << 22};
+
+// Where a frame is copied on its way there, as a ring buffer takes no packet directly
+struct slow_frame {
+	__u8 b[SLOW_MAX];
+};
+
+struct map_def slow_buf SEC("maps") = {BPF_MAP_TYPE_PERCPU_ARRAY, sizeof(__u32), sizeof(struct slow_frame), 1};
 
 // The IPv4 UDP datagrams without a checksum whose first fragment went to sixup, so that the rest
 // follows it there: the kernel cuts a reassembled datagram again first fragment first
@@ -97,12 +96,7 @@ struct frag4 {
 	__u16 pad;
 };
 
-struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__uint(max_entries, 1024);
-	__type(key, struct frag4);
-	__type(value, __u8);
-} slow_frags SEC(".maps");
+struct map_def slow_frags SEC("maps") = {BPF_MAP_TYPE_LRU_HASH, sizeof(struct frag4), sizeof(__u8), 1024};
 
 // The IPv6 pseudo-header, which the ICMPv6 checksum covers and the ICMP one does not
 struct pseudo6 {
@@ -155,8 +149,15 @@ static __always_inline int count(__u32 stat, int verdict)
 // into fragments gives up on the rest at the first failure.
 static __always_inline int to_slow(struct __sk_buff *skb)
 {
-	__u32 len = skb->len;
-	if (bpf_perf_event_output(skb, &slow, BPF_F_CURRENT_CPU | (__u64)len << 32, &len, sizeof(len)))
+	__u32 zero = 0, len = skb->len;
+	struct slow_frame *f = bpf_map_lookup_elem(&slow_buf, &zero);
+	if (!f || len < ETH_HLEN || len > SLOW_MAX)
+		return count(STAT_DROP_ERR, TC_ACT_SHOT);
+	// The same length, in a form whose bounds the verifier can see; the barrier keeps the
+	// compiler from folding it back
+	asm volatile("" : "+r"(len));
+	len = ((len - 1) & (SLOW_MAX - 1)) + 1;
+	if (bpf_skb_load_bytes(skb, 0, f->b, len) || bpf_ringbuf_output(&slow, f->b, len, 0))
 		return count(STAT_DROP_ERR, TC_ACT_SHOT);
 	return count(STAT_SLOW, TC_ACT_STOLEN);
 }

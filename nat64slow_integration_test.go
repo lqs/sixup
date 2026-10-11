@@ -13,8 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"unsafe"
 
-	"github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -36,17 +36,8 @@ func newSlowFixture(t *testing.T, mtu int) *slowFixture {
 		t.Fatal(err)
 	}
 	ifi.MTU = mtu
-	v4of, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 16, ValueSize: 4, MaxEntries: 64})
-	if err != nil {
-		t.Fatal(err)
-	}
-	v6of, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 4, ValueSize: 16, MaxEntries: 64})
-	if err != nil {
-		t.Fatal(err)
-	}
-	objs := &nat64Objects{nat64Maps: nat64Maps{V4Of: v4of, V6Of: v6of}}
-	t.Cleanup(func() { objs.Close() })
-	p, err := newSlowPath(nat64WKP, objs, ifi, 1500)
+	v4of, v6of := testMaps(t, 64, 64)
+	p, err := newSlowPath(nat64WKP, v4of, v6of, ifi, 1500)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,7 +136,7 @@ func TestSlowPathTranslates(t *testing.T) {
 	p := f.p
 	host := netip.MustParseAddr("2001:db8::5").As16()
 	pool := [4]byte{198, 18, 0, 5}
-	if err := p.v6of.Put(pool, host); err != nil {
+	if err := p.v6of.update(pool[:], host[:], 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -216,7 +207,7 @@ func TestSlowPathTranslates(t *testing.T) {
 	}
 	hdr, msg = reassembled(t, f.sent(), 600)
 	var a4 [4]byte
-	if err := p.v4of.Lookup(src.As16(), &a4); err != nil {
+	if err := p.v4of.lookup(src.AsSlice(), a4[:]); err != nil {
 		t.Fatal(err)
 	}
 	base, mask := binary.BigEndian.Uint32(bpfPool.Addr().AsSlice()), uint32(1)<<(32-bpfPool.Bits())-1
@@ -245,7 +236,7 @@ func TestSlowPathTranslates(t *testing.T) {
 	for i := range uint32(bpfProbes) {
 		var slot [4]byte
 		binary.BigEndian.PutUint32(slot[:], base+((hash6(busy)+i)&mask))
-		p.v6of.Put(slot, host)
+		p.v6of.update(slot[:], host[:], 0)
 	}
 	if err := p.packet(v6Packet("2001:db8::99", "64:ff9b::1", unix.IPPROTO_ICMPV6, reply[:8])); err == nil || !strings.Contains(err.Error(), "full") {
 		t.Fatalf("want the pool full, got %v", err)
@@ -274,24 +265,13 @@ func TestMap4WithoutRoom(t *testing.T) {
 	if !ownNetns(t) {
 		return
 	}
-	v4of, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 16, ValueSize: 4, MaxEntries: 1})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer v4of.Close()
-	v6of, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Hash, KeySize: 4, ValueSize: 16, MaxEntries: 4})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer v6of.Close()
-	v4of.Put(netip.MustParseAddr("2001:db8::1").As16(), [4]byte{198, 18, 0, 1})
+	v4of, v6of := testMaps(t, 1, 4)
+	v4of.update(netip.MustParseAddr("2001:db8::1").AsSlice(), []byte{198, 18, 0, 1}, 0)
 	if _, ok := map4(v4of, v6of, netip.MustParseAddr("2001:db8::2").As16()); ok {
 		t.Fatal("a full map should refuse a new source")
 	}
-	var a [4]byte
-	var s [16]byte
-	if v6of.Iterate().Next(&a, &s) {
-		t.Fatalf("the claimed slot %v should be given back", a)
+	if keys := v6of.keys(); len(keys) != 0 {
+		t.Fatalf("the claimed slot %v should be given back", keys)
 	}
 }
 
@@ -317,12 +297,11 @@ func TestBPFProgram(t *testing.T) {
 	}
 	src := netip.MustParseAddr("2001:db8::abcd")
 	udp := []byte{0, 1, 0, 2, 0, 8, 0x12, 0x34}
-	ret, err := b.objs.Nat64.Run(&ebpf.RunOptions{Data: frame(v6Packet(src.String(), "64:ff9b::c000:202", unix.IPPROTO_UDP, udp), unix.ETH_P_IPV6)})
-	if err != nil || ret != 7 { // TC_ACT_REDIRECT
-		t.Fatalf("want the packet redirected, got %d: %v", ret, err)
+	if ret, _, _ := b.objs.testRun(t, frame(v6Packet(src.String(), "64:ff9b::c000:202", unix.IPPROTO_UDP, udp), unix.ETH_P_IPV6), nil); ret != 7 { // TC_ACT_REDIRECT
+		t.Fatalf("want the packet redirected, got %d", ret)
 	}
 	var a [4]byte
-	if err := b.objs.V4Of.Lookup(src.As16(), &a); err != nil {
+	if err := b.objs.maps[nat64MapV4Of].lookup(src.AsSlice(), a[:]); err != nil {
 		t.Fatal(err)
 	}
 	base, mask := binary.BigEndian.Uint32(bpfPool.Addr().AsSlice()), uint32(1)<<(32-bpfPool.Bits())-1
@@ -338,11 +317,10 @@ func TestBPFProgram(t *testing.T) {
 	gone.stop()
 
 	// struct __sk_buff from its start to mark, the third word
-	ctx := []uint32{0, 0, bpfSlowMark}
-	out := make([]uint32, 48) // the whole struct __sk_buff
-	ret, err = b.objs.Nat64.Run(&ebpf.RunOptions{Data: frame(make([]byte, 40), unix.ETH_P_IPV6), Context: ctx, ContextOut: out})
-	if err != nil || ret != 7 || out[2] != 0 {
-		t.Fatalf("want a marked packet redirected with its mark cleared, got %d, mark %#x: %v", ret, out[2], err)
+	ctx := nativeEndian.AppendUint32(make([]byte, 8), bpfSlowMark)
+	ret, _, out := b.objs.testRun(t, frame(make([]byte, 40), unix.ETH_P_IPV6), ctx)
+	if mark := nativeEndian.Uint32(out[8:]); ret != 7 || mark != 0 {
+		t.Fatalf("want a marked packet redirected with its mark cleared, got %d, mark %#x", ret, mark)
 	}
 }
 
@@ -395,7 +373,7 @@ func TestBPFNAT64WithoutPrivileges(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.stop()
-	b.objs.V6Of.Put([4]byte{198, 18, 0, 1}, netip.MustParseAddr("2001:db8::1").As16())
+	b.objs.maps[nat64MapV6Of].update([]byte{198, 18, 0, 1}, netip.MustParseAddr("2001:db8::1").AsSlice(), 0)
 	if err := syscall.Setresuid(-1, 65534, -1); err != nil {
 		t.Fatal(err)
 	}
@@ -409,9 +387,7 @@ func TestBPFNAT64WithoutPrivileges(t *testing.T) {
 		t.Fatalf("want the old device's removal refused, got %v", addErr)
 	}
 	joolWithFDs(t, 0, func() error { b.sweep(); b.sweep(); return nil })
-	var a [4]byte
-	var s [16]byte
-	if !b.objs.V6Of.Iterate().Next(&a, &s) {
+	if len(b.objs.maps[nat64MapV6Of].keys()) == 0 {
 		t.Fatal("a sweep that cannot ask conntrack should remove nothing")
 	}
 	// The slow path's drops are reported with the program's
@@ -455,7 +431,7 @@ func TestSlowPathWithoutDescriptors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := joolWithFDs(t, 0, func() error { _, err := newSlowPath(nat64WKP, &nat64Objects{}, lo, 1500); return err }); !errors.Is(err, unix.EMFILE) {
+	if err := joolWithFDs(t, 0, func() error { _, err := newSlowPath(nat64WKP, nil, nil, lo, 1500); return err }); !errors.Is(err, unix.EMFILE) {
 		t.Fatalf("want the socket refused, got %v", err)
 	}
 }
@@ -477,18 +453,12 @@ func TestBPFICMPTranslation(t *testing.T) {
 	}
 	defer b.stop()
 	host := netip.MustParseAddr("2001:db8::5")
-	b.objs.V6Of.Put([4]byte{198, 18, 0, 5}, host.As16())
-	b.objs.V4Of.Put(host.As16(), [4]byte{198, 18, 0, 5})
+	b.objs.maps[nat64MapV6Of].update([]byte{198, 18, 0, 5}, host.AsSlice(), 0)
+	b.objs.maps[nat64MapV4Of].update(host.AsSlice(), []byte{198, 18, 0, 5}, 0)
 	run := func(pkt []byte, proto uint16) ([]byte, bool) {
 		t.Helper()
-		out := make([]byte, 2000)
-		frame := append(binary.BigEndian.AppendUint16(make([]byte, 12), proto), pkt...)
-		opts := &ebpf.RunOptions{Data: frame, DataOut: out}
-		ret, err := b.objs.Nat64.Run(opts)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return opts.DataOut[14:], ret == 7
+		ret, out, _ := b.objs.testRun(t, append(binary.BigEndian.AppendUint16(make([]byte, 12), proto), pkt...), nil)
+		return out[14:], ret == 7
 	}
 	udp := []byte{0, 7, 0x30, 0x39, 0, 8, 0xab, 0xcd}
 
@@ -632,15 +602,10 @@ func TestBPFRFC6052(t *testing.T) {
 		if err := b.load(); err != nil {
 			t.Fatal(err)
 		}
-		b.objs.V6Of.Put([4]byte{198, 18, 0, 5}, host.As16())
+		b.objs.maps[nat64MapV6Of].update([]byte{198, 18, 0, 5}, host.AsSlice(), 0)
 		run := func(pkt []byte, proto uint16) ([]byte, bool) {
-			out := make([]byte, 200)
-			opts := &ebpf.RunOptions{Data: append(binary.BigEndian.AppendUint16(make([]byte, 12), proto), pkt...), DataOut: out}
-			ret, err := b.objs.Nat64.Run(opts)
-			if err != nil {
-				t.Fatal(err)
-			}
-			return opts.DataOut[14:], ret == 7
+			ret, out, _ := b.objs.testRun(t, append(binary.BigEndian.AppendUint16(make([]byte, 12), proto), pkt...), nil)
+			return out[14:], ret == 7
 		}
 		got, ok := run(v4Packet("192.0.2.33", "198.18.0.5", unix.IPPROTO_UDP, 0, udp), unix.ETH_P_IP)
 		if src := netip.AddrFrom16([16]byte(got[8:24])); !ok || src != netip.MustParseAddr(want) {
@@ -655,4 +620,44 @@ func TestBPFRFC6052(t *testing.T) {
 		}
 		b.stop()
 	}
+}
+
+// testMaps creates the two maps of the address mapping, with room for so many sources and pool
+// addresses.
+func testMaps(t *testing.T, sources, pool uint32) (v4of, v6of *bpfMap) {
+	t.Helper()
+	v4of, err := bpfMapCreate(bpfMapSpec{name: "v4_of", typ: unix.BPF_MAP_TYPE_HASH, keySize: 16, valueSize: 4, maxEntries: sources})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(v4of.close)
+	v6of, err = bpfMapCreate(bpfMapSpec{name: "v6_of", typ: unix.BPF_MAP_TYPE_HASH, keySize: 4, valueSize: 16, maxEntries: pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(v6of.close)
+	return v4of, v6of
+}
+
+// testRun runs the program once on a frame (BPF_PROG_TEST_RUN), with ctx as the start of its
+// struct __sk_buff, and returns the verdict, the frame and the whole context after.
+func (o *bpfObjects) testRun(t *testing.T, frame, ctx []byte) (uint32, []byte, []byte) {
+	t.Helper()
+	out, ctxOut := make([]byte, 2000), make([]byte, 192)
+	attr := struct {
+		prog, retval, dataSizeIn, dataSizeOut uint32
+		dataIn, dataOut                       uint64
+		repeat, duration                      uint32
+		ctxSizeIn, ctxSizeOut                 uint32
+		ctxIn, ctxOut                         uint64
+	}{prog: uint32(o.prog), dataSizeIn: uint32(len(frame)), dataSizeOut: uint32(len(out)), dataIn: ptr(frame), dataOut: ptr(out)}
+	if ctx != nil {
+		attr.ctxSizeIn, attr.ctxSizeOut, attr.ctxIn, attr.ctxOut = uint32(len(ctx)), uint32(len(ctxOut)), ptr(ctx), ptr(ctxOut)
+	}
+	if _, err := bpfSys(unix.BPF_PROG_TEST_RUN, unsafe.Pointer(&attr), unsafe.Sizeof(attr)); err != nil {
+		t.Fatal(err)
+	}
+	runtime.KeepAlive(frame)
+	runtime.KeepAlive(ctx)
+	return attr.retval, out[:attr.dataSizeOut], ctxOut
 }

@@ -48,6 +48,10 @@ var licenseText string
 //go:embed NOTICE
 var noticeText string
 
+// bpfPool is the private IPv4 pool -nat64 bpf numbers IPv6 sources from. The source NAT on the
+// way out hides these addresses like those of any other IPv4 host behind the router.
+var bpfPool = netip.MustParsePrefix("198.18.0.0/15")
+
 // nat64WKP is the well-known prefix of RFC 6052, the default of -nat64-prefix. Carving one out of
 // the delegated prefix would tie the translator to a prefix that changes, and every client would
 // have to be told again.
@@ -161,8 +165,13 @@ func main() {
 	}
 	// Refused before anything is configured, so a conflict leaves the host as it was
 	if *nat64 == "jool" && !dryRun {
-		if err := checkJoolIPv4(joolLink); err != nil {
+		if err := checkIPv4Unused(joolLink); err != nil {
 			fatalf("-jool-ipv4: %v", err)
+		}
+	}
+	if *nat64 == "bpf" && !dryRun {
+		if err := checkIPv4Unused(bpfPool); err != nil {
+			fatalf("-nat64 bpf numbers IPv6 sources from %s, but %v", bpfPool, err)
 		}
 	}
 	layout := shared64Layout(*shared64)

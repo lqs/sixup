@@ -13,8 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/perf"
 	"golang.org/x/sys/unix"
 )
 
@@ -34,8 +32,8 @@ const (
 
 type slowPath struct {
 	prefix  netip.Prefix
-	v4of    *ebpf.Map
-	v6of    *ebpf.Map
+	v4of    *bpfMap
+	v6of    *bpfMap
 	dev     *net.Interface
 	mtu6    int // what an IPv6 packet sent on may be at most
 	fd      int // a packet socket, sending marked
@@ -59,13 +57,13 @@ type slowGroup struct {
 	expires time.Time
 }
 
-func newSlowPath(prefix netip.Prefix, objs *nat64Objects, dev *net.Interface, mtu6 int) (*slowPath, error) {
+func newSlowPath(prefix netip.Prefix, v4of, v6of *bpfMap, dev *net.Interface, mtu6 int) (*slowPath, error) {
 	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("packet socket: %w", err)
 	}
 	unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_MARK, bpfSlowMark) // CAP_NET_RAW, which the socket took, allows it
-	return &slowPath{prefix: prefix, v4of: objs.V4Of, v6of: objs.V6Of, dev: dev, mtu6: min(mtu6, dev.MTU), fd: fd, groups: map[slowKey]*slowGroup{}, now: time.Now}, nil
+	return &slowPath{prefix: prefix, v4of: v4of, v6of: v6of, dev: dev, mtu6: min(mtu6, dev.MTU), fd: fd, groups: map[slowKey]*slowGroup{}, now: time.Now}, nil
 }
 
 func (p *slowPath) close() { unix.Close(p.fd) }
@@ -82,37 +80,23 @@ func (p *slowPath) send(pkt []byte) error {
 }
 
 // serve reads what the program hands over until the reader is closed.
-func (p *slowPath) serve(rd *perf.Reader) {
+func (p *slowPath) serve(rd *ringReader) {
 	for {
-		rec, err := rd.Read()
+		rec, err := rd.read()
 		if err != nil {
 			return
 		}
-		p.record(rec)
+		p.handle(rec)
 	}
 }
 
-// record takes one record of the perf buffer: a sample, or the count of those it had no room for.
-func (p *slowPath) record(rec perf.Record) {
-	if rec.LostSamples > 0 {
-		p.dropped.Add(rec.LostSamples)
-		return
-	}
-	p.handle(rec.RawSample)
-}
-
-// handle takes one sample: the frame's length, then the frame.
-func (p *slowPath) handle(sample []byte) {
-	if len(sample) < 4 {
+// handle takes one frame the program handed over.
+func (p *slowPath) handle(frame []byte) {
+	if len(frame) < 14 {
 		p.dropped.Add(1)
 		return
 	}
-	n := int(binary.NativeEndian.Uint32(sample))
-	if n < 14 || len(sample) < 4+n {
-		p.dropped.Add(1)
-		return
-	}
-	if err := p.packet(sample[4+14 : 4+n]); err != nil {
+	if err := p.packet(frame[14:]); err != nil {
 		p.dropped.Add(1)
 		debugf("[nat64] slow path: %v", err)
 	}
@@ -227,7 +211,7 @@ func (p *slowPath) whole(hdr []byte, proto uint8, payload []byte) error {
 // to6 translates IPv4 from the pool's side: ICMP echo, or UDP whose checksum it computes.
 func (p *slowPath) to6(hdr []byte, proto uint8, payload []byte) error {
 	var dst [16]byte
-	if err := p.v6of.Lookup([4]byte(hdr[16:20]), &dst); err != nil {
+	if err := p.v6of.lookup(hdr[16:20], dst[:]); err != nil {
 		return fmt.Errorf("no source has %s", netip.AddrFrom4([4]byte(hdr[16:20])))
 	}
 	src := embed4(p.prefix, [4]byte(hdr[12:16]))
@@ -387,9 +371,9 @@ func l4Checksum(src, dst []byte, proto uint8, msg []byte) uint16 {
 }
 
 // map4 is map4 of bpf/nat64.c: the pool address of an IPv6 source, a free one the first time.
-func map4(v4of, v6of *ebpf.Map, src [16]byte) ([4]byte, bool) {
+func map4(v4of, v6of *bpfMap, src [16]byte) ([4]byte, bool) {
 	var a [4]byte
-	if v4of.Lookup(src, &a) == nil {
+	if v4of.lookup(src[:], a[:]) == nil {
 		return a, true
 	}
 	h := hash6(src)
@@ -397,14 +381,14 @@ func map4(v4of, v6of *ebpf.Map, src [16]byte) ([4]byte, bool) {
 	mask := uint32(1)<<(32-bpfPool.Bits()) - 1
 	for i := range uint32(bpfProbes) {
 		binary.BigEndian.PutUint32(a[:], base+((h+i)&mask))
-		if v6of.Update(a, src, ebpf.UpdateNoExist) != nil {
+		if v6of.update(a[:], src[:], unix.BPF_NOEXIST) != nil {
 			continue
 		}
-		if v4of.Update(src, a, ebpf.UpdateNoExist) == nil {
+		if v4of.update(src[:], a[:], unix.BPF_NOEXIST) == nil {
 			return a, true
 		}
-		v6of.Delete(a) // the program mapped the same source meanwhile
-		return a, v4of.Lookup(src, &a) == nil
+		v6of.delete(a[:]) // the program mapped the same source meanwhile
+		return a, v4of.lookup(src[:], a[:]) == nil
 	}
 	return a, false
 }

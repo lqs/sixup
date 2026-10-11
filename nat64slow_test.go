@@ -8,28 +8,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cilium/ebpf/perf"
 	"github.com/mdlayher/netlink"
 )
 
-// A sample too short for its length or for an Ethernet frame is dropped, and so is a record of
-// samples the buffer had no room for.
-func TestSlowPathRecords(t *testing.T) {
+// A frame too short for an Ethernet header, or with no IP after it, is dropped.
+func TestSlowPathFrames(t *testing.T) {
 	p := &slowPath{}
-	sample := func(n int, frame []byte) []byte {
-		return append(binary.NativeEndian.AppendUint32(nil, uint32(n)), frame...)
-	}
-	for _, rec := range []perf.Record{
-		{RawSample: []byte{1, 2}},
-		{RawSample: sample(10, make([]byte, 10))},  // shorter than an Ethernet header
-		{RawSample: sample(100, make([]byte, 20))}, // shorter than it says
-		{RawSample: sample(20, make([]byte, 20))},  // no IP after the Ethernet header
-		{LostSamples: 3},
-	} {
-		p.record(rec)
-	}
-	if n := p.dropped.Load(); n != 7 {
-		t.Fatalf("want 4 bad samples and 3 lost counted, got %d", n)
+	p.handle(make([]byte, 10))
+	p.handle(make([]byte, 20))
+	if n := p.dropped.Load(); n != 2 {
+		t.Fatalf("want both frames dropped, got %d", n)
 	}
 }
 

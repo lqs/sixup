@@ -455,7 +455,11 @@ Tested by `TestNATPMP` and `TestPCPServerAgainstKernel`.
   ports are kept inside the line's port set by a port restricted NAT, as a MAP-E CE must.
 - **RFC 6052, NAT64 prefixes.** The well-known `64:ff9b::/96` by default, or a network specific
   prefix with `-nat64-prefix`.
-- **RFC 6146, stateful NAT64.** Done by Jool with `-nat64 jool`.
+- **RFC 7915, IP/ICMP translation, and RFC 6146, stateful NAT64.** `-nat64 bpf` translates
+  statelessly in BPF, with an IPv4 address from a private pool for each IPv6 source, and leaves
+  the state to conntrack and the IPv4 source NAT, which together make a stateful NAT64. Fragmented
+  ICMP and IPv4 UDP without a checksum, which need the whole datagram, are reassembled and
+  translated by sixup itself. `-nat64 jool` uses Jool's stateful NAT64 instead.
 - **RFC 8781, PREF64 in the RA.** Advertised while the NAT64 translates, with a lifetime of
   3 × MaxRtrAdvInterval, and withdrawn with lifetime 0.
 - **RFC 6877, 464XLAT.** The CLAT is on the clients; PREF64 is what lets them find the prefix.

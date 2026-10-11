@@ -10,21 +10,15 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/link"
-	"github.com/cilium/ebpf/perf"
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target bpfel,bpfeb -go-package main nat64 bpf/nat64.c
-
-// bpfPool is the private IPv4 pool the translator numbers IPv6 sources from. The source NAT on
-// the way out hides these addresses like those of any other IPv4 host behind the router.
-var bpfPool = netip.MustParsePrefix("198.18.0.0/15")
+//go:generate go run ./tools/bpfgen bpf/nat64.c nat64
 
 // The counters of bpf/nat64.c, in its order; the unnamed ones count no drops
 var bpfStatNames = []string{"", "", "protocol", "", "icmp", "pool-full", "unmapped", "error"}
@@ -42,10 +36,10 @@ type bpfNAT64 struct {
 
 	// While translating
 	ifindex int
-	objs    *nat64Objects
-	link    link.Link
+	objs    *bpfObjects
+	link    *os.File // the tcx link, which detaches the program when closed
 	slow    *slowPath
-	reader  *perf.Reader
+	reader  *ringReader
 	served  chan struct{} // closed when the slow path stops reading
 }
 
@@ -102,10 +96,10 @@ func (b *bpfNAT64) start() (err error) {
 	if err := b.route(ifi); err != nil {
 		return err
 	}
-	if b.slow, err = newSlowPath(b.prefix, b.objs, ifi, b.lanMTU()); err != nil {
+	if b.slow, err = newSlowPath(b.prefix, b.objs.maps[nat64MapV4Of], b.objs.maps[nat64MapV6Of], ifi, b.lanMTU()); err != nil {
 		return err
 	}
-	if b.reader, err = perf.NewReader(b.objs.Slow, 16*os.Getpagesize()); err != nil {
+	if b.reader, err = newRingReader(b.objs.maps[nat64MapSlow]); err != nil {
 		return fmt.Errorf("reading the slow path: %w", err)
 	}
 	b.served = make(chan struct{})
@@ -119,8 +113,9 @@ func (b *bpfNAT64) start() (err error) {
 // stop takes down whatever start set up.
 func (b *bpfNAT64) stop() {
 	if b.reader != nil {
-		b.reader.Close()
+		b.reader.close()
 		<-b.served
+		b.reader.free()
 		b.reader = nil
 	}
 	if b.slow != nil {
@@ -132,7 +127,7 @@ func (b *bpfNAT64) stop() {
 		b.link = nil
 	}
 	if b.objs != nil {
-		b.objs.Close()
+		b.objs.close()
 		b.objs = nil
 	}
 	if b.ifindex != 0 {
@@ -142,31 +137,29 @@ func (b *bpfNAT64) stop() {
 }
 
 func (b *bpfNAT64) load() error {
-	spec, _ := loadNat64() // built into sixup, it always parses
+	ro := slices.Clone(nat64Rodata)
+	set := func(v bpfVar, b []byte) { copy(ro[v.off:v.off+v.size], b) }
 	var mask [16]byte
 	for i := range b.prefix.Bits() {
 		mask[i/8] |= 0x80 >> (i % 8)
 	}
-	for name, v := range map[string]any{
-		"pool_base": binary.BigEndian.Uint32(bpfPool.Addr().AsSlice()),
-		"pool_mask": uint32(1)<<(32-bpfPool.Bits()) - 1,
-		"pref6":     b.prefix.Masked().Addr().As16(),
-		"mask6":     mask,
-		"v4pos":     v4Positions(b.prefix.Bits()),
-		"slow_mark": uint32(bpfSlowMark),
-	} {
-		spec.Variables[name].Set(v) // the program declares each, of this size
-	}
-	objs := new(nat64Objects)
-	if err := spec.LoadAndAssign(objs, nil); err != nil {
+	pref, pos := b.prefix.Masked().Addr().As16(), v4Positions(b.prefix.Bits())
+	set(nat64VarPoolBase, nativeEndian.AppendUint32(nil, binary.BigEndian.Uint32(bpfPool.Addr().AsSlice())))
+	set(nat64VarPoolMask, nativeEndian.AppendUint32(nil, uint32(1)<<(32-bpfPool.Bits())-1))
+	set(nat64VarPref6, pref[:])
+	set(nat64VarMask6, mask[:])
+	set(nat64VarV4pos, pos[:])
+	set(nat64VarSlowMark, nativeEndian.AppendUint32(nil, bpfSlowMark))
+	objs, err := bpfLoad(bpfProgram{code: nat64Code, maps: nat64Maps, relocs: nat64Relocs, rodata: ro, license: nat64License})
+	if err != nil {
 		return fmt.Errorf("loading the BPF translator: %w", err)
 	}
 	b.objs = objs
-	l, err := link.AttachTCX(link.TCXOptions{Interface: b.ifindex, Program: objs.Nat64, Attach: ebpf.AttachTCXEgress})
+	fd, err := objs.attachTCX(b.ifindex)
 	if err != nil {
 		return fmt.Errorf("attaching the BPF translator, which needs Linux 6.6 or later: %w", err)
 	}
-	b.link = l
+	b.link = os.NewFile(uintptr(fd), "tcx")
 	return nil
 }
 
@@ -210,23 +203,21 @@ func (b *bpfNAT64) sweep() {
 	if b.idle == nil {
 		b.idle = map[[4]byte]int{}
 	}
-	var a4 [4]byte
-	var a6 [16]byte
-	var gone [][4]byte
-	it := b.objs.V6Of.Iterate()
-	for it.Next(&a4, &a6) {
+	v4of, v6of := b.objs.maps[nat64MapV4Of], b.objs.maps[nat64MapV6Of]
+	for _, key := range v6of.keys() {
+		a4 := [4]byte(key)
 		if active[netip.AddrFrom4(a4)] {
 			delete(b.idle, a4)
 			continue
 		}
 		if b.idle[a4]++; b.idle[a4] >= bpfIdleSweeps {
-			gone = append(gone, a4)
-			b.objs.V4Of.Delete(a6)
+			a6 := make([]byte, 16)
+			if v6of.lookup(key, a6) == nil {
+				v4of.delete(a6)
+			}
+			v6of.delete(key)
+			delete(b.idle, a4)
 		}
-	}
-	for _, a := range gone {
-		b.objs.V6Of.Delete(a)
-		delete(b.idle, a)
 	}
 }
 
@@ -305,15 +296,16 @@ func route4MTU(ifi int, dst netip.Prefix, mtu int) error {
 // slow path dropped.
 func (b *bpfNAT64) drops() string {
 	var parts []string
+	stats := b.objs.maps[nat64MapStats]
+	per := make([]byte, stats.valueSize)
 	for i, name := range bpfStatNames {
-		var per []uint64
 		if name == "" {
 			continue
 		}
-		b.objs.Stats.Lookup(uint32(i), &per) // every index of an array is there
+		stats.lookup(nativeEndian.AppendUint32(nil, uint32(i)), per) // every index of an array is there
 		var n uint64
-		for _, v := range per {
-			n += v
+		for c := 0; c < len(per); c += 8 {
+			n += nativeEndian.Uint64(per[c:])
 		}
 		if n != 0 {
 			parts = append(parts, fmt.Sprintf("%s %d", name, n))

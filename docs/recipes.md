@@ -30,7 +30,7 @@ both.
 | [Choosing the DNS servers](#choosing-the-dns-servers) | `-ra-dns self`, or the servers' addresses |
 | [Addresses handed out by DHCPv6](#addresses-handed-out-by-dhcpv6) | `-dhcp6s-mode stateful` |
 | [A router behind this one](#a-router-behind-this-one) | `-dhcp6s-mode stateless` on the upstream router |
-| [An IPv6-only or IPv6-mostly LAN](#an-ipv6-only-or-ipv6-mostly-lan) | `-nat64 jool` |
+| [An IPv6-only or IPv6-mostly LAN](#an-ipv6-only-or-ipv6-mostly-lan) | `-nat64 bpf` |
 | [Another network behind a LAN host](#another-network-behind-a-lan-host) | `-ra-route`, `-source-filter=false` |
 | [Running in a container](#running-in-a-container) | `-no-sysctl`, `-state-dir` |
 
@@ -398,19 +398,26 @@ packets at the router. Going IPv6-only is one of the most useful things a networ
 IPv6, since every such network is one less reason for anyone to keep IPv4 around; if that is
 your plan, this section is for you.
 
-Install the Jool module and start sixup with NAT64. If the module is not loaded, sixup loads it with `/sbin/modprobe jool`.
-The namespace is reached through the IPv4 /31 `192.168.255.254/31`; when that overlaps an address
-or a route of the host, sixup refuses to start, and `-jool-ipv4` gives another.
+Start sixup with NAT64. `-nat64 bpf` is sixup's own translator: it needs nothing installed, only
+Linux 6.6 or later.
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -nat64 jool
+sudo sixup -wan eth0 -lan eth1 -nat64 bpf
 ```
 
-Jool runs in a network namespace of its own behind the veth `sixup-nat64` and translates
-`64:ff9b::/96`, for the LAN and for the router itself. While it translates, the RA announces the
-prefix (PREF64, RFC 8781). The translated IPv4 leaves by the router's IPv4 route. Through a MAP-E
-tunnel it shares the line's port set with everything else, and without a tunnel it takes
-whatever IPv4 uplink is configured. A firewall has to let traffic through `sixup-nat64`.
+It translates `64:ff9b::/96` on the dummy device `sixup-nat64`, for the LAN and for the router
+itself, in the kernel. Each IPv6 client gets an IPv4 address of its own from `198.18.0.0/15`, and
+the router's IPv4 source NAT hides it like any other host behind it: through a MAP-E tunnel the
+translated traffic shares the line's port set with everything else, and without a tunnel it
+takes whatever IPv4 uplink is configured. When that pool overlaps an address or a route of the
+host, sixup refuses to start. While it translates, the RA announces the prefix (PREF64,
+RFC 8781). A firewall has to let traffic through `sixup-nat64`.
+
+On an older kernel, `-nat64 jool` runs the Jool kernel module (4.1 or later) instead, in a
+network namespace of its own behind a veth of the same name. If the module is not loaded, sixup
+loads it with `/sbin/modprobe jool`. The namespace is reached through the IPv4 /31
+`192.168.255.254/31`; when that overlaps an address or a route of the host, sixup refuses to
+start, and `-jool-ipv4` gives another.
 
 Clients reach IPv4 in one of two ways.
 
@@ -439,14 +446,14 @@ To reach private IPv4 addresses through NAT64, which the well-known prefix may n
 (RFC 6052), use a network-specific prefix.
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -nat64 jool -nat64-prefix fd00:64::/96
+sudo sixup -wan eth0 -lan eth1 -nat64 bpf -nat64-prefix fd00:64::/96
 ```
 
 To offer NAT64 through DNS64 only, without clients turning on their CLAT, keep the prefix out of
 the RA.
 
 ```sh
-sudo sixup -wan eth0 -lan eth1 -nat64 jool -ra-pref64 off
+sudo sixup -wan eth0 -lan eth1 -nat64 bpf -ra-pref64 off
 ```
 
 ## Another network behind a LAN host

@@ -365,15 +365,7 @@ func bpfEndToEnd(t *testing.T, prefix netip.Prefix) {
 	noDrops("after the errors")
 
 	// The mappings stay while conntrack has their flows, and go two sweeps after it forgets them
-	mappings := func() int {
-		n := 0
-		var a4 [4]byte
-		var a6 [16]byte
-		for it := b.objs.V6Of.Iterate(); it.Next(&a4, &a6); {
-			n++
-		}
-		return n
-	}
+	mappings := func() int { return len(b.objs.maps[nat64MapV6Of].keys()) }
 	before := mappings()
 	b.sweep()
 	b.sweep()
