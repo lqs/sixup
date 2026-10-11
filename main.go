@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -298,6 +299,8 @@ func main() {
 	for _, l := range lanDefs {
 		names = append(names, l.iface)
 	}
+	// The BPF translators leave devices and routes behind them, which have to go before sixup does
+	var teardown sync.WaitGroup
 	if *nat64 == "jool" {
 		// Jool's IPv4 output comes back through the veth and is forwarded out of this namespace
 		if !*noSysctl {
@@ -314,7 +317,7 @@ func main() {
 				warnf("[sysctl] ipv4/ip_forward=1 failed: %v", err)
 			}
 		}
-		go (&bpfNAT64{prefix: nat64Pfx, lans: names, store: store}).run(ctx)
+		teardown.Go(func() { (&bpfNAT64{prefix: nat64Pfx, lans: names, store: store}).run(ctx) })
 	}
 	// The border of RFC 7084 is kept in every mode; allow only lets unsolicited traffic in. A host
 	// forwards nothing for it to filter.
@@ -349,7 +352,7 @@ func main() {
 	wcfg.enabled = *tEnable
 	go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanStatic, tempPick: Snapshot.wanTemp, side: sideWAN, layout: layout, extra: wanEndpoints(secret)}).run(ctx, hub, store, store.Subscribe())
 	// While the line announces a PREF64, this host's own IPv4 has a way out through its NAT64
-	go (&clatManager{wan: *wan, secret: secret, sysctl: !*noSysctl}).run(ctx, store.Subscribe())
+	teardown.Go(func() { (&clatManager{wan: *wan, secret: secret, sysctl: !*noSysctl}).run(ctx, store.Subscribe()) })
 	poolStart, poolEnd := parsePool(*poolRange)
 	var pd *pdPool
 	if *srvMode != "off" && !pdOff && !hostOnly {
@@ -399,6 +402,7 @@ func main() {
 	if dhcp != nil {
 		dhcp.WaitDone()
 	}
+	teardown.Wait()
 	time.Sleep(500 * time.Millisecond)
 }
 

@@ -366,3 +366,104 @@ func TestCLATWithoutItsNeeds(t *testing.T) {
 		t.Fatalf("the failure should be reported:\n%s", logged.String())
 	}
 }
+
+// Two sixups end to end: one routes a LAN and runs -nat64 bpf, whose RA announces the PREF64; the
+// other, behind it without -lan, learns the prefix from that RA alone and reaches an IPv4-only
+// server through its CLAT, the first's NAT64 and the first's IPv4 route.
+func TestPLATAndCLATAgainstKernel(t *testing.T) {
+	needTools(t, "ip", "ping")
+	if os.Geteuid() != 0 {
+		t.Skip("network namespaces need root")
+	}
+	ip := func(args ...string) {
+		t.Helper()
+		if out, err := exec.Command("ip", args...).CombinedOutput(); err != nil {
+			t.Fatalf("ip %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+	}
+	nsAdd := func(name string) (string, int) {
+		ns := fmt.Sprintf("sx%d-%s", os.Getpid(), name)
+		ip("netns", "add", ns)
+		t.Cleanup(func() { exec.Command("ip", "netns", "del", ns).Run() })
+		ip("-n", ns, "link", "set", "lo", "up")
+		fd, err := unix.Open("/var/run/netns/"+ns, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { unix.Close(fd) })
+		return ns, fd
+	}
+	link := func(ns, name, peerNS, peer string) {
+		ip("link", "add", name, "netns", ns, "type", "veth", "peer", "name", peer, "netns", peerNS)
+		ip("-n", ns, "link", "set", name, "up")
+		ip("-n", peerNS, "link", "set", peer, "up")
+	}
+	isp, _ := nsAdd("isp")
+	plat, _ := nsAdd("plat")
+	host, hostFD := nsAdd("host")
+	srv, srvFD := nsAdd("srv")
+	link(plat, "wan0", isp, "isp0")
+	link(plat, "lan0", host, "wan0")
+	link(plat, "v4up", srv, "eth0")
+	ip("-n", plat, "addr", "add", "192.0.2.1/24", "dev", "v4up")
+	ip("-n", srv, "addr", "add", "192.0.2.2/24", "dev", "eth0")
+	ip("-n", srv, "route", "add", bpfPool.String(), "via", "192.0.2.1")
+
+	var tl net.Listener
+	if err := inNetns(srvFD, func() (err error) {
+		tl, err = net.Listen("tcp4", "192.0.2.2:7")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	defer tl.Close()
+	go func() {
+		for {
+			c, err := tl.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(c, c); c.Close() }()
+		}
+	}()
+
+	up := &treeRouter{ns: plat, state: t.TempDir()}
+	up.args = []string{"-wan", "wan0", "-lan", "lan0", "-state-dir", up.state, "-tunnel-dev", "",
+		"-dhcp6c-mode", "off", "-wan-ra=false", "-routed-prefix", "2001:db8::/48", "-nat64", "bpf", "-ra-min", "3s", "-ra-max", "4s"}
+	treeStart(t, up)
+	down := &treeRouter{ns: host, state: t.TempDir()}
+	down.args = []string{"-wan", "wan0", "-state-dir", down.state, "-tunnel-dev", "", "-dhcp6c-mode", "off"}
+	treeStart(t, down)
+
+	eventually(t, 30*time.Second, "the host reaches 192.0.2.2 through its CLAT", func() bool {
+		return exec.Command("ip", "netns", "exec", host, "ping", "-c", "1", "-W", "1", "192.0.2.2").Run() == nil
+	})
+	payload := bytes.Repeat([]byte("plat and clat "), 50000)
+	if err := inNetns(hostFD, func() error {
+		c, err := net.DialTimeout("tcp4", "192.0.2.2:7", 3*time.Second)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		c.SetDeadline(time.Now().Add(10 * time.Second))
+		go func() { c.Write(payload); c.(*net.TCPConn).CloseWrite() }()
+		got, err := io.ReadAll(c)
+		if err == nil && !bytes.Equal(got, payload) {
+			err = fmt.Errorf("echoed %d bytes of %d", len(got), len(payload))
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("TCP through the CLAT: %v", err)
+	}
+	if out, err := exec.Command("ip", "netns", "exec", host, "ping", "-c", "1", "-W", "2", "-s", "3000", "192.0.2.2").CombinedOutput(); err != nil {
+		t.Fatalf("a fragmented ping through both slow paths: %v\n%s", err, out)
+	}
+
+	treeStop(down)
+	if !strings.Contains(down.stderr.String(), "[clat] this host's IPv4 reaches the NAT64 prefix 64:ff9b::/96") {
+		t.Errorf("the host should report its CLAT:\n%s", down.stderr)
+	}
+	if out, _ := exec.Command("ip", "-n", host, "link", "show", clatDev).CombinedOutput(); !bytes.Contains(out, []byte("does not exist")) {
+		t.Errorf("%s should go with sixup:\n%s", clatDev, out)
+	}
+}
