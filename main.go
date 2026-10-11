@@ -135,8 +135,8 @@ func main() {
 	if *tunNAT != "auto" && *tunNAT != "off" {
 		fatalf("-tunnel-nat must be auto / off")
 	}
-	if *nat64 != "jool" && *nat64 != "off" {
-		fatalf("-nat64 must be jool / off")
+	if *nat64 != "jool" && *nat64 != "bpf" && *nat64 != "off" {
+		fatalf("-nat64 must be jool / bpf / off")
 	}
 	joolLink, err := netip.ParsePrefix(*joolIPv4)
 	if err != nil || !joolLink.Addr().Is4() || joolLink.Bits() != 31 {
@@ -281,6 +281,10 @@ func main() {
 			go nat.run(ctx, store.Subscribe())
 		}
 	}
+	var names []string
+	for _, l := range lanDefs {
+		names = append(names, l.iface)
+	}
 	if *nat64 == "jool" {
 		// Jool's IPv4 output comes back through the veth and is forwarded out of this namespace
 		if !*noSysctl {
@@ -290,12 +294,17 @@ func main() {
 		}
 		go (&joolManager{prefix: nat64Pfx, link: joolLink, store: store}).run(ctx)
 	}
-	var names []string
-	for _, l := range lanDefs {
-		names = append(names, l.iface)
+	if *nat64 == "bpf" {
+		// The translated IPv4 comes in on the dummy device and is forwarded out of it
+		if !*noSysctl {
+			if err := sysctlWrite("/proc/sys/net/ipv4/ip_forward", "1"); err != nil {
+				warnf("[sysctl] ipv4/ip_forward=1 failed: %v", err)
+			}
+		}
+		go (&bpfNAT64{prefix: nat64Pfx, lans: names, store: store}).run(ctx)
 	}
 	// The border of RFC 7084 is kept in every mode; allow only lets unsolicited traffic in
-	fw := &firewall{wan: *wan, lans: names, inbound: *unsolicited != "allow", source: *srcFilter, nat64: *nat64 == "jool", holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
+	fw := &firewall{wan: *wan, lans: names, inbound: *unsolicited != "allow", source: *srcFilter, nat64: *nat64 != "off", holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
 	go fw.run(ctx, store.Subscribe())
 	if *unsolicited != "deny" {
 		p := &pcpServer{lans: names, nat: nat}

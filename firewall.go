@@ -70,7 +70,7 @@ type firewall struct {
 	lans    []string            // the interfaces sixup serves
 	inbound bool                // filter unsolicited traffic from the WAN
 	source  bool                // refuse LAN sources outside ours (-source-filter)
-	nat64   bool                // Jool translates behind joolOutside
+	nat64   bool                // a translator sits behind joolOutside
 	holeIn  chan []portMapping  // PCP's pinholes, the latest set replacing the last
 	delegIn chan []netip.Prefix // the prefixes delegated to downstream routers, likewise
 	holes   *nftables.Set

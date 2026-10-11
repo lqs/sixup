@@ -6,7 +6,7 @@ ARG TARGETARCH TARGETVARIANT VERSION=dev
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY *.go LICENSE NOTICE ./
+COPY *.go *.o LICENSE NOTICE ./
 RUN CGO_ENABLED=0 GOOS=linux GOARCH="$TARGETARCH" GOARM="${TARGETVARIANT#v}" \
 	go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/sixup .
 

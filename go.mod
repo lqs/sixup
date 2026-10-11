@@ -11,6 +11,7 @@ require (
 )
 
 require (
+	github.com/cilium/ebpf v0.22.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/nftables v0.3.0 // indirect
 	github.com/josharian/native v1.1.0 // indirect
