@@ -80,11 +80,15 @@ func main() {
 	if runtime.GOOS != "linux" && !dryRun {
 		fatalf("only -dry-run is supported on %s: configuring addresses, routes, sysctls and tunnel devices needs Linux netlink, so run for real on Linux", runtime.GOOS)
 	}
-	if len(lans) == 0 && !dryRun {
-		fatalf("at least one -lan is required")
-	}
-	if len(lans) == 0 {
+	// Without -lan sixup looks after this host alone: its WAN addresses and routes and the IPv4
+	// tunnel, with no forwarding, no service to a LAN and no border firewall. A dry run still
+	// shows how a LAN would take the prefix.
+	if len(lans) == 0 && dryRun {
 		lans = multiFlag{"lan"}
+	}
+	hostOnly := len(lans) == 0
+	if hostOnly && *nat64 != "off" {
+		fatalf("-nat64 translates for a LAN, and without -lan there is none")
 	}
 	lanDefs := parseLans(lans)
 	// The addresses configured on the WAN by hand are left as they are, and the first one is the
@@ -280,7 +284,7 @@ func main() {
 		go (&tunnelManager{dev: *tunDev, wan: *wan, mtu: *tunMTU, metric4: uint32(*tunMetric4), store: store}).run(ctx, store.Subscribe())
 		// A tunnel carries IPv4, which the kernel will not forward on a system that has never been a
 		// router; the IPv6 switches alone leave the tunnel built and the LAN unable to use it.
-		if !*noSysctl && !dryRun {
+		if !*noSysctl && !hostOnly {
 			if err := sysctlWrite("/proc/sys/net/ipv4/ip_forward", "1"); err != nil {
 				warnf("[sysctl] ipv4/ip_forward=1 failed: %v", err)
 			}
@@ -312,10 +316,14 @@ func main() {
 		}
 		go (&bpfNAT64{prefix: nat64Pfx, lans: names, store: store}).run(ctx)
 	}
-	// The border of RFC 7084 is kept in every mode; allow only lets unsolicited traffic in
-	fw := &firewall{wan: *wan, lans: names, inbound: *unsolicited != "allow", source: *srcFilter, nat64: *nat64 != "off", holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
-	go fw.run(ctx, store.Subscribe())
-	if *unsolicited != "deny" {
+	// The border of RFC 7084 is kept in every mode; allow only lets unsolicited traffic in. A host
+	// forwards nothing for it to filter.
+	var fw *firewall
+	if !hostOnly {
+		fw = &firewall{wan: *wan, lans: names, inbound: *unsolicited != "allow", source: *srcFilter, nat64: *nat64 != "off", holeIn: make(chan []portMapping, 1), delegIn: make(chan []netip.Prefix, 1)}
+		go fw.run(ctx, store.Subscribe())
+	}
+	if *unsolicited != "deny" && !hostOnly {
 		p := &pcpServer{lans: names, nat: nat}
 		if *unsolicited == "request" {
 			p.fw = fw // IPv6 mappings are the filter's pinholes
@@ -342,7 +350,7 @@ func main() {
 	go (&addrManager{ifname: *wan, secret: secret, cfg: wcfg, iids: iids, pick: Snapshot.wanStatic, tempPick: Snapshot.wanTemp, side: sideWAN, layout: layout, extra: Snapshot.tunnelEndpoints}).run(ctx, hub, store, store.Subscribe())
 	poolStart, poolEnd := parsePool(*poolRange)
 	var pd *pdPool
-	if *srvMode != "off" && !pdOff {
+	if *srvMode != "off" && !pdOff && !hostOnly {
 		pd = newPDPool(srvPD, filepath.Join(*stateDir, "pd-leases.json"), fw)
 	}
 	for _, l := range lanDefs {
@@ -368,7 +376,7 @@ func main() {
 		}
 	}
 	var proxy *ndProxy
-	if *ndMode != "off" {
+	if *ndMode != "off" && !hostOnly {
 		proxy = &ndProxy{mode: proxyMode(*ndMode), wanIf: *wan, wanPkts: pkts, lanIf: lanDefs[0].iface, ttl: ndProxyTTL, layout: layout}
 		for _, s := range ndStatic {
 			proxy.static = append(proxy.static, parsePrefixOrAddr(s))
@@ -380,6 +388,9 @@ func main() {
 	}
 
 	infof("[sixup] version %s", version)
+	if hostOnly {
+		infof("[sixup] no -lan: configuring this host only, forwarding nothing")
+	}
 	infof("[sixup] starting: wan=%s lan=%v dhcpv6-client=%s dhcpv6-server=%s ndp-proxy=%s tempaddr=%t", *wan, lans, *dhcpMode, *srvMode, *ndMode, *tEnable)
 	<-ctx.Done()
 	infof("[sixup] got a termination signal, advertising RA with lifetime=0 and releasing the DHCPv6 bindings before exit")

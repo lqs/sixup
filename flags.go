@@ -70,7 +70,7 @@ var (
 // The options that need the address of an existing variable, or that accumulate repeated values.
 func init() {
 	flag.BoolVar(&dryRun, "dry-run", false, "trial run: walk through the whole flow of requesting parameters from upstream, renewing and identifying tunnel parameters, printing continuously, but change no system configuration and send no RA to the LAN")
-	flag.Var(&lans, "lan", "LAN interface, repeatable, format name[:subnet-id], e.g. eth1:0; the id is the one this /64 takes out of the delegated prefix and has nothing to do with an IPv4 alias label of the same shape, which the kernel does not accept as an interface name anyway")
+	flag.Var(&lans, "lan", "LAN interface, repeatable, format name[:subnet-id], e.g. eth1:0; without any, sixup configures this host alone and forwards nothing; the id is the one this /64 takes out of the delegated prefix and has nothing to do with an IPv4 alias label of the same shape, which the kernel does not accept as an interface name anyway")
 	flag.Var(&statics, "dhcp6s-static", "DHCPv6 static binding, repeatable: mac=..,addr=::100 or duid=hex,addr=2001:db8::5")
 	flag.Var(&routes, "ra-route", "Route Information carried in the RA, repeatable")
 	flag.Var(&ndStatic, "ndproxy-static", "static address or prefix for the NDP proxy, repeatable")
@@ -175,7 +175,7 @@ var usageGroups = []struct {
 
 func printUsage() {
 	w := flag.CommandLine.Output()
-	fmt.Fprintf(w, "usage: %s -wan <interface> -lan <interface> [options]\n", filepath.Base(os.Args[0]))
+	fmt.Fprintf(w, "usage: %s -wan <interface> [-lan <interface>] [options]\n", filepath.Base(os.Args[0]))
 	fmt.Fprintf(w, "       %s -wan <interface> -dry-run\n", filepath.Base(os.Args[0]))
 	listed := map[string]bool{}
 	printFlag := func(f *flag.Flag) {

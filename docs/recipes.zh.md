@@ -28,6 +28,7 @@ sudo sixup -wan eth0 -lan eth1
 | [下级路由器](#下级路由器) | 上级路由器加 `-dhcp6s-mode stateless` |
 | [IPv6 单栈或 IPv6-mostly 内网](#ipv6-单栈或-ipv6-mostly-内网) | `-nat64 bpf` |
 | [内网主机后面的另一个网络](#内网主机后面的另一个网络) | `-ra-route`、`-source-filter=false` |
+| [只给本机用 IPv6](#只给本机用-ipv6) | 不指定 `-lan` |
 | [在容器里运行](#在容器里运行) | `-no-sysctl`、`-state-dir` |
 
 每个参数及其默认值都可以用 `sixup -h` 查看，本页按需求介绍它们的用法。
@@ -320,6 +321,16 @@ sudo sixup -wan eth0 -lan eth1 -ra-route 2001:db8:200::/64 -source-filter=false
 ```
 
 源地址过滤只让内网用自己的前缀和委派出去的前缀向外发包，其他源地址会收到 ICMPv6 code 5（BCP 38）。关闭它，这个路由过来的前缀就能出去；此时上游也要把这个前缀路由到本路由器。`-ra-onlink=false` 则是另一个方向的做法：主机之间的流量也都经过路由器。
+
+## 只给本机用 IPv6
+
+不指定 `-lan` 时，sixup 只管理它所在的这台机器。它取得线路分配的 WAN 地址和默认路由；在 MAP-E 或 DS-Lite 线路上，还会建立 IPv4 隧道和源地址转换，所以本机既能用 IPv6，也能用 IPv4。它不转发任何流量，也不运行 RA、DHCPv6 服务器、NDP 代理、PCP 服务器或边界防火墙；本机自身流量的过滤由你自己负责。
+
+```sh
+sudo sixup -wan eth0
+```
+
+如果线路委派了前缀，而 RA 没有在链路上给出前缀，本机就从委派前缀中运营商没有留给链路的第一个 /64 里取地址。sixup 会关闭内核自己对 WAN 上 RA 的处理，否则内核会在它之外另行配置地址和路由。线路给出的 DNS 服务器不会写入系统的解析配置，可以用 `sixup -dry-run` 查看。`-nat64` 需要内网，指定时 sixup 拒绝启动。
 
 ## 在容器里运行
 

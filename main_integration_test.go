@@ -13,6 +13,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/google/nftables"
 )
 
 // The daemon as a whole on a static prefix: it claims the interfaces, sets the sysctls, brings the
@@ -116,6 +118,70 @@ func TestMainAgainstKernel(t *testing.T) {
 	}
 	if stdout.Len() != 0 {
 		t.Errorf("the daemon wrote to stdout:\n%s", stdout)
+	}
+}
+
+// Without -lan the daemon numbers this host alone: the WAN takes an address of the routed prefix,
+// the kernel no longer takes the RA itself, nothing is forwarded and no border firewall goes in.
+func TestMainHostOnlyAgainstKernel(t *testing.T) {
+	if !ownNetns(t) {
+		return
+	}
+	loUp(t)
+	ns, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ns.Close()
+	if err := vethAdd("wan-test0", "up-test0", int(ns.Fd())); err != nil {
+		t.Fatal(err)
+	}
+	wan, err := net.InterfaceByName("wan-test0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, _, stderr := mainCmd(t, "-wan", "wan-test0", "-state-dir", t.TempDir(),
+		"-dhcp6c-mode", "off", "-wan-ra=false", "-routed-prefix", "2001:db8:1::/48", "-tunnel-dev", "")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	want := netip.MustParsePrefix("2001:db8:1::/64")
+	numbered := func() bool {
+		list, _ := addrList(wan.Index)
+		return slices.ContainsFunc(list, func(ia ifAddr) bool { return want.Contains(ia.Addr) })
+	}
+	for deadline := time.Now().Add(5 * time.Second); !numbered() && time.Now().Before(deadline); {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !numbered() {
+		t.Errorf("wan-test0 has no address in %s", want)
+	}
+	for path, val := range map[string]string{
+		"/proc/sys/net/ipv6/conf/wan-test0/accept_ra":  "0",
+		"/proc/sys/net/ipv6/conf/all/forwarding":       "0",
+		"/proc/sys/net/ipv6/conf/wan-test0/forwarding": "0",
+	} {
+		if b, err := os.ReadFile(path); err != nil || strings.TrimSpace(string(b)) != val {
+			t.Errorf("%s = %q, %v; want %s", path, b, err, val)
+		}
+	}
+	c, err := nftables.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := c.ListTables()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.ContainsFunc(tables, func(tb *nftables.Table) bool { return tb.Name == filterTable }) {
+		t.Error("a host should get no border firewall")
+	}
+	cmd.Process.Signal(syscall.SIGTERM)
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("%v:\n%s", err, stderr)
+	}
+	if !strings.Contains(stderr.String(), "configuring this host only") {
+		t.Errorf("the host mode should be reported:\n%s", stderr)
 	}
 }
 
