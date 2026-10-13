@@ -8,7 +8,6 @@ import (
 	"flag"
 	"os"
 	"os/exec"
-	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -95,16 +94,11 @@ func TestMainVersionAndLicense(t *testing.T) {
 }
 
 func TestMainRejectsBadOptions(t *testing.T) {
-	hostNAT64 := "without -lan there is none"
-	if runtime.GOOS != "linux" {
-		hostNAT64 = "only -dry-run is supported"
-	}
 	for _, c := range []struct {
 		args []string
 		want string
 	}{
 		{nil, "-wan is required"},
-		{[]string{"-wan", "x", "-nat64", "bpf"}, hostNAT64},
 		{[]string{"-wan", "x", "-log-level", "loud"}, "-log-level must be"},
 		{[]string{"-dry-run", "-wan", "x", "-wan-prefix", "fd00::/64"}, "-wan-prefix:"},
 		{[]string{"-dry-run", "-wan", "x", "-wan-prefix", "2001:db8::/48"}, "-routed-prefix"},

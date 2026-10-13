@@ -88,9 +88,6 @@ func main() {
 		lans = multiFlag{"lan"}
 	}
 	hostOnly := len(lans) == 0
-	if hostOnly && *nat64 != "off" {
-		fatalf("-nat64 translates for a LAN, and without -lan there is none")
-	}
 	lanDefs := parseLans(lans)
 	// The addresses configured on the WAN by hand are left as they are, and the first one is the
 	// WAN address: no SLAAC or IA_NA address goes beside them
