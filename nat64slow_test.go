@@ -175,3 +175,20 @@ func TestRFC6052(t *testing.T) {
 		}
 	}
 }
+
+// The CLAT's slow path maps as its program does: the NAT64 prefix both ways, the CLAT address and
+// 192.0.0.4, and a router on the IPv6 path to 192.0.0.8.
+func TestCLATMapping(t *testing.T) {
+	addr := netip.MustParseAddr("2001:db8::c1a7")
+	m := clatMapping(nat64WKP, addr)
+	for in, want := range map[string]string{"64:ff9b::c000:202": "192.0.2.2", addr.String(): "192.0.0.4", "2001:db8::1": "192.0.0.8"} {
+		if got, err := m.v4of6(netip.MustParseAddr(in).As16(), false); err != nil || netip.AddrFrom4(got).String() != want {
+			t.Errorf("%s: got %v %v, want %s", in, netip.AddrFrom4(got), err, want)
+		}
+	}
+	for in, want := range map[string]netip.Addr{"192.0.2.2": netip.MustParseAddr("64:ff9b::c000:202"), "192.0.0.4": addr} {
+		if got, err := m.v6of4(netip.MustParseAddr(in).As4()); err != nil || netip.AddrFrom16(got) != want {
+			t.Errorf("%s: got %v %v, want %s", in, netip.AddrFrom16(got), err, want)
+		}
+	}
+}

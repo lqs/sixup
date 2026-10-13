@@ -221,15 +221,43 @@ func (o *bpfObjects) close() {
 	}
 }
 
-// attachTCX attaches the program to the egress of a device; closing the descriptor it returns
-// detaches it, and so does sixup ending.
-func (o *bpfObjects) attachTCX(ifindex int) (int, error) {
+// attachTCX attaches the program to a device, at unix.BPF_TCX_EGRESS or unix.BPF_TCX_INGRESS, and
+// returns the link, which detaches it when closed, as it does when sixup ends.
+func (o *bpfObjects) attachTCX(ifindex int, at uint32) (*os.File, error) {
 	attr := struct {
 		prog, ifindex, attachType, flags uint32
 		relative, _                      uint32
 		expectedRevision                 uint64
-	}{prog: uint32(o.prog), ifindex: uint32(ifindex), attachType: unix.BPF_TCX_EGRESS}
-	return bpfSys(unix.BPF_LINK_CREATE, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	}{prog: uint32(o.prog), ifindex: uint32(ifindex), attachType: at}
+	fd, err := bpfSys(unix.BPF_LINK_CREATE, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+	if err != nil {
+		return nil, fmt.Errorf("attaching the program, which needs Linux 6.6 or later: %w", err)
+	}
+	return os.NewFile(uintptr(fd), "tcx"), nil
+}
+
+// drops sums the counters of a program's stats map over the CPUs, by the names of those that
+// count drops, and adds what its slow path dropped; those that are not zero.
+func drops(stats *bpfMap, names []string, slow *slowPath) string {
+	var parts []string
+	per := make([]byte, stats.valueSize)
+	for i, name := range names {
+		if name == "" {
+			continue
+		}
+		stats.lookup(nativeEndian.AppendUint32(nil, uint32(i)), per) // every index of an array is there
+		var n uint64
+		for c := 0; c < len(per); c += 8 {
+			n += nativeEndian.Uint64(per[c:])
+		}
+		if n != 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", name, n))
+		}
+	}
+	if n := slow.dropped.Load(); n != 0 {
+		parts = append(parts, fmt.Sprintf("slow-path %d", n))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // errRingClosed is what a ring buffer reader returns once closed.

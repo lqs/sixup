@@ -184,6 +184,34 @@ func (s Snapshot) wanSelf(iid iidPolicy, secret []byte, ifi *net.Interface) (net
 	return netip.Addr{}, false
 }
 
+// clatDev is the device the CLAT takes this host's IPv4 from.
+const clatDev = "sixup-clat"
+
+// clatAddr is this host's CLAT address (RFC 6877) while the upstream announces a PREF64: stable in
+// the WAN subnet, else in the SLAAC prefix, and apart from every other address of the host.
+func (s Snapshot) clatAddr(secret []byte) netip.Addr {
+	if !s.PREF64.IsValid() {
+		return netip.Addr{}
+	}
+	prefixes := append([]Prefix{s.WANSubnet}, s.wanSLAAC()...)
+	i := slices.IndexFunc(prefixes, func(p Prefix) bool { return p.Prefix.IsValid() && !p.Deprecated })
+	if i < 0 {
+		return netip.Addr{}
+	}
+	return stableIID(secret, prefixes[i].Prefix, clatDev, 0)
+}
+
+// wanEndpoints is what the WAN holds beside the addresses of its prefixes: the tunnel endpoints
+// and the CLAT address, neither ever a source of its own.
+func wanEndpoints(secret []byte) func(Snapshot) []netip.Addr {
+	return func(s Snapshot) []netip.Addr {
+		if a := s.clatAddr(secret); a.IsValid() {
+			return append(s.tunnelEndpoints(), a)
+		}
+		return s.tunnelEndpoints()
+	}
+}
+
 // selfAddr returns the address of this router in prefix by the policy iid, after any DAD failure.
 func (s Snapshot) selfAddr(iid iidPolicy, secret []byte, prefix netip.Prefix, ifi *net.Interface) netip.Addr {
 	if a, ok := s.Self[prefix]; ok {
@@ -800,7 +828,8 @@ func (s *Store) recompute(now time.Time) {
 		if change == changeNone && !tunnelEqual(s.cur.Tunnel, next.Tunnel) {
 			change = changeRenew
 		}
-		if change == changeNone && (s.cur.WANAddr != next.WANAddr || s.cur.PDPending != next.PDPending) {
+		// A host's subnet follows the delegation alone, so it moves without any LAN prefix moving
+		if change == changeNone && (s.cur.WANAddr != next.WANAddr || s.cur.WANSubnet.Prefix != next.WANSubnet.Prefix || s.cur.PDPending != next.PDPending) {
 			change = changeRenew
 		}
 		// DNS, search list, PREF64 and MTU reach hosts through the RA and the DHCPv6 server, so a
@@ -999,19 +1028,38 @@ func (s *Store) spareSubnet(p Prefix) (netip.Prefix, bool) {
 }
 
 // wanSubnet picks the first LAN's delegated /64: routed to this router, so the upstream resolves
-// none of its addresses, and taken from no downstream delegation (RFC 7084 WAA-7). One also
-// on-link on the WAN is skipped.
+// none of its addresses, and taken from no downstream delegation (RFC 7084 WAA-7). A host with no
+// LAN takes the first /64 of the delegation the ISP does not keep for the WAN link (RFC 6603).
+// One also on-link on the WAN is skipped.
 func (s Snapshot) wanSubnet(lans []lanDef) Prefix {
-	for _, deprecated := range []bool{false, true} {
+	candidates := func(yield func(Prefix) bool) {
 		for _, l := range lans {
 			for _, p := range s.LAN[l.iface] {
-				if p.Source != sourcePD || p.Stale || p.Deprecated != deprecated ||
-					slices.ContainsFunc(s.WAN, func(w Prefix) bool { return w.Source == sourceRA && w.Prefix.Overlaps(p.Prefix) }) {
-					continue
+				if !yield(p) {
+					return
 				}
-				p.OffLink = true
-				return p
 			}
+		}
+		for _, p := range s.WAN {
+			for i := 0; len(lans) == 0 && i < 2; i++ {
+				if sub, ok := splitLAN(p.Prefix, i); ok && !p.Exclude.Overlaps(sub) {
+					p.Prefix = sub
+					if !yield(p) {
+						return
+					}
+					break
+				}
+			}
+		}
+	}
+	for _, deprecated := range []bool{false, true} {
+		for p := range candidates {
+			if p.Source != sourcePD || p.Stale || p.Deprecated != deprecated ||
+				slices.ContainsFunc(s.WAN, func(w Prefix) bool { return w.Source == sourceRA && w.Prefix.Overlaps(p.Prefix) }) {
+				continue
+			}
+			p.OffLink = true
+			return p
 		}
 	}
 	return Prefix{}

@@ -32,6 +32,7 @@ both.
 | [A router behind this one](#a-router-behind-this-one) | `-dhcp6s-mode stateless` on the upstream router |
 | [An IPv6-only or IPv6-mostly LAN](#an-ipv6-only-or-ipv6-mostly-lan) | `-nat64 bpf` |
 | [Another network behind a LAN host](#another-network-behind-a-lan-host) | `-ra-route`, `-source-filter=false` |
+| [IPv6 for this machine alone](#ipv6-for-this-machine-alone) | no `-lan` |
 | [Running in a container](#running-in-a-container) | `-no-sysctl`, `-state-dir` |
 
 Every option, with its default, is listed by `sixup -h`; this page shows them by need.
@@ -75,6 +76,11 @@ sudo sixup -wan eth0 -dry-run
   and clamps the TCP MSS.
 - **DS-Lite.** When DHCPv6 names the AFTR, sixup resolves it and builds the tunnel. The AFTR
   translates, so only the MSS clamp is installed here.
+- **A line with NAT64 for IPv4.** When the upstream RA announces a PREF64 (RFC 8781), sixup runs
+  a CLAT (RFC 6877) for the router's own IPv4: a default route of last resort through the device
+  `sixup-clat`, from `192.0.0.4`, whose traffic it translates to an IPv6 address of its own on the
+  WAN and sends to the line's NAT64. Any other IPv4 route comes first. It needs Linux 6.6 and an
+  Ethernet WAN; LAN hosts run their own CLAT, as in [An IPv6-only or IPv6-mostly LAN](#an-ipv6-only-or-ipv6-mostly-lan).
 - **A tunnel DHCPv6 does not describe**, such as a static 4in6 tunnel. When tunnel traffic reaches
   the WAN, sixup captures it and infers the endpoints and the IPv4 address.
 
@@ -471,6 +477,25 @@ The source filter lets the LAN send out only from its own and the delegated pref
 other sources with ICMPv6 code 5 (BCP 38). Turning it off lets the routed prefix out; it then has
 to be routed to this router upstream too. `-ra-onlink=false` goes further the other way: hosts
 then send even traffic for each other through the router.
+
+## IPv6 for this machine alone
+
+Without `-lan`, sixup looks after the machine it runs on and nothing else. It takes the WAN
+addresses and the default route the line hands out, and on a MAP-E or DS-Lite line the IPv4
+tunnel with its source NAT, or the CLAT on a line with NAT64 for IPv4, so the machine itself
+reaches both IPv6 and IPv4. It forwards
+nothing and runs no RA, DHCPv6 server, NDP proxy, PCP server or border firewall; filtering the
+machine's own traffic is left to you.
+
+```sh
+sudo sixup -wan eth0
+```
+
+When the line delegates a prefix and its RA puts none on the link, the machine takes its address
+in the first /64 of the delegation that the ISP does not keep for the link. sixup turns off the
+kernel's own handling of the RA on the WAN, which would otherwise configure addresses and routes
+beside it. The DNS servers the line hands out are not written to the system's resolver; `sixup
+-dry-run` shows them. `-nat64` needs a LAN and is refused.
 
 ## Running in a container
 

@@ -28,6 +28,7 @@ sudo sixup -wan eth0 -lan eth1
 | [下级路由器](#下级路由器) | 上级路由器加 `-dhcp6s-mode stateless` |
 | [IPv6 单栈或 IPv6-mostly 内网](#ipv6-单栈或-ipv6-mostly-内网) | `-nat64 bpf` |
 | [内网主机后面的另一个网络](#内网主机后面的另一个网络) | `-ra-route`、`-source-filter=false` |
+| [只给本机用 IPv6](#只给本机用-ipv6) | 不指定 `-lan` |
 | [在容器里运行](#在容器里运行) | `-no-sysctl`、`-state-dir` |
 
 每个参数及其默认值都可以用 `sixup -h` 查看，本页按需求介绍它们的用法。
@@ -48,6 +49,7 @@ sudo sixup -wan eth0 -dry-run
 - **PPPoE。** 把 PPP 设备作为 WAN，即 `-wan ppp0`。点对点的 WAN 没有地址解析，共享的 /64 不需要代理；收不到 RA 时，默认路由直接指向这个设备。RA 会把线路较小的 MTU 1492 告诉内网，主机不必依赖路径 MTU 发现；`-ra-mtu` 可以指定其他值。
 - **MAP-E。** DHCPv6 带有 MAP-E 选项，或者前缀符合日本 IPoE 运营商（v6plus、BIGLOBE、OCN、NURO）的规则表时，sixup 建立隧道 `sixup-ipv4`，配置共享的 IPv4 地址，经隧道添加一条 metric 较高的 IPv4 默认路由，并维护 nftables 表 `inet sixup`，把源端口限制在线路分到的端口集内，同时钳制 TCP MSS。
 - **DS-Lite。** DHCPv6 给出 AFTR 名称时，sixup 解析它并建立隧道。转换由 AFTR 完成，这里只设置 MSS 钳制。
+- **用 NAT64 提供 IPv4 的线路。** 上游 RA 通告 PREF64（RFC 8781）时，sixup 为路由器自身的 IPv4 运行 CLAT（RFC 6877）：经设备 `sixup-clat`、源地址为 `192.0.0.4` 的一条优先级最低的默认路由，其流量被转换为路由器在 WAN 上的一个专用 IPv6 地址发出，交给线路的 NAT64。其他 IPv4 路由都优先于它。需要 Linux 6.6 和以太网 WAN；内网主机运行自己的 CLAT，见 [IPv6 单栈或 IPv6-mostly 内网](#ipv6-单栈或-ipv6-mostly-内网)。
 - **DHCPv6 没有描述的隧道**，例如固定的 4in6 隧道。隧道流量到达 WAN 时，sixup 抓包推断出两端地址和 IPv4 地址。
 
 ## 让外部访问内网主机
@@ -320,6 +322,16 @@ sudo sixup -wan eth0 -lan eth1 -ra-route 2001:db8:200::/64 -source-filter=false
 ```
 
 源地址过滤只让内网用自己的前缀和委派出去的前缀向外发包，其他源地址会收到 ICMPv6 code 5（BCP 38）。关闭它，这个路由过来的前缀就能出去；此时上游也要把这个前缀路由到本路由器。`-ra-onlink=false` 则是另一个方向的做法：主机之间的流量也都经过路由器。
+
+## 只给本机用 IPv6
+
+不指定 `-lan` 时，sixup 只管理它所在的这台机器。它取得线路分配的 WAN 地址和默认路由；在 MAP-E 或 DS-Lite 线路上，还会建立 IPv4 隧道和源地址转换，在用 NAT64 提供 IPv4 的线路上则运行 CLAT，所以本机既能用 IPv6，也能用 IPv4。它不转发任何流量，也不运行 RA、DHCPv6 服务器、NDP 代理、PCP 服务器或边界防火墙；本机自身流量的过滤由你自己负责。
+
+```sh
+sudo sixup -wan eth0
+```
+
+如果线路委派了前缀，而 RA 没有在链路上给出前缀，本机就从委派前缀中运营商没有留给链路的第一个 /64 里取地址。sixup 会关闭内核自己对 WAN 上 RA 的处理，否则内核会在它之外另行配置地址和路由。线路给出的 DNS 服务器不会写入系统的解析配置，可以用 `sixup -dry-run` 查看。`-nat64` 需要内网，指定时 sixup 拒绝启动。
 
 ## 在容器里运行
 
