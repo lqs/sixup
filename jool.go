@@ -740,7 +740,9 @@ type route4 struct {
 	oif int
 }
 
-// routes4 lists the IPv4 routes in every table, by destination and outgoing interface.
+// routes4 lists the IPv4 routes in every table, by destination and outgoing interface. A dump
+// without strict checking carries the route exceptions too, a PMTU learnt for one destination
+// as a /32 that expires in minutes; those are left out, flagged cloned.
 func routes4() ([]route4, error) {
 	c, err := rtDial()
 	if err != nil {
@@ -753,7 +755,7 @@ func routes4() ([]route4, error) {
 	}
 	var out []route4
 	for _, m := range msgs {
-		if len(m.Data) < 12 {
+		if len(m.Data) < 12 || nativeEndian.Uint32(m.Data[8:12])&unix.RTM_F_CLONED != 0 {
 			continue
 		}
 		r := route4{dst: netip.PrefixFrom(netip.IPv4Unspecified(), int(m.Data[1]))}
