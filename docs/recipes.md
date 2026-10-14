@@ -417,7 +417,9 @@ the router's IPv4 source NAT hides it like any other host behind it: through a M
 translated traffic shares the line's port set with everything else, and without a tunnel it
 takes whatever IPv4 uplink is configured. When that pool overlaps an address or a route of the
 host, sixup refuses to start. While it translates, the RA announces the prefix (PREF64,
-RFC 8781). A firewall has to let traffic through `sixup-nat64`.
+RFC 8781). A firewall has to let traffic through `sixup-nat64`. The device itself is
+`198.18.0.1`, so an nftables `redirect` to a proxy on the router catches translated traffic like
+any other, and the router's ICMP errors reach the client from `64:ff9b::198.18.0.1`.
 
 On an older kernel, `-nat64 jool` runs the Jool kernel module (4.1 or later) instead, in a
 network namespace of its own behind a veth of the same name. If the module is not loaded, sixup

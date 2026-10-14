@@ -29,9 +29,14 @@ static __always_inline __u32 hash6(const struct in6_addr *a)
 	return h ^ (h >> 15);
 }
 
+// The first POOL_RESERVED addresses of the pool belong to no source: the network address, and
+// the device's own; main.go's bpfPoolReserved is the same
+#define POOL_RESERVED 2
+
 static __always_inline int in_pool(__be32 a)
 {
-	return (bpf_ntohl(a) & ~pool_mask) == pool_base;
+	__u32 h = bpf_ntohl(a);
+	return (h & ~pool_mask) == pool_base && (h & pool_mask) >= POOL_RESERVED;
 }
 
 // map6to4 extracts what the NAT64 prefix carries, and numbers an IPv6 source from the pool,
@@ -52,7 +57,10 @@ static __always_inline int map6to4(const struct in6_addr *a, __be32 *out, int al
 	__u32 h = hash6(a);
 #pragma unroll
 	for (int i = 0; i < PROBES; i++) {
-		__be32 p = bpf_htonl(pool_base + ((h + i) & pool_mask));
+		__u32 idx = (h + i) & pool_mask;
+		if (idx < POOL_RESERVED)
+			continue;
+		__be32 p = bpf_htonl(pool_base + idx);
 		if (bpf_map_update_elem(&v6_of, &p, a, BPF_NOEXIST))
 			continue;
 		if (!bpf_map_update_elem(&v4_of, a, &p, BPF_NOEXIST)) {

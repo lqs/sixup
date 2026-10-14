@@ -69,7 +69,7 @@ func nat64Mapping(prefix netip.Prefix, v4of, v6of *bpfMap) slowMapping {
 		},
 		v6of4: func(a [4]byte) ([16]byte, error) {
 			var v [16]byte
-			if !bpfPool.Contains(netip.AddrFrom4(a)) {
+			if !inPool(a) {
 				return embed4(prefix, a), nil
 			}
 			if v6of.lookup(a[:], v[:]) != nil {
@@ -409,6 +409,14 @@ func l4Checksum(src, dst []byte, proto uint8, msg []byte) uint16 {
 	return ^uint16(sum)
 }
 
+// inPool reports whether a is a pool address a source can hold: in bpfPool and past the reserved ones.
+func inPool(a [4]byte) bool {
+	base := binary.BigEndian.Uint32(bpfPool.Addr().AsSlice())
+	mask := uint32(1)<<(32-bpfPool.Bits()) - 1
+	v := binary.BigEndian.Uint32(a[:])
+	return v&^mask == base && v&mask >= bpfPoolReserved
+}
+
 // map4 is map4 of bpf/nat64.c: the pool address of an IPv6 source, a free one the first time.
 func map4(v4of, v6of *bpfMap, src [16]byte) ([4]byte, bool) {
 	var a [4]byte
@@ -419,7 +427,11 @@ func map4(v4of, v6of *bpfMap, src [16]byte) ([4]byte, bool) {
 	base := binary.BigEndian.Uint32(bpfPool.Addr().AsSlice())
 	mask := uint32(1)<<(32-bpfPool.Bits()) - 1
 	for i := range uint32(bpfProbes) {
-		binary.BigEndian.PutUint32(a[:], base+((h+i)&mask))
+		idx := (h + i) & mask
+		if idx < bpfPoolReserved {
+			continue
+		}
+		binary.BigEndian.PutUint32(a[:], base+idx)
 		if v6of.update(a[:], src[:], unix.BPF_NOEXIST) != nil {
 			continue
 		}

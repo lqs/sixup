@@ -160,17 +160,17 @@ func (b *bpfNAT64) load() error {
 	return nil
 }
 
-// route brings the device up and routes the NAT64 prefix and the pool to it. The device takes no
-// address: it never answers for one, and NOARP spares the neighbour lookups.
+// route brings the device up, gives it bpfDevAddr and routes the NAT64 prefix and the pool to it.
+// NOARP spares the neighbour lookups.
 //
 // The pool's route carries an MTU 28 bytes below the smallest LAN's, the IPv6 header's 20 more
 // and a fragment header's 8. IPv4 that conntrack reassembled is cut again to it on the way to the
 // program, so each piece, translated, still crosses the LAN; a whole packet with DF that would
 // not fit earns its sender a Fragmentation Needed from the router.
 func (b *bpfNAT64) route(ifi *net.Interface) error {
-	err := errors.Join(linkSetUp(ifi.Index), routeSet(ifi.Index, b.prefix, netip.Addr{}, 0, 0), route4MTU(ifi.Index, bpfPool, b.lanMTU()-28))
+	err := errors.Join(linkSetUp(ifi.Index), addr4Set(ifi.Name, netip.PrefixFrom(bpfDevAddr, 32)), routeSet(ifi.Index, b.prefix, netip.Addr{}, 0, 0), route4MTU(ifi.Index, bpfPool, b.lanMTU()-28))
 	if err != nil {
-		return fmt.Errorf("bringing %s up and routing %s and %s to it: %w", ifi.Name, b.prefix, bpfPool, err)
+		return fmt.Errorf("bringing %s up as %s and routing %s and %s to it: %w", ifi.Name, bpfDevAddr, b.prefix, bpfPool, err)
 	}
 	return nil
 }

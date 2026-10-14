@@ -53,6 +53,14 @@ var noticeText string
 // way out hides these addresses like those of any other IPv4 host behind the router.
 var bpfPool = netip.MustParsePrefix("198.18.0.0/15")
 
+// The first bpfPoolReserved addresses of the pool are handed to no source: 198.18.0.0, which reads
+// as a network, and bpfDevAddr, the address of sixup-nat64 itself. With one the device can be the
+// target of a redirect rule, and the kernel's ICMP errors for translated traffic leave from it,
+// reaching the client from the prefix as 64:ff9b::198.18.0.1. bpf/nat64.c has the same constant.
+const bpfPoolReserved = 2
+
+var bpfDevAddr = netip.MustParseAddr("198.18.0.1")
+
 // nat64WKP is the well-known prefix of RFC 6052, the default of -nat64-prefix. Carving one out of
 // the delegated prefix would tie the translator to a prefix that changes, and every client would
 // have to be told again.

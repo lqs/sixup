@@ -140,13 +140,21 @@ func TestPoolSources(t *testing.T) {
 		return netlink.Message{Data: append(make([]byte, nfgenmsgLen), b...)}
 	}
 	got := poolSources([]netlink.Message{
-		flow([4]byte{198, 18, 0, 1}),
+		flow([4]byte{198, 18, 0, 2}),
 		flow([4]byte{10, 0, 0, 1}),
 		{Data: []byte{0, 0}},             // shorter than nfgenmsg
 		{Data: []byte{0, 0, 0, 0, 9, 0}}, // an attribute cut short
 	}, bpfPool)
-	if len(got) != 1 || !got[netip.MustParseAddr("198.18.0.1")] {
-		t.Fatalf("want only 198.18.0.1, got %v", got)
+	if len(got) != 1 || !got[netip.MustParseAddr("198.18.0.2")] {
+		t.Fatalf("want only 198.18.0.2, got %v", got)
+	}
+}
+
+func TestInPool(t *testing.T) {
+	for a, want := range map[string]bool{"198.18.0.0": false, "198.18.0.1": false, "198.18.0.2": true, "198.19.255.255": true, "198.20.0.0": false, "198.17.255.255": false} {
+		if got := inPool(netip.MustParseAddr(a).As4()); got != want {
+			t.Errorf("inPool(%s) = %v, want %v", a, got, want)
+		}
 	}
 }
 
