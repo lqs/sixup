@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"path/filepath"
 	"slices"
-	"strings"
 	"time"
 )
 
@@ -31,7 +30,7 @@ func (r *lanRoutes) run(ctx context.Context, hub *linkHub, store *Store, ch <-ch
 		if r.sysctl {
 			// the kernel answers for proxy entries only with proxy_ndp, and at once only without the delay
 			sysctlSet(r.ifname, "proxy_ndp", "1")
-			sysctlWrite(filepath.Join("/proc/sys/net/ipv6/neigh", strings.ReplaceAll(r.ifname, ".", "/"), "proxy_delay"), "0")
+			sysctlWrite(filepath.Join("/proc/sys/net/ipv6/neigh", r.ifname, "proxy_delay"), "0")
 		}
 		r.snap = store.Current()
 		r.apply(ifi)

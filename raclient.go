@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/mdlayher/ndp"
@@ -92,8 +91,11 @@ func (c *raClient) serve(ctx context.Context, ifi *net.Interface) {
 	old := c.ifi
 	c.ifi = ifi
 	// take over RA handling from the kernel so two implementations do not both configure the interface
-	sysctlSet(c.ifname, "accept_ra", "0")
-	sysctlSet(c.ifname, "autoconf", "0")
+	for _, key := range []string{"accept_ra", "autoconf"} {
+		if err := sysctlSet(c.ifname, key, "0"); err != nil {
+			warnf("[ra-client] %s/%s=0 failed, the kernel keeps handling RAs beside sixup: %v", c.ifname, key, err)
+		}
+	}
 	c.ppp = false
 	if old == nil || old.Index != ifi.Index {
 		// a recreated interface has lost its routes and addresses; reset and tell downstream to revoke
@@ -459,7 +461,7 @@ func (c *raClient) handle(ra *ndp.RouterAdvertisement, from netip.Addr) {
 	// With accept_ra off the kernel leaves these to us (RFC 4861 section 6.3.4)
 	for key, v := range map[string]time.Duration{"base_reachable_time_ms": ra.ReachableTime, "retrans_time_ms": ra.RetransmitTimer} {
 		if v > 0 {
-			if err := sysctlWrite(filepath.Join("/proc/sys/net/ipv6/neigh", strings.ReplaceAll(c.ifname, ".", "/"), key), strconv.FormatInt(v.Milliseconds(), 10)); err != nil {
+			if err := sysctlWrite(filepath.Join("/proc/sys/net/ipv6/neigh", c.ifname, key), strconv.FormatInt(v.Milliseconds(), 10)); err != nil {
 				debugf("[ra-client] setting %s: %v", key, err)
 			}
 		}

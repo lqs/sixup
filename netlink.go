@@ -506,9 +506,10 @@ type linkEvent struct {
 	Gone  bool // interface was removed
 }
 
-// sysctlSet writes /proc/sys/net/ipv6/conf/<iface>/<key>.
+// sysctlSet writes /proc/sys/net/ipv6/conf/<iface>/<key>. The directory carries the interface name
+// as is, dots included: the slash sysctl(8) shows for a dot, as in conf.eth0/1, is its own notation.
 func sysctlSet(iface, key, val string) error {
-	return sysctlWrite(filepath.Join("/proc/sys/net/ipv6/conf", strings.ReplaceAll(iface, ".", "/"), key), val)
+	return sysctlWrite(filepath.Join("/proc/sys/net/ipv6/conf", iface, key), val)
 }
 
 // sysctlWrite writes one /proc/sys entry by path, for the switches that are not per-interface IPv6.
@@ -521,7 +522,7 @@ func sysctlWrite(path, val string) error {
 }
 
 func sysctlGet(iface, key string) (string, error) {
-	p := filepath.Join("/proc/sys/net/ipv6/conf", strings.ReplaceAll(iface, ".", "/"), key)
+	p := filepath.Join("/proc/sys/net/ipv6/conf", iface, key)
 	b, err := os.ReadFile(p)
 	return strings.TrimSpace(string(b)), err
 }
