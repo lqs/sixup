@@ -197,7 +197,12 @@ func bpfLoad(p bpfProgram) (_ *bpfObjects, err error) {
 		if log != nil {
 			attr.logLevel = 1
 		}
+		// The verifier gives up with EAGAIN when a signal is pending, and the Go runtime
+		// preempts goroutines with signals, so a long verification is tried again.
 		fd, err := bpfSys(unix.BPF_PROG_LOAD, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+		for i := 0; i < 5 && errors.Is(err, unix.EAGAIN); i++ {
+			fd, err = bpfSys(unix.BPF_PROG_LOAD, unsafe.Pointer(&attr), unsafe.Sizeof(attr))
+		}
 		runtime.KeepAlive(code)
 		runtime.KeepAlive(license)
 		runtime.KeepAlive(log)
