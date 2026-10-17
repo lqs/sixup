@@ -35,9 +35,11 @@ const (
 	// later, and while the RA sets M or O the WAN takes no address in them, since the prefix length
 	// depends on the result.
 	pdGrace    = 10 * time.Second
-	tunCapMax  = 2 * time.Minute  // how long the capture waits for a tunnel packet before it gives up until the next change
+	tunCapMax  = 2 * time.Minute  // how long the capture waits for a tunnel packet before it gives up for a while
 	ndProxyTTL = 30 * time.Second // lifetime of a learned NDP proxy session
 	tempGrace  = 5 * time.Second  // gap between the two checks that find a temporary address no longer in use
+
+	tunCapRetry = 30 * time.Minute // how often a capture that saw nothing is tried again, until the WAN changes
 )
 
 // A release is a bare binary, and both licences ask for their text to accompany it. Carrying them
@@ -339,7 +341,7 @@ func main() {
 		go p.run(ctx, store.Subscribe())
 	}
 	if *tunCap && dhcp != nil {
-		go (&tunnelWatcher{ifname: *wan, store: store, pkts: pkts, maxRun: tunCapMax}).run(ctx, store.Subscribe())
+		go (&tunnelWatcher{ifname: *wan, store: store, pkts: pkts, maxRun: tunCapMax, retry: tunCapRetry}).run(ctx, store.Subscribe())
 	}
 
 	dnsOverride := lanDNS{wanIID: iids[0], wan: *wan, secret: secret}

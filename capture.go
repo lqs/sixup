@@ -47,12 +47,14 @@ type tunnelGuess struct {
 
 // tunnelWatcher is the daemon-mode fallback: if a DHCPv6 binding carries no tunnel options it starts a capture,
 // stores the result and stops once inference is confident, and restarts from scratch when the WAN prefix or address
-// changes. It is capped by tunCapMax so it does not keep consuming every IPv6 frame indefinitely.
+// changes. Each capture is capped by maxRun so it does not keep consuming every IPv6 frame indefinitely; one that
+// sees nothing is tried again every retry, in case the tunnel was only idle or down.
 type tunnelWatcher struct {
 	ifname string
 	store  *Store
 	pkts   *packetHub
 	maxRun time.Duration
+	retry  time.Duration
 }
 
 func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
@@ -62,12 +64,17 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 		cc      *tunnelSniffer
 		started time.Time
 		lastKey string
+		want    bool      // the last snapshot needs a decision
+		retryAt time.Time // set once a capture under lastKey saw nothing
 	)
+	stop := func() {
+		sub.Close()
+		sub = nil
+		frames = nil
+	}
 	end := func() {
 		if sub != nil {
-			sub.Close()
-			sub = nil
-			frames = nil
+			stop()
 			infof("[tunnel-capture] tunnel inference finished")
 		}
 	}
@@ -87,6 +94,7 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 			}
 			if key != lastKey {
 				lastKey = key
+				retryAt = time.Time{}
 				// Discard the old decision only once the captured local endpoint falls outside every WAN prefix; gaining a first prefix is not a change
 				if s.Tunnel != nil && s.Tunnel.Captured != nil && len(s.WAN) > 0 && !localStillValid(s, s.Tunnel.Captured.Local) {
 					infof("[tunnel-capture] local endpoint %s is no longer inside a WAN prefix, discarding the old decision and inferring again", s.Tunnel.Captured.Local)
@@ -95,15 +103,8 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 				}
 			}
 			bound := len(s.WAN) > 0 || s.WANAddr.IsValid()
-			need := bound && !s.Tunnel.hasDelivered() && (s.Tunnel == nil || s.Tunnel.Captured == nil)
-			if need && sub == nil {
-				sub = w.pkts.Subscribe(kindTunnel)
-				frames = sub.C
-				started = time.Now()
-				cc = &tunnelSniffer{tunnels: map[[2]netip.Addr]*tunnelObs{}}
-				infof("[tunnel-capture] DHCPv6 delivered no tunnel options, inferring from tunnel traffic (up to %s)", w.maxRun)
-			}
-			if !need && sub != nil {
+			want = bound && !s.Tunnel.hasDelivered() && (s.Tunnel == nil || s.Tunnel.Captured == nil)
+			if !want && sub != nil {
 				end()
 			}
 		case f := <-frames:
@@ -116,11 +117,23 @@ func (w *tunnelWatcher) run(ctx context.Context, ch <-chan Snapshot) {
 			}
 		case <-tick.C:
 			if sub == nil {
+				if want && !time.Now().Before(retryAt) {
+					sub = w.pkts.Subscribe(kindTunnel)
+					frames = sub.C
+					started = time.Now()
+					cc = &tunnelSniffer{tunnels: map[[2]netip.Addr]*tunnelObs{}}
+					if retryAt.IsZero() {
+						infof("[tunnel-capture] DHCPv6 delivered no tunnel options, inferring from tunnel traffic (up to %s)", w.maxRun)
+					}
+				}
 				continue
 			}
 			if time.Since(started) > w.maxRun {
-				warnf("[tunnel-capture] no tunnel packets within %s, stopping capture", w.maxRun)
-				end()
+				if retryAt.IsZero() {
+					warnf("[tunnel-capture] no tunnel packets within %s, trying again every %s", w.maxRun, w.retry)
+				}
+				retryAt = time.Now().Add(w.retry)
+				stop()
 			}
 		}
 	}

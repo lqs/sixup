@@ -43,7 +43,7 @@ func runDry(ctx context.Context, store *Store, hub *linkHub, pkts *packetHub, o 
 		go (&raClient{ifname: o.wan, store: store, dhcp: dhcp, slaac: true, iid: o.iid, secret: loadSecret(o.stateDir)}).run(ctx, hub)
 	}
 	// Capture tunnel traffic as usual: when DHCPv6 sends no tunnel option this is the only way to learn the BR, the local address and the IPv4.
-	go (&tunnelWatcher{ifname: o.wan, store: store, pkts: pkts, maxRun: 2 * time.Minute}).run(ctx, store.Subscribe())
+	go (&tunnelWatcher{ifname: o.wan, store: store, pkts: pkts, maxRun: 2 * time.Minute, retry: tunCapRetry}).run(ctx, store.Subscribe())
 	// Name resolution changes nothing on the system, and without it a DS-Lite report has no remote endpoint.
 	go (&aftrResolver{store: store, wan: o.wan}).run(ctx, store.Subscribe())
 	var deadline <-chan time.Time

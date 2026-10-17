@@ -359,16 +359,42 @@ func TestTunnelWatcher(t *testing.T) {
 	<-done
 }
 
-// Without tunnel traffic the capture gives up after maxRun.
+// Without tunnel traffic the capture gives up after maxRun, and a renewal does not start it again
+// before the retry is due, while a change of the WAN address does.
 func TestTunnelWatcherGivesUp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	hub := newPacketHub(ctx, "sixup-none0")
-	w := &tunnelWatcher{ifname: "sixup-none0", store: &Store{}, pkts: hub, maxRun: time.Nanosecond}
+	w := &tunnelWatcher{ifname: "sixup-none0", store: &Store{}, pkts: hub, maxRun: time.Nanosecond, retry: time.Hour}
 	ch := make(chan Snapshot)
 	go w.run(ctx, ch)
 	ch <- Snapshot{WANAddr: netip.MustParseAddr("2001:db8::1")}
 	captureSubOf(t, hub, 1)
 	captureSubOf(t, hub, 0)             // the first tick stops it
 	time.Sleep(1100 * time.Millisecond) // and the next finds nothing running
+	ch <- Snapshot{WANAddr: netip.MustParseAddr("2001:db8::1")}
+	ch <- Snapshot{WANAddr: netip.MustParseAddr("2001:db8::1")} // returns once the first is handled
+	hub.mu.Lock()
+	n := len(hub.subs)
+	hub.mu.Unlock()
+	if n != 0 {
+		t.Fatal("a renewal restarted the capture that gave up")
+	}
+	ch <- Snapshot{WANAddr: netip.MustParseAddr("2001:db8::2")}
+	captureSubOf(t, hub, 1)
+}
+
+// A capture that saw nothing is tried again once the retry is due, without any new snapshot, so a
+// tunnel that was only idle or down is still found.
+func TestTunnelWatcherRetries(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := newPacketHub(ctx, "sixup-none0")
+	w := &tunnelWatcher{ifname: "sixup-none0", store: &Store{}, pkts: hub, maxRun: time.Nanosecond, retry: time.Nanosecond}
+	ch := make(chan Snapshot)
+	go w.run(ctx, ch)
+	ch <- Snapshot{WANAddr: netip.MustParseAddr("2001:db8::1")}
+	captureSubOf(t, hub, 1)
+	captureSubOf(t, hub, 0) // the first tick gives up
+	captureSubOf(t, hub, 1) // a later one tries again
 }
