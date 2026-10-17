@@ -12,7 +12,7 @@ import (
 // logLevel is the threshold shared by every log call; -log-level and -v set it at startup.
 var logLevel = new(slog.LevelVar)
 
-// plainHandler keeps the old one-line format: a timestamp, a level and the message. The messages
+// plainHandler keeps the old one-line format: a date and time, a level and the message. The messages
 // already carry their own "[component]" prefix, so attributes are neither used nor printed.
 // With color set, the level is highlighted with ANSI escapes.
 type plainHandler struct {
@@ -39,7 +39,7 @@ func (h *plainHandler) Handle(_ context.Context, r slog.Record) error {
 	if c, ok := levelColors[r.Level]; ok && h.color {
 		level = c + level + "\x1b[0m"
 	}
-	_, err := fmt.Fprintf(h.w, "%s %s %s\n", r.Time.Format("15:04:05.000000"), level, r.Message)
+	_, err := fmt.Fprintf(h.w, "%s %s %s\n", r.Time.Format("2006-01-02 15:04:05.000000"), level, r.Message)
 	return err
 }
 
