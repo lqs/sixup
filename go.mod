@@ -8,7 +8,7 @@ require (
 	github.com/mdlayher/genetlink v1.4.0
 	github.com/mdlayher/ndp v1.1.0
 	github.com/mdlayher/netlink v1.11.2
-	golang.org/x/net v0.62.0
+	golang.org/x/net v0.63.0
 	golang.org/x/sys v0.50.0
 )
 
@@ -18,6 +18,6 @@ require (
 	github.com/mdlayher/socket v0.6.0 // indirect
 	github.com/pierrec/lz4/v4 v4.1.14 // indirect
 	github.com/u-root/uio v0.0.0-20230220225925-ffce2a382923 // indirect
-	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 )
